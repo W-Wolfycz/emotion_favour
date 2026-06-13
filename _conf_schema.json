@@ -1,0 +1,301 @@
+{
+  "favour_mode": {
+    "description": "好感度判定模式",
+    "type": "string",
+    "default": "normal",
+    "options": [
+      "galgame",
+      "normal",
+      "realistic"
+    ],
+    "hint": "Galgame模式：好感度容易提升，性格宽容。\n正常模式：平衡判定，符合一般社交直觉。\n拟真模式：好感度提升严格，性格复杂，难以取悦。"
+  },
+  "group_sort_by": {
+    "description": "群组好感度排序方式",
+    "type": "string",
+    "default": "default",
+    "options": [
+      "default",
+      "favour",
+      "nickname",
+      "userid"
+    ],
+    "hint": "default: 按添加时间排序\nfavour: 按好感度从高到低排序\nnickname: 按昵称A-Z排序\nuserid: 按用户ID排序"
+  },
+  "min_favour_value": {
+    "description": "好感度数值下限（例如 -100）",
+    "type": "int",
+    "default": -100,
+    "hint": "修改后记得把好感度规则也改一下！"
+  },
+  "max_favour_value": {
+    "description": "好感度数值上限（例如 100）",
+    "type": "int",
+    "default": 100,
+    "hint": "修改后记得把好感度规则也改一下！"
+  },
+  "default_favour": {
+    "description": "普通用户初始好感度",
+    "type": "int",
+    "default": 0,
+    "hint": "新用户首次交互时的初始好感度值。别超出自定义的范围哦！"
+  },
+  "judge_provider": {
+    "description": "裁判模型",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "判断好感度变化的模型，留空则使用当前默认对话模型。"
+  },
+  "relationship_config": {
+    "description": "好感度关系映射配置",
+    "type": "object",
+    "hint": "根据好感度数值映射关系等级，用于查询展示和LLM行为引导。",
+    "items": {
+      "mode": {
+        "description": "映射模式",
+        "type": "string",
+        "default": "simple",
+        "options": [
+          "simple",
+          "advance"
+        ],
+        "hint": "simple: 提供关系名称列表，好感度范围自动均分；advance: 自定义每个区间的名称、范围和规则。"
+      },
+      "simple_list": {
+        "description": "简单模式关系列表",
+        "type": "list",
+        "default": [
+          "极度厌恶",
+          "厌恶",
+          "反感",
+          "普通",
+          "喜欢",
+          "亲密",
+          "挚爱"
+        ],
+        "hint": "从低到高排列，好感度范围将按项数自动均分。仅在 simple 模式下生效。"
+      },
+      "advance_config": {
+        "description": "高级模式配置 (JSON格式)",
+        "type": "text",
+        "default": "[{\"describe\":\"极度厌恶\",\"min_value\":-100,\"max_value\":-91,\"rule\":\"无论用户说什么内容，你都会感到十分嫌弃。如果没有其他人请求，该等级用户无法提升好感度。\"},{\"describe\":\"厌恶\",\"min_value\":-90,\"max_value\":-51,\"rule\":\"你对用户抱有很强烈的抗拒感，你会想尽办法不想与其发生交流。该等级用户可以通过正向互动稍微恢复好感度。\"},{\"describe\":\"反感\",\"min_value\":-50,\"max_value\":-1,\"rule\":\"你对用户的行为感到反感，会明显表现出自己对TA没有好感。此等级用户可以正常通过对话进行好感度增减。\"},{\"describe\":\"普通\",\"min_value\":0,\"max_value\":49,\"rule\":\"你对用户的态度为普通朋友。态度很平淡，不会主动表现出喜爱或者厌恶情绪。但是你不喜欢对方缺少分寸感的发言，如果出现，你会感到反感。\"},{\"describe\":\"喜欢\",\"min_value\":50,\"max_value\":89,\"rule\":\"你对于用户有一定的喜欢。用户的言语、动作主要不是特别冒犯，都会让你感到喜欢。此等级用户可以正常通过对话进行好感度增减。\"},{\"describe\":\"亲密\",\"min_value\":90,\"max_value\":99,\"rule\":\"你几乎不会对用户的行为感到不适。用户做什么都会引起你的喜欢。（除非太过强硬，明显违背你的意愿）此等级用户可以正常通过对话进行好感度增减。\"},{\"describe\":\"挚爱\",\"min_value\":100,\"max_value\":100,\"rule\":\"你对用户抱有极深的感情，极为重视用户的每一句话。\"}]",
+        "hint": "JSON数组，每项含 describe(名称)、min_value、max_value、rule(LLM行为规则)。可参考默认值格式修改。"
+      }
+    }
+  },
+  "advanced_config": {
+    "description": "高级配置",
+    "type": "object",
+    "hint": "包含数值波动范围、管理员设置等高级选项。",
+    "items": {
+      "admin_default_favour": {
+        "description": "框架管理员/特使初始好感度",
+        "type": "int",
+        "default": 50,
+        "hint": "好感度特使和Bot管理员的初始好感度值。"
+      },
+      "admin_default_relationship": {
+        "description": "框架管理员/特使关系",
+        "type": "string",
+        "default": "",
+        "hint": "留空则使用 relationship_config 中的映射关系。非空则框架管理员/特使在计算时使用该特殊值。"
+      },
+      "favour_envoys": {
+        "description": "好感度特使用户ID列表",
+        "type": "list",
+        "default": [],
+        "hint": "列表中的用户将获得与管理员相同的初始好感度，一行一个，回车确认。"
+      },
+      "favour_change_min": {
+        "description": "好感度单次变化最小值",
+        "type": "int",
+        "default": -5,
+        "hint": "好感度单次变化的下限（负值）。"
+      },
+      "favour_change_max": {
+        "description": "好感度单次变化最大值",
+        "type": "int",
+        "default": 5,
+        "hint": "好感度单次变化的上限（正值）。"
+      },
+      "emotion_change_min": {
+        "description": "情感维度单次变化最小值",
+        "type": "int",
+        "default": -10,
+        "hint": "每个情感维度单次变化的下限（负值）。"
+      },
+      "emotion_change_max": {
+        "description": "情感维度单次变化最大值",
+        "type": "int",
+        "default": 5,
+        "hint": "每个情感维度单次变化的上限（正值）。"
+      },
+      "level_threshold": {
+        "description": "高等级成员的群等级阈值",
+        "type": "int",
+        "default": 50,
+        "hint": "群成员等级达到此值时视为HIGH权限。"
+      },
+      "member_commands": {
+        "description": "允许普通成员使用的命令",
+        "type": "list",
+        "options": [
+          "查询印象",
+          "查询全局印象",
+          "修改印象",
+          "修改情感",
+          "清空印象",
+          "清空全局印象",
+          "印象帮助",
+          "印象指令帮助"
+        ],
+        "default": [
+          "查询印象",
+          "印象帮助",
+          "印象指令帮助"
+        ],
+        "hint": "普通成员可使用的命令列表。所有角色默认继承此列表。"
+      },
+      "high_commands": {
+        "description": "允许高等级群员额外使用的命令",
+        "type": "list",
+        "options": [
+          "查询印象",
+          "查询全局印象",
+          "修改印象",
+          "修改情感",
+          "清空印象",
+          "清空全局印象",
+          "印象帮助",
+          "印象指令帮助"
+        ],
+        "default": [],
+        "hint": "高等级群员在普通成员基础上可额外使用的命令列表。"
+      },
+      "admin_commands": {
+        "description": "允许群管理员额外使用的命令",
+        "type": "list",
+        "options": [
+          "查询印象",
+          "查询全局印象",
+          "修改印象",
+          "修改情感",
+          "清空印象",
+          "清空全局印象",
+          "印象帮助",
+          "印象指令帮助"
+        ],
+        "default": [
+          "修改印象",
+          "修改情感"
+        ],
+        "hint": "群管理员在高等级群员基础上可额外使用的命令列表。"
+      },
+      "owner_commands": {
+        "description": "允许群主额外使用的命令",
+        "type": "list",
+        "options": [
+          "查询印象",
+          "查询全局印象",
+          "修改印象",
+          "修改情感",
+          "清空印象",
+          "清空全局印象",
+          "印象帮助",
+          "印象指令帮助"
+        ],
+        "default": [
+          "清空印象"
+        ],
+        "hint": "群主在群管理员基础上可额外使用的命令列表。"
+      },
+      "superuser_commands": {
+        "description": "允许Bot管理员额外使用的命令",
+        "type": "list",
+        "options": [
+          "查询印象",
+          "查询全局印象",
+          "修改印象",
+          "修改情感",
+          "清空印象",
+          "清空全局印象",
+          "印象帮助",
+          "印象指令帮助"
+        ],
+        "default": [
+          "查询全局印象",
+          "清空全局印象"
+        ],
+        "hint": "Bot管理员在群主基础上可额外使用的命令列表。"
+      },
+      "query_others_favour_level": {
+        "description": "允许查看其他人印象的最低等级",
+        "type": "string",
+        "default": "群管理员",
+        "options": [
+          "普通成员",
+          "高等级群员",
+          "群管理员",
+          "群主",
+          "Bot管理员"
+        ],
+        "hint": "低于此等级的用户使用「查询印象」时只能查看自身印象，无法查看他人。"
+      },
+      "history_rounds": {
+        "description": "裁决模型参考的近期对话轮数",
+        "type": "int",
+        "default": 0,
+        "hint": "0 表示仅参考当前一轮互动（默认行为）。设为 1-10 时，裁决模型将参考最近 N 轮对话来判断好感度变化，需注意 Token 开销。"
+      },
+      "use_chat_memory": {
+        "description": "使用 chat_memory 插件提供对话上下文",
+        "type": "bool",
+        "default": false,
+        "hint": "启用后，裁决模型参考的对话历史从 chat_memory 插件按用户ID隔离读取。\n未启用时，从 AstrBot 自带上下文管理读取（群聊场景共享上下文）。\n⚠️ 启用前需先安装 chat_memory 插件，否则自动回退到 AstrBot 自带上下文。"
+      },
+      "emotion_decay_enabled": {
+        "description": "启用情感时间衰减",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，长时间未互动的用户情感维度会自然衰减回归 baseline，防止情绪长期累积不消退"
+      },
+      "emotion_decay_rate": {
+        "description": "情感衰减率（每小时保留比例）",
+        "type": "float",
+        "default": 0.85,
+        "slider": {
+          "min": 0.5,
+          "max": 0.99,
+          "step": 0.01
+        },
+        "hint": "每小时情感值保留比例。0.85=每小时衰减15%。值越小衰减越快。0.85时约5小时衰减过半，约24小时接近归零。"
+      },
+      "emotion_decay_min_hours": {
+        "description": "衰减生效最小间隔/小时",
+        "type": "float",
+        "default": 1.0,
+        "hint": "距上次互动超过此时长后才开始计算衰减。避免短时间内频繁互动时误衰减。"
+      }
+    }
+  },
+  "log_config": {
+    "description": "日志配置",
+    "type": "object",
+    "hint": "控制日志前缀格式与调试级别。",
+    "items": {
+      "log_with_bot_id": {
+        "description": "日志区分机器人实例",
+        "type": "bool",
+        "default": false,
+        "hint": "启用后，日志前缀从 [EmotionFavour] 变为 [EmotionFavour:机器人ID]，便于多 Bot 实例环境下定位问题。"
+      },
+      "debug_to_info": {
+        "description": "调试日志提级",
+        "type": "bool",
+        "default": false,
+        "hint": "启用后，所有 debug 级别日志以 info 级别输出，无需调整后端日志级别即可查看详细运行信息。插件热重载即可生效。"
+      }
+    }
+  }
+}

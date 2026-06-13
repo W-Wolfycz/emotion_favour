@@ -1,0 +1,6 @@
+name: "emotion_favour"
+display_name: "多维度情感好感度系统"
+author: "wolfycz"
+version: "3.0.0"
+description: '后台 LLM 结算好感度与12维情感，支持三模式判定、情感代谢与时间衰减、人设性格摘要、对话历史参考，注入时附带情感面板与三层语气渲染。'
+repo: "https://github.com/W-Wolfycz/emotion_favour"
