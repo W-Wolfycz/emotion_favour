@@ -86,17 +86,9 @@ class EmotionFavourPlugin(Star):
         # 对话历史轮数
         self.history_rounds = max(0, min(10, adv_conf.get("history_rounds", 0)))
 
-        # chat_memory 集成
+        # chat_memory 集成（运行时按需解析，启动顺序无关）
         self.use_chat_memory = adv_conf.get("use_chat_memory", False)
-        self._chat_memory_query = None
-        if self.use_chat_memory:
-            try:
-                from chat_memory.main import query_history as _cm_query
-                self._chat_memory_query = _cm_query
-                logger.info("[EmotionFavour] 已启用 chat_memory 对话历史集成")
-            except ImportError:
-                logger.warning("[EmotionFavour] 未找到 chat_memory 插件，回退到 AstrBot 自带上下文")
-                self.use_chat_memory = False
+        self._chat_memory = None  # 成功解析后缓存，失败不缓存以便下次重试
 
         # 日志配置
         log_conf = config.get("log_config", {})
@@ -143,6 +135,29 @@ class EmotionFavourPlugin(Star):
 
         asyncio.create_task(self._init_storage())
 
+    def _resolve_chat_memory(self):
+        """定位 chat_memory 插件，返回带 query_history 方法的对象。
+        成功后缓存到 self._chat_memory；失败不缓存以便下次重试。
+        优先 AstrBot 插件注册表；失败则直接从 sys.modules 查找，绕过包导入路径问题。
+        """
+        if self._chat_memory is not None:
+            return self._chat_memory
+        try:
+            star = self.context.get_registered_star("chat_memory")
+            if star is not None:
+                for candidate in (star, getattr(star, "star", None), getattr(star, "star_cls", None)):
+                    if candidate is not None and hasattr(candidate, "query_history"):
+                        self._chat_memory = candidate
+                        return candidate
+        except Exception:
+            pass
+        import sys
+        mod = sys.modules.get("chat_memory.main") or sys.modules.get("chat_memory")
+        if mod is not None and hasattr(mod, "query_history"):
+            self._chat_memory = mod
+            return mod
+        return None
+
     def _validate_config(self):
         if self.min_favour_value >= self.max_favour_value:
             self.min_favour_value = -100
@@ -187,9 +202,13 @@ class EmotionFavourPlugin(Star):
         if self.history_rounds <= 0 or not conversation_id:
             return ""
 
+        chat_memory = self._resolve_chat_memory() if self.use_chat_memory else None
+        if self.use_chat_memory and chat_memory is None:
+            logger.warning("[EmotionFavour] 未找到 chat_memory 插件，本次回退到 AstrBot 自带上下文")
+
         try:
-            if self.use_chat_memory and self._chat_memory_query:
-                records = await self._chat_memory_query(umo, conversation_id, user_id, limit=self.history_rounds * 2)
+            if chat_memory is not None:
+                records = await chat_memory.query_history(umo, conversation_id, user_id, limit=self.history_rounds * 2)
             else:
                 records = await self._read_astrbot_history(umo, conversation_id)
         except Exception as e:
