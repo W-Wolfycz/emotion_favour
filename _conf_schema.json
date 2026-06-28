@@ -260,8 +260,19 @@
         "default": true,
         "hint": "开启后，长时间未互动的用户情感维度会自然衰减回归 baseline，防止情绪长期累积不消退"
       },
-      "emotion_decay_rate": {
-        "description": "情感衰减率（每小时保留比例）",
+      "emotion_decay_rate_volatile": {
+        "description": "挥发组衰减率（surprise/anticipation）",
+        "type": "float",
+        "default": 0.7,
+        "slider": {
+          "min": 0.5,
+          "max": 0.99,
+          "step": 0.01
+        },
+        "hint": "短期反应型情感的每小时保留比例。控制维度：surprise（惊讶）、anticipation（期待）。这两类情绪应快速消散——0.7 时约 2 小时衰减过半，6 小时接近归零。值更小=消散更快。"
+      },
+      "emotion_decay_rate_standard": {
+        "description": "标准组衰减率（joy/anger/disgust/fear）",
         "type": "float",
         "default": 0.85,
         "slider": {
@@ -269,13 +280,41 @@
           "max": 0.99,
           "step": 0.01
         },
-        "hint": "每小时情感值保留比例。0.85=每小时衰减15%。值越小衰减越快。0.85时约5小时衰减过半，约24小时接近归零。"
+        "hint": "中等持续情感的每小时保留比例。控制维度：joy（喜悦）、anger（愤怒）、disgust（厌恶）、fear（恐惧）。0.85 时约 5 小时衰减过半，24 小时接近归零。值更小=消散更快。"
+      },
+      "emotion_decay_rate_sticky": {
+        "description": "黏附组衰减率（trust/sadness/guilt/shame/pride/envy）",
+        "type": "float",
+        "default": 0.93,
+        "slider": {
+          "min": 0.5,
+          "max": 0.99,
+          "step": 0.01
+        },
+        "hint": "长期心境型情感的每小时保留比例。控制维度：trust（信任）、sadness（悲伤）、guilt（内疚）、shame（害羞）、pride（得意）、envy（嫉妒）。这类情绪应慢沉淀——0.93 时约 10 小时衰减过半，2 天才接近归零。值更小=沉淀更快。"
       },
       "emotion_decay_min_hours": {
         "description": "衰减生效最小间隔/小时",
         "type": "float",
         "default": 1.0,
         "hint": "距上次互动超过此时长后才开始计算衰减。避免短时间内频繁互动时误衰减。"
+      },
+      "favour_decay_enabled": {
+        "description": "启用好感度时间衰减",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，长时间未互动的用户好感度会向锚点自然回归，与情感维度衰减相互独立。仅在裁决模型结算时落盘新值。"
+      },
+      "favour_decay_anchor": {
+        "description": "好感度衰减锚点",
+        "type": "int",
+        "default": 50,
+        "slider": {
+          "min": -100,
+          "max": 500,
+          "step": 10
+        },
+        "hint": "好感度向此值回归。只有高于锚点的部分会衰减；≤ 锚点的好感度不衰减（负面印象不会被时间冲淡）。"
       }
     }
   },
@@ -295,6 +334,31 @@
         "type": "bool",
         "default": false,
         "hint": "启用后，所有 debug 级别日志以 info 级别输出，无需调整后端日志级别即可查看详细运行信息。插件热重载即可生效。"
+      }
+    }
+  },
+  "persuasion_config": {
+    "description": "关系调解（AI劝说）",
+    "type": "object",
+    "hint": "启用后，A 在与 AI 对话时可以请 AI 调整对 B（不在场的第三方群成员）的好感度与情感。",
+    "items": {
+      "enabled": {
+        "description": "启用关系调解",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后不影响其他功能。"
+      },
+      "match_threshold": {
+        "description": "匹配分数",
+        "type": "int",
+        "default": 70,
+        "hint": "0-100，裁决模型判断'名字匹配是否可信'的标准。\n100 = 仅精确匹配（最严格，外号/缩写一律不认）\n70 = 默认推荐，允许常见外号、缩写、子串包含（如'小明' 匹配 '小明（上班版）'）\n60 以下 = 过于宽松，可能误判到无关成员\n裁决模型会用此分数决定是否相信某条匹配并据此调整对 B 的情感——分数越高，模型越需要确信。"
+      },
+      "history_rounds": {
+        "description": "参考对话轮数",
+        "type": "int",
+        "default": 0,
+        "hint": "裁决模型判定劝说意图时参考的近期对话轮数（0-10）。0=仅看当前一轮；推荐 3-5 轮以识别'渐进式劝说'（A 多轮逐步诋毁/夸奖 B）。轮数越大 Token 开销越高。"
       }
     }
   }

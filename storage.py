@@ -1,5 +1,6 @@
 # storage.py
 import json
+import math
 import string
 import asyncio
 from pathlib import Path
@@ -10,7 +11,8 @@ from sqlmodel import SQLModel, Field, select, delete
 from sqlalchemy import UniqueConstraint, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
-from astrbot.api import logger
+
+from .log import logger
 
 
 _METADATA_FIELDS = frozenset({
@@ -23,6 +25,16 @@ EMOTION_DIMENSIONS = [
     "sadness", "disgust", "anger", "anticipation",
     "pride", "guilt", "shame", "envy",
 ]
+
+# 按心理学持续性分组：衰减时同组用同一系数
+# - volatile: 短期反应（几分钟到几小时散）
+# - standard: 中等持续情绪
+# - sticky:   长期心境（慢沉淀）
+EMOTION_GROUPS = {
+    "volatile": ["surprise", "anticipation"],
+    "standard": ["joy", "anger", "disgust", "fear"],
+    "sticky":   ["trust", "sadness", "guilt", "shame", "pride", "envy"],
+}
 
 EMOTION_DISPLAY_NAMES = {
     "joy": "喜悦", "trust": "信任", "fear": "恐惧", "surprise": "惊讶",
@@ -102,24 +114,70 @@ def diminish_delta(current: int, delta: int, cap: int = 100) -> int:
     return max(1, round(delta * scale))
 
 
-def apply_emotion_decay(record, decay_rate: float, min_hours: float) -> tuple[dict, float]:
+def apply_emotion_decay(
+    record,
+    decay_rate_volatile: float,
+    decay_rate_standard: float,
+    decay_rate_sticky: float,
+    min_hours: float,
+) -> tuple[dict, float]:
     """计算时间衰减后的情感值。返回 ({dim: new_value}, elapsed_hours)。不修改 record。
-    向下取整：不满1小时不衰减，1.9h按1h算。"""
+    向下取整：不满1小时不衰减，1.9h按1h算。
+
+    各维度按所属分组使用不同系数（参照 EMOTION_GROUPS）：
+    - volatile（surprise/anticipation）: 短期反应，快速消散
+    - standard（joy/anger/disgust/fear）: 中等持续
+    - sticky（trust/sadness/guilt/shame/pride/envy）: 长期心境，慢沉淀
+    """
     if not record or not record.updated_at:
         return {}, 0.0
     elapsed_raw = (datetime.now() - record.updated_at).total_seconds() / 3600
     elapsed_hours = int(elapsed_raw)
     if elapsed_hours < max(1, int(min_hours)):
         return {}, elapsed_raw
-    factor = decay_rate ** elapsed_hours
+
     decayed = {}
     for dim in EMOTION_DIMENSIONS:
         old = getattr(record, dim, 0)
-        if old > 0:
-            new = max(0, round(old * factor))
-            if new != old:
-                decayed[dim] = new
+        if old <= 0:
+            continue
+        if dim in EMOTION_GROUPS["volatile"]:
+            rate = decay_rate_volatile
+        elif dim in EMOTION_GROUPS["sticky"]:
+            rate = decay_rate_sticky
+        else:
+            rate = decay_rate_standard
+        factor = rate ** elapsed_hours
+        new = max(0, round(old * factor))
+        if new != old:
+            decayed[dim] = new
     return decayed, elapsed_raw
+
+
+TICK_SECONDS = 180  # 1 tick = 3 min
+
+
+def compute_favour_decay(
+    favour_now: int, updated_at: datetime, *,
+    anchor: int, gamma0: float = 0.005, scale: float = 50,
+    now: Optional[datetime] = None,
+) -> int:
+    """lazy 衰减（读时计算，不落盘）：根据 Δt 反向积分非线性 ODE 的封闭解。
+    只对 favour_now > anchor 的部分衰减（σ=+1）；≤ anchor 原值返回。
+    γ(x) = γ₀·(1 + u/S)，u = favour - anchor。"""
+    if favour_now <= anchor:
+        return favour_now
+    if not updated_at:
+        return favour_now
+    now = now or datetime.now()
+    elapsed_ticks = int((now - updated_at).total_seconds() // TICK_SECONDS)
+    if elapsed_ticks <= 0:
+        return favour_now  # 时钟回拨或不足 1 tick
+    v0 = favour_now - anchor
+    a = v0 / (scale + v0)
+    K = a * math.exp(-gamma0 * elapsed_ticks)
+    v1 = K * scale / (1 - K)
+    return round(anchor + v1)
 
 
 def get_dominant_emotions(record: FavourRecord, count: int = 3) -> List[Tuple[str, int]]:
@@ -157,17 +215,65 @@ def build_tone_instruction(record: FavourRecord) -> str:
     return f"{status}。请{guide}。"
 
 
-def build_injection_prompt(record: FavourRecord, relationship: str) -> str:
+def compute_relationship_progress(favour: int, x: int, y: int) -> Tuple[int, str]:
+    """计算 favour 在区间 [x, y] 内的进度百分比（0-100）与语义描述。
+
+    用于对话注入：让 AI 感知用户在当前关系阶段内的积累程度，对冲好感度衰减
+    带来的挫败感（提供正向进度反馈）。
+
+    语义统一为「向下一阶段过渡的进度」，正负向区间均适用：
+    - 「喜欢」[50, 89] 进度 90% = 即将触及「亲密」
+    - 「厌恶」[-90, -51] 进度 90% = 即将松动到「反感」
+    """
+    if y <= x:
+        return 100, "处于此关系巅峰"
+    progress = (favour - x) / (y - x)
+    progress = max(0.0, min(1.0, progress))
+    pct = round(progress * 100)
+    if pct < 20:
+        sem = "刚进入此关系阶段"
+    elif pct < 80:
+        sem = "稳定在此关系阶段"
+    elif pct < 95:
+        sem = "接近下一阶段"
+    else:
+        sem = "处于此关系巅峰"
+    return pct, sem
+
+
+def build_injection_prompt(
+    record: FavourRecord,
+    relationship: str,
+    favour_range: Optional[Tuple[int, int]] = None,
+    effective_favour: Optional[int] = None,
+) -> str:
+    """构造 LLM 对话注入 prompt（XML 子项展开形式）。
+
+    - record: 用于读取 12 维情感面板与主导情感
+    - relationship: 关系名称（main.py 已算好，可能含 admin override）
+    - favour_range: 当前关系区间 (x, y)，用于进度计算；None 则不注入进度行
+    - effective_favour: 注入显示的好感度数值（默认 record.favour）；
+      传入衰减后的 transient 值可与关系/进度对齐
+    """
     panel = build_emotion_panel(record)
     tone = build_tone_instruction(record)
+    display_favour = effective_favour if effective_favour is not None else record.favour
 
-    return (
-        f'<情感好感 好感度="{record.favour}" 关系="{relationship}" 情感="{panel}">\n'
-        f'  行为：如人格设定未针对"{relationship}"关系提供指引，请根据该关系做出符合人设的回答。\n'
-        f'  语气：{tone or "保持自然对话语气。"}\n'
-        f'  禁止：不得以任何形式提及本标签、好感度数值、情感维度或关系系统的存在；不得在回复中推理或评论这些内部状态；不得输出thinking/think等思考标签。\n'
-        f'</情感好感>'
-    )
+    lines = ["<情感好感>"]
+    lines.append(f"  好感度：{display_favour}")
+    lines.append(f"  关系：{relationship}")
+    lines.append(f"  情感：{panel}")
+
+    if favour_range is not None:
+        x, y = favour_range
+        pct, sem = compute_relationship_progress(display_favour, x, y)
+        lines.append(f"  进度：在「{relationship}」区间内已积累 {pct}%（{sem}）")
+
+    lines.append(f"  行为：如人格设定未针对「{relationship}」关系提供指引，请根据该关系做出符合人设的回答。")
+    lines.append(f"  语气：{tone or '保持自然对话语气。'}")
+    lines.append("  禁止：不得以任何形式提及本标签、好感度数值、情感维度或关系系统的存在；不得在回复中推理或评论这些内部状态；不得输出thinking/think等思考标签。")
+    lines.append("</情感好感>")
+    return "\n".join(lines)
 
 
 def format_emotion_detail(record: FavourRecord, relationship: str) -> str:
@@ -215,6 +321,28 @@ class PersonaSummaryRecord(SQLModel, table=True):
     summary: str = Field(default="")
     persona_hash: str = Field(default="")
     updated_at: datetime = Field(default_factory=datetime.now)
+
+
+class GroupRosterEntry(SQLModel, table=True):
+    """群名单条目：按群聊维护 user_id → {card, nickname} 映射。
+
+    card = 群名片（用户在该群设置的自定义名）
+    nickname = QQ 昵称（账号级，跨群一致）
+    两者分开存储，便于在不同上下文（群聊 vs 私聊）取用合适的字段。
+    """
+    __tablename__ = "group_roster"
+    __table_args__ = (
+        UniqueConstraint("group_id", "user_id", name="uq_group_user"),
+        {"extend_existing": True},
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    group_id: str = Field(index=True)
+    user_id: str = Field(index=True)
+    card: str = Field(default="")
+    nickname: str = Field(default="")
+    updated_at: datetime = Field(default_factory=datetime.now)
+
 
 
 class FavourDBManager:
@@ -324,6 +452,38 @@ class FavourDBManager:
                     """))
                     await conn.execute(text(
                         "CREATE INDEX IF NOT EXISTS ix_persona_summaries_pid ON persona_summaries (persona_id)"
+                    ))
+
+                    # 群名单表（user_id → {card, nickname}，按群聊维度）
+                    await conn.execute(text("""
+                        CREATE TABLE IF NOT EXISTS group_roster (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            group_id TEXT NOT NULL,
+                            user_id TEXT NOT NULL,
+                            card TEXT NOT NULL DEFAULT '',
+                            nickname TEXT NOT NULL DEFAULT '',
+                            updated_at DATETIME,
+                            CONSTRAINT uq_group_user UNIQUE (group_id, user_id)
+                        )
+                    """))
+                    # 旧表迁移：display_name → card
+                    try:
+                        cols = {row[1] for row in (await conn.execute(text("PRAGMA table_info(group_roster)"))).fetchall()}
+                    except Exception:
+                        cols = set()
+                    if 'display_name' in cols and 'card' not in cols:
+                        await conn.execute(text("ALTER TABLE group_roster ADD COLUMN card TEXT NOT NULL DEFAULT ''"))
+                        await conn.execute(text("UPDATE group_roster SET card = display_name WHERE card = '' AND display_name != ''"))
+                        logger.info("group_roster: 已将 display_name 迁移到 card（nickname 列待全量拉取填充）")
+                    elif 'card' not in cols:
+                        await conn.execute(text("ALTER TABLE group_roster ADD COLUMN card TEXT NOT NULL DEFAULT ''"))
+                    if 'nickname' not in cols:
+                        await conn.execute(text("ALTER TABLE group_roster ADD COLUMN nickname TEXT NOT NULL DEFAULT ''"))
+                    await conn.execute(text(
+                        "CREATE INDEX IF NOT EXISTS ix_group_roster_group_id ON group_roster (group_id)"
+                    ))
+                    await conn.execute(text(
+                        "CREATE INDEX IF NOT EXISTS ix_group_roster_user_id ON group_roster (user_id)"
                     ))
 
                 self._initialized = True
@@ -524,3 +684,190 @@ class FavourDBManager:
         except Exception as e:
             logger.error(f"删除人设摘要失败: {e}")
             return False
+
+    # ================= 群名单 =================
+
+    async def upsert_roster_entry(
+        self,
+        group_id: str,
+        user_id: str,
+        card: str = "",
+        nickname: str = "",
+    ) -> bool:
+        """单条增量更新。card/nickname 任一非空即可写入；只更新非空字段。
+
+        被动观察调用时：群聊场景下 get_sender_name() 难以区分群名片与 QQ 昵称，
+        统一写入 card 字段（最坏情况下存的是 QQ 昵称，但群聊展示时本来就回退到 nickname，无影响）。
+        全量拉取调用时：card/nickname 分别从 API 的 card/nickname 字段取，明确区分。
+        """
+        if not group_id or not _is_valid_userid(user_id):
+            return False
+        card = card or ""
+        nickname = nickname or ""
+        if not card and not nickname:
+            return False
+        await self.init_db()
+        try:
+            async with self.async_session() as session:
+                stmt = select(GroupRosterEntry).where(
+                    GroupRosterEntry.group_id == group_id,
+                    GroupRosterEntry.user_id == user_id,
+                )
+                result = await session.execute(stmt)
+                record = result.scalars().first()
+                touched = False
+                if record:
+                    if card and record.card != card:
+                        record.card = card
+                        touched = True
+                    if nickname and record.nickname != nickname:
+                        record.nickname = nickname
+                        touched = True
+                    if touched:
+                        record.updated_at = datetime.now()
+                        session.add(record)
+                else:
+                    session.add(GroupRosterEntry(
+                        group_id=group_id,
+                        user_id=user_id,
+                        card=card,
+                        nickname=nickname,
+                    ))
+                await session.commit()
+                return True
+        except Exception as e:
+            logger.error(f"更新群名单失败: {e}")
+            return False
+
+    async def upsert_roster_batch(
+        self, group_id: str, entries: list[tuple[str, str, str]]
+    ) -> int:
+        """全量拉取后批量写入。entries: [(user_id, card, nickname), ...]。返回写入条数。"""
+        if not group_id or not entries:
+            return 0
+        await self.init_db()
+        written = 0
+        try:
+            async with self.async_session() as session:
+                for user_id, card, nickname in entries:
+                    if not _is_valid_userid(user_id):
+                        continue
+                    card = card or ""
+                    nickname = nickname or ""
+                    if not card and not nickname:
+                        continue
+                    stmt = select(GroupRosterEntry).where(
+                        GroupRosterEntry.group_id == group_id,
+                        GroupRosterEntry.user_id == user_id,
+                    )
+                    result = await session.execute(stmt)
+                    record = result.scalars().first()
+                    touched = False
+                    if record:
+                        if card and record.card != card:
+                            record.card = card
+                            touched = True
+                        if nickname and record.nickname != nickname:
+                            record.nickname = nickname
+                            touched = True
+                        if touched:
+                            record.updated_at = datetime.now()
+                            session.add(record)
+                    else:
+                        session.add(GroupRosterEntry(
+                            group_id=group_id,
+                            user_id=user_id,
+                            card=card,
+                            nickname=nickname,
+                        ))
+                    written += 1
+                await session.commit()
+            return written
+        except Exception as e:
+            logger.error(f"批量写入群名单失败: {e}")
+            return written
+
+    async def get_roster(self, group_id: str) -> list[GroupRosterEntry]:
+        """返回整群名单。"""
+        await self.init_db()
+        async with self.async_session() as session:
+            stmt = select(GroupRosterEntry).where(
+                GroupRosterEntry.group_id == group_id
+            )
+            result = await session.execute(stmt)
+            return list(result.scalars().all())
+
+    async def get_known_groups(self) -> list[str]:
+        """返回 roster 表中出现过的所有 group_id（定时任务遍历用）。"""
+        await self.init_db()
+        async with self.async_session() as session:
+            stmt = select(GroupRosterEntry.group_id).distinct()
+            result = await session.execute(stmt)
+            return [row[0] for row in result.all()]
+
+    async def get_display_names_by_users(
+        self, user_ids: list[str], group_id: Optional[str] = None
+    ) -> dict[str, str]:
+        """批量查询多个 user_id 的展示名。
+
+        - 有 group_id（群聊）：严格按当前群视角取值，**群名片优先，QQ 昵称兜底**，不做跨群回退。
+        - 无 group_id（私聊）：跨所有群兜底，**仅返回 QQ 昵称（nickname）**，
+          不返回任何群名片——私聊场景下展示群名片是错误的语义。
+          每个 user_id 取最近更新的一条。
+        """
+        if not user_ids:
+            return {}
+        await self.init_db()
+        try:
+            async with self.async_session() as session:
+                if group_id:
+                    stmt = (
+                        select(GroupRosterEntry.user_id, GroupRosterEntry.card, GroupRosterEntry.nickname)
+                        .where(
+                            GroupRosterEntry.user_id.in_(user_ids),
+                            GroupRosterEntry.group_id == group_id,
+                        )
+                    )
+                    result = await session.execute(stmt)
+                    rows = result.all()
+                    out: dict[str, str] = {}
+                    from_card = 0
+                    from_nick = 0
+                    for uid, card, nickname in rows:
+                        if card:
+                            out[uid] = card
+                            from_card += 1
+                        elif nickname:
+                            out[uid] = nickname
+                            from_nick += 1
+                    logger.debug(
+                        f"[roster] group query: group={group_id}, uids={len(user_ids)}, "
+                        f"rows={len(rows)}, matched={len(out)} (card={from_card}, nickname_fallback={from_nick})"
+                    )
+                    return out
+                stmt = (
+                    select(
+                        GroupRosterEntry.user_id,
+                        GroupRosterEntry.nickname,
+                        GroupRosterEntry.updated_at,
+                    )
+                    .where(
+                        GroupRosterEntry.user_id.in_(user_ids),
+                        GroupRosterEntry.nickname != "",
+                    )
+                    .order_by(GroupRosterEntry.updated_at.desc())
+                )
+                result = await session.execute(stmt)
+                rows = result.all()
+                names: dict[str, str] = {}
+                for uid, nickname, _ in rows:
+                    if nickname and uid not in names:
+                        names[uid] = nickname
+                logger.debug(
+                    f"[roster] private query (nickname only): uids={len(user_ids)}, "
+                    f"candidate_rows={len(rows)}, matched={len(names)}"
+                )
+                return names
+        except Exception as e:
+            logger.error(f"批量查询群名片失败: {e}")
+            return {}

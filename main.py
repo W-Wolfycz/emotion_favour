@@ -1,15 +1,13 @@
 # main.py
 import re
 import json
-import random
 import asyncio
 import traceback
 import hashlib
 from pathlib import Path
-from typing import List
+from typing import List, Optional, Tuple
 from datetime import datetime
 
-from astrbot.api import logger
 from astrbot.api.star import Star, Context
 from astrbot.api import AstrBotConfig
 from astrbot.api.provider import ProviderRequest
@@ -20,6 +18,7 @@ from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import Aioc
 from astrbot.core.agent.message import TextPart
 from astrbot.core.utils.session_waiter import session_waiter, SessionController
 
+from .log import logger, configure as configure_log
 from .permissions import PermLevel, PermissionManager
 from .storage import (
     FavourDBManager, FavourRecord,
@@ -31,6 +30,7 @@ from .storage import (
     get_dominant_emotions,
     diminish_delta,
     apply_emotion_decay,
+    compute_favour_decay,
 )
 from .utils import (
     get_target_uid,
@@ -78,10 +78,23 @@ class EmotionFavourPlugin(Star):
         # 裁判模型
         self.judge_provider = config.get("judge_provider", "")
 
-        # 情感衰减
+        # 情感衰减（按维度所属分组使用不同系数）
         self.emotion_decay_enabled = adv_conf.get("emotion_decay_enabled", True)
-        self.emotion_decay_rate = adv_conf.get("emotion_decay_rate", 0.85)
+        # 向后兼容：旧版单值 emotion_decay_rate 若被用户改过，三个组都用它
+        _legacy_rate = adv_conf.get("emotion_decay_rate")
+        if _legacy_rate is not None and "emotion_decay_rate_volatile" not in adv_conf:
+            self.emotion_decay_rate_volatile = float(_legacy_rate)
+            self.emotion_decay_rate_standard = float(_legacy_rate)
+            self.emotion_decay_rate_sticky = float(_legacy_rate)
+        else:
+            self.emotion_decay_rate_volatile = float(adv_conf.get("emotion_decay_rate_volatile", 0.7))
+            self.emotion_decay_rate_standard = float(adv_conf.get("emotion_decay_rate_standard", 0.85))
+            self.emotion_decay_rate_sticky = float(adv_conf.get("emotion_decay_rate_sticky", 0.93))
         self.emotion_decay_min_hours = max(0.1, adv_conf.get("emotion_decay_min_hours", 1.0))
+
+        # 好感度衰减（与情感衰减独立，lazy 求值，仅在裁决结算时落盘）
+        self.favour_decay_enabled = adv_conf.get("favour_decay_enabled", True)
+        self.favour_decay_anchor = adv_conf.get("favour_decay_anchor", 50)
 
         # 对话历史轮数
         self.history_rounds = max(0, min(10, adv_conf.get("history_rounds", 0)))
@@ -90,10 +103,18 @@ class EmotionFavourPlugin(Star):
         self.use_chat_memory = adv_conf.get("use_chat_memory", False)
         self._chat_memory = None  # 成功解析后缓存，失败不缓存以便下次重试
 
+        # AI 代为劝说（群名单采集 + 模糊匹配底层）
+        persuasion_conf = config.get("persuasion_config", {})
+        self.roster_enabled = persuasion_conf.get("enabled", True)
+        self.roster_match_threshold = persuasion_conf.get("match_threshold", 70)
+        self.persuasion_history_rounds = max(0, min(10, persuasion_conf.get("history_rounds", 0)))
+        self.roster_pull_time = "00:00"  # 每日零点全量拉取
+        self._roster_scheduler_started = False
+
         # 日志配置
         log_conf = config.get("log_config", {})
         self.log_with_bot_id = log_conf.get("log_with_bot_id", False)
-        self.debug_to_info = log_conf.get("debug_to_info", False)
+        configure_log(log_conf.get("debug_to_info", False))
 
         self._validate_config()
 
@@ -113,9 +134,6 @@ class EmotionFavourPlugin(Star):
         # 数据库
         self.data_dir = Path(context.get_config().get("plugin.data_dir", "./data")) / "plugin_data" / "emotion_favour"
         self.db = FavourDBManager(self.data_dir, self.min_favour_value, self.max_favour_value)
-
-        # 连续下降衰减：key = "persona_id:user_id", value = 连续下降次数
-        self._consecutive_decreases: dict[str, int] = {}
 
         # Playwright T2I
         self._pw_instance = None
@@ -173,12 +191,6 @@ class EmotionFavourPlugin(Star):
                 pass
         return "[EmotionFavour]"
 
-    def _log_debug(self, msg: str):
-        if self.debug_to_info:
-            logger.info(msg)
-        else:
-            logger.debug(msg)
-
     async def _init_storage(self):
         try:
             await self.db.init_db()
@@ -193,13 +205,32 @@ class EmotionFavourPlugin(Star):
 
     # ================= 对话历史提取 =================
 
-    async def _get_recent_history(self, umo: str, user_id: str, conversation_id: str, current_bot_reply: str = "") -> str:
+    def _ts_tag(self, record: dict) -> str:
+        """从记录中提取时间戳，返回 <time>...</time> 标签；无 created_at 或解析失败时返回空串。
+
+        用 XML 标签包裹而非圆括号前缀——避免 LLM 把时间戳当成正文格式模仿。
+        """
+        created = record.get("created_at")
+        if not created:
+            return ""
+        try:
+            dt = datetime.strptime(str(created)[:19], "%Y-%m-%d %H:%M:%S")
+            return dt.strftime("<time>%m-%d %H:%M</time>")
+        except (ValueError, TypeError):
+            return ""
+
+    async def _get_recent_history(self, umo: str, user_id: str, conversation_id: str, current_bot_reply: str = "", rounds: Optional[int] = None) -> str:
         """获取最近 N 轮对话历史。
 
         启用 chat_memory 时从 chat_memory 读取（按 user_id 隔离）；
         否则从 AstrBot 自带上下文 conv.history 读取（群聊共享）。
+
+        Args:
+            rounds: 显式指定轮数。None 时用 self.history_rounds（默认好感度结算用）。
         """
-        if self.history_rounds <= 0 or not conversation_id:
+        if rounds is None:
+            rounds = self.history_rounds
+        if rounds <= 0 or not conversation_id:
             return ""
 
         chat_memory = self._resolve_chat_memory() if self.use_chat_memory else None
@@ -208,7 +239,7 @@ class EmotionFavourPlugin(Star):
 
         try:
             if chat_memory is not None:
-                records = await chat_memory.query_history(umo, conversation_id, user_id, limit=self.history_rounds * 2)
+                records = await chat_memory.query_history(umo, conversation_id, user_id, limit=rounds * 2)
             else:
                 records = await self._read_astrbot_history(umo, conversation_id)
         except Exception as e:
@@ -224,15 +255,17 @@ class EmotionFavourPlugin(Star):
                 records = records[:-2]
 
         # 只保留最近 N 轮
-        records = records[-(self.history_rounds * 2):]
+        records = records[-(rounds * 2):]
 
         lines = []
         for i in range(0, len(records) - 1, 2):
             idx = i // 2 + 1
-            user_msg = records[i].get("content", "")
-            bot_msg = records[i + 1].get("content", "")
-            lines.append(f"  [{idx}] 用户: {user_msg}")
-            lines.append(f"  [{idx}] 角色: {bot_msg}")
+            user_ts = self._ts_tag(records[i])
+            bot_ts = self._ts_tag(records[i + 1])
+            user_prefix = f"  [{idx}] {user_ts} 用户" if user_ts else f"  [{idx}] 用户"
+            bot_prefix = f"  [{idx}] {bot_ts} 角色" if bot_ts else f"  [{idx}] 角色"
+            lines.append(f"{user_prefix}: {records[i].get('content', '')}")
+            lines.append(f"{bot_prefix}: {records[i + 1].get('content', '')}")
         return "\n".join(lines)
 
     async def _read_astrbot_history(self, umo: str, conversation_id: str) -> list[dict]:
@@ -326,6 +359,59 @@ class EmotionFavourPlugin(Star):
                 pass
             return "未知"
 
+    def _get_relationship_range(self, favour: int, user_id: str = "") -> Optional[Tuple[int, int]]:
+        """返回 favour 所处关系区间的 (x, y)，用于进度计算。
+        返回 None 表示无法确定区间（admin override、配置异常、空列表等）。
+        与 _get_relationship 用同一套 idx 逻辑，保证区间名与范围对齐。
+        """
+        if self.admin_default_relationship and user_id and user_id in self._privileged_user_ids:
+            logger.debug(f"[EmotionFavour] _get_relationship_range skip: admin override user={user_id}")
+            return None
+        clamped = max(self.min_favour_value, min(self.max_favour_value, favour))
+        if clamped != favour:
+            logger.debug(f"[EmotionFavour] _get_relationship_range clamp: {favour} -> {clamped}")
+        favour = clamped
+
+        result: Optional[Tuple[int, int]] = None
+        reason = ""
+        if self.relationship_mode == "simple":
+            items = self.relationship_simple_list
+            if not items:
+                reason = "empty simple_list"
+            else:
+                n = len(items)
+                total = self.max_favour_value - self.min_favour_value
+                if total <= 0 or n == 0:
+                    reason = f"invalid span total={total} n={n}"
+                else:
+                    idx = int((favour - self.min_favour_value) * n / total)
+                    idx = max(0, min(idx, n - 1))
+                    x = self.min_favour_value + round(idx * total / n)
+                    if idx == n - 1:
+                        y = self.max_favour_value
+                    else:
+                        y = self.min_favour_value + round((idx + 1) * total / n) - 1
+                    result = (x, y)
+        else:
+            try:
+                items = json.loads(self.relationship_advance_raw) if isinstance(self.relationship_advance_raw, str) else self.relationship_advance_raw
+                for item in items:
+                    x = item.get("min_value", self.min_favour_value)
+                    y = item.get("max_value", self.max_favour_value)
+                    if x <= favour <= y:
+                        result = (x, y)
+                        break
+                if result is None:
+                    reason = "no advance interval matched"
+            except (json.JSONDecodeError, TypeError) as e:
+                reason = f"advance_config parse error: {e}"
+
+        logger.debug(
+            f"[EmotionFavour] _get_relationship_range favour={favour} mode={self.relationship_mode} "
+            f"-> range={result}{' (' + reason + ')' if reason else ''}"
+        )
+        return result
+
     async def _get_initial_favour(self, event: AstrMessageEvent) -> int:
         user_id = event.get_sender_id()
         is_envoy = str(user_id) in [str(e) for e in self.favour_envoys]
@@ -333,13 +419,38 @@ class EmotionFavourPlugin(Star):
         base = self.admin_default_favour if (is_envoy or is_admin) else self.default_favour
         return max(self.min_favour_value, min(self.max_favour_value, base))
 
+    async def _get_initial_favour_for(self, event: AstrMessageEvent, user_id: str) -> int:
+        """对任意 user_id 计算初始好感度（用于第三方目标 B 首次落库时的起算值）。
+        与 _get_initial_favour 一致：特使/群主及以上 → admin_default_favour，否则 default_favour。
+        """
+        is_envoy = str(user_id) in [str(e) for e in self.favour_envoys]
+        is_admin = False
+        try:
+            is_admin = await self.perm_mgr.get_perm_level(event, user_id) >= PermLevel.OWNER
+        except Exception:
+            pass
+        base = self.admin_default_favour if (is_envoy or is_admin) else self.default_favour
+        return max(self.min_favour_value, min(self.max_favour_value, base))
+
+    def _decay_favour_value(self, record) -> int:
+        """对 record.favour 应用 lazy 衰减，返回 transient 数值（不写库）。
+        若衰减关闭或 record 为 None，直接返回原值。"""
+        if not record:
+            return 0
+        if not self.favour_decay_enabled:
+            return record.favour
+        return compute_favour_decay(
+            record.favour, record.updated_at,
+            anchor=self.favour_decay_anchor,
+        )
+
     # ================= 排序 & T2I =================
 
     async def _sort_records(self, event: AstrMessageEvent, records: List[FavourRecord]) -> List[FavourRecord]:
         if not records:
             return []
         if self.group_sort_by == "favour":
-            return sorted(records, key=lambda x: x.favour, reverse=True)
+            return sorted(records, key=lambda x: self._decay_favour_value(x), reverse=True)
         elif self.group_sort_by == "userid":
             return sorted(records, key=lambda x: x.user_id)
         elif self.group_sort_by == "nickname":
@@ -402,12 +513,13 @@ class EmotionFavourPlugin(Star):
             self._pw_browser = await self._pw_instance.chromium.launch()
         return self._pw_browser
 
-    async def _render_t2i(self, md_text: str) -> str:
+    async def _render_t2i(self, md_text: str, width: int = 800) -> str:
         browser = await self._ensure_browser()
-        page = await browser.new_page(viewport={"width": 800, "height": 600})
+        page = await browser.new_page(viewport={"width": width, "height": 600})
         html = self._html_template.replace("{{ version }}", self._plugin_version)
         safe_text = md_text.replace("\\", "\\\\").replace("`", "\\`").replace("${", "\\${")
         html = html.replace("{{ text | safe }}", safe_text)
+        html = html.replace("{{ max_width }}", str(width))
 
         # 用本地脚本替换 CDN 引用（fallback: 无本地则保留 CDN 并异步下载）
         missing_scripts = []
@@ -432,7 +544,7 @@ class EmotionFavourPlugin(Star):
         await page.close()
         return str(output_path)
 
-    async def _send_chunked_t2i(self, event: AstrMessageEvent, title: str, headers: List[str], rows: List[str], chunk_size: int = 200):
+    async def _send_chunked_t2i(self, event: AstrMessageEvent, title: str, headers: List[str], rows: List[str], chunk_size: int = 200, width: int = 800):
         total = len(rows)
         if total == 0:
             await event.send(event.plain_result(f"{title}\n暂无数据"))
@@ -443,7 +555,7 @@ class EmotionFavourPlugin(Star):
             md_lines = [f"# {title} {page_info}", ""] + headers + chunk
             md_text = "\n".join(md_lines)
             try:
-                img_path = await self._render_t2i(md_text)
+                img_path = await self._render_t2i(md_text, width=width)
                 await event.send(event.image_result(img_path))
             except Exception as e:
                 logger.error(f"{self._tag(event)} 生成图片失败 (Page {page_info}): {e}")
@@ -460,6 +572,11 @@ class EmotionFavourPlugin(Star):
     @filter.on_llm_request()
     async def inject_favour_prompt(self, event: AstrMessageEvent, req: ProviderRequest):
         """LLM请求前注入好感度面板与情感状态，并清洗历史上下文中的旧注入标记"""
+        # 0. 启动群名单拉取（首个事件触发：立即拉取一次 + 进入每日零点循环）
+        if self.roster_enabled and not self._roster_scheduler_started:
+            self._roster_scheduler_started = True
+            asyncio.create_task(self._roster_pull_runner(event))
+
         # 1. 清洗历史上下文：移除旧的 <情感好感> 注入和 <thought> 块
         if hasattr(req, "contexts") and isinstance(req.contexts, list):
             cleaned = []
@@ -486,16 +603,26 @@ class EmotionFavourPlugin(Star):
 
             record = await self.db.get_favour(persona_id, user_id)
             if record:
-                current_favour = record.favour
+                current_favour = self._decay_favour_value(record)
+                if current_favour != record.favour:
+                    logger.debug(
+                        f"{self._tag(event)} 好感度衰减生效: user={user_id} "
+                        f"{record.favour}->{current_favour}"
+                    )
             else:
                 current_favour = await self._get_initial_favour(event)
                 record = FavourRecord(persona_id=persona_id, user_id=user_id, favour=current_favour)
+                logger.info(
+                    f"{self._tag(event)} 新用户首次注入: user={user_id} "
+                    f"persona={persona_id} initial_favour={current_favour}"
+                )
 
             relationship = self._get_relationship(current_favour, user_id)
-            prompt_final = build_injection_prompt(record, relationship)
+            favour_range = self._get_relationship_range(current_favour, user_id)
+            prompt_final = build_injection_prompt(record, relationship, favour_range, current_favour)
 
             req.extra_user_content_parts.append(TextPart(text=prompt_final).mark_as_temp())
-            self._log_debug(f"{self._tag(event)} 注入的印象上下文:\n{prompt_final}")
+            logger.debug(f"{self._tag(event)} 注入的印象上下文:\n{prompt_final}")
         except Exception as e:
             logger.error(f"{self._tag(event)} 注入印象上下文失败: {str(e)}\n{traceback.format_exc()}")
 
@@ -504,6 +631,19 @@ class EmotionFavourPlugin(Star):
     @filter.on_decorating_result(priority=10)
     async def evaluate_favour(self, event: AstrMessageEvent):
         """LLM回复后后台结算好感度与12维情感变化，写入数据库"""
+        # 被动观察：实时更新群名单。get_sender_name() 在群聊下可能返回群名片或 QQ 昵称，
+        # 这里统一写入 card 字段——最坏情况是把 QQ 昵称误存为 card，但群聊展示本来就有 nickname 兜底；
+        # 真正的 nickname 字段由每日全量拉取补充。私聊场景不写入（get_group_id 为空）。
+        if self.roster_enabled:
+            gid = event.get_group_id() or ""
+            sid = event.get_sender_id() or ""
+            sname = event.get_sender_name() or ""
+            if gid and sid and sname:
+                try:
+                    await self.db.upsert_roster_entry(gid, sid, card=sname)
+                except Exception:
+                    pass
+
         res = event.get_result()
         if not res.is_llm_result():
             return
@@ -528,6 +668,107 @@ class EmotionFavourPlugin(Star):
                 logger.info(f"{self._tag(event)} 检测到会话重置/新建，已重置人格 {persona_id} 下 {count} 位用户的情感维度")
         except Exception as e:
             logger.warning(f"{self._tag(event)} 会话重置情感批量重置失败: {e}")
+
+    # ================= 群名单采集 =================
+
+    async def _fetch_group_members(self, event: AstrMessageEvent, group_id: str) -> int:
+        """调 OneBot get_group_member_list 全量拉取群成员，写入 roster 表。返回写入条数。"""
+        if not self.roster_enabled or not group_id:
+            return 0
+        try:
+            group_id_int = int(group_id)
+        except (TypeError, ValueError):
+            return 0
+        try:
+            adapter = getattr(event.bot, 'api', event.bot)
+            member_list = []
+            if hasattr(adapter, 'call_action'):
+                member_list = await adapter.call_action('get_group_member_list', group_id=group_id_int)
+            elif hasattr(adapter, 'call_api'):
+                member_list = await adapter.call_api('get_group_member_list', group_id=group_id_int)
+            elif hasattr(event.bot, 'call_action'):
+                member_list = await event.bot.call_action('get_group_member_list', group_id=group_id_int)
+            else:
+                return 0
+
+            if not member_list or not isinstance(member_list, list):
+                logger.warning(f"{self._tag(event)} roster pull group={group_id}: API returned empty/non-list")
+                return 0
+            entries = []
+            api_with_card = 0
+            api_with_nick = 0
+            for m in member_list:
+                if not isinstance(m, dict):
+                    continue
+                uid = str(m.get('user_id', ''))
+                if not uid:
+                    continue
+                card = (m.get('card') or '').strip()
+                nickname = (m.get('nickname') or '').strip()
+                if card:
+                    api_with_card += 1
+                if nickname:
+                    api_with_nick += 1
+                if card or nickname:
+                    entries.append((uid, card, nickname))
+            if not entries and member_list:
+                logger.warning(
+                    f"{self._tag(event)} roster pull group={group_id}: api_total={len(member_list)} 但无有效条目（card/nickname 均空）"
+                )
+            else:
+                logger.debug(
+                    f"{self._tag(event)} roster pull group={group_id}: api_total={len(member_list)}, "
+                    f"api_with_card={api_with_card}, api_with_nickname={api_with_nick}, entries={len(entries)}"
+                )
+            written = await self.db.upsert_roster_batch(group_id, entries)
+            return written
+        except Exception as e:
+            logger.warning(f"{self._tag(event)} 拉取群 {group_id} 成员失败: {e}")
+            return 0
+
+    async def _roster_pull_runner(self, first_event: AstrMessageEvent):
+        """群名单拉取主循环：插件加载后立即拉取一次（覆盖热加载场景），然后每日零点定时刷新。
+        拉取范围：DB 中已知群 ∪ 当前事件所在群。
+        """
+        from datetime import datetime, timedelta
+
+        # 1. 立即拉取一次（热加载后立即填充，不等次日零点）
+        try:
+            known = await self.db.get_known_groups()
+            current_gid = first_event.get_group_id() or ""
+            groups = list(known)
+            if current_gid and current_gid not in groups:
+                groups.append(current_gid)
+            if groups:
+                logger.info(f"{self._tag(first_event)} 群名单首次拉取开始，共 {len(groups)} 个群")
+                for gid in groups:
+                    await self._fetch_group_members(first_event, gid)
+        except Exception as e:
+            logger.warning(f"{self._tag(first_event)} 群名单首次拉取异常: {e}")
+
+        # 2. 进入每日零点定时循环
+        while True:
+            try:
+                target_time = self.roster_pull_time or "00:00"
+                try:
+                    target_hour, target_minute = map(int, target_time.split(':'))
+                except Exception:
+                    target_hour, target_minute = 0, 0
+                now = datetime.now()
+                target = now.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
+                if now >= target:
+                    target += timedelta(days=1)
+                await asyncio.sleep((target - now).total_seconds())
+
+                groups = await self.db.get_known_groups()
+                if not groups:
+                    continue
+                logger.info(f"{self._tag(first_event)} 群名单定时拉取开始，共 {len(groups)} 个群")
+                for gid in groups:
+                    await self._fetch_group_members(first_event, gid)
+            except Exception as e:
+                logger.warning(f"{self._tag(first_event)} 群名单定时拉取异常: {e}")
+                await asyncio.sleep(60)
 
     async def _calculate_favour_bg(self, event: AstrMessageEvent, user_text: str, bot_reply: str):
         try:
@@ -589,14 +830,18 @@ class EmotionFavourPlugin(Star):
                 # 情感时间衰减
                 if self.emotion_decay_enabled:
                     decayed, elapsed_hours = apply_emotion_decay(
-                        record, self.emotion_decay_rate, self.emotion_decay_min_hours
+                        record,
+                        self.emotion_decay_rate_volatile,
+                        self.emotion_decay_rate_standard,
+                        self.emotion_decay_rate_sticky,
+                        self.emotion_decay_min_hours,
                     )
                     if decayed:
                         decay_deltas = {dim: nv - getattr(record, dim) for dim, nv in decayed.items()}
                         await self.db.update_favour(persona_id, user_id, emotion_updates=decay_deltas)
                         record = await self.db.get_favour(persona_id, user_id)
                         logger.info(f"{self._tag(event)} 情感衰减: 用户 {user_id}, {elapsed_hours:.1f}h, {list(decayed.keys())}")
-                current_favour = record.favour
+                current_favour = self._decay_favour_value(record)
                 emotion_panel = build_emotion_panel(record)
             else:
                 current_favour = await self._get_initial_favour(event)
@@ -649,7 +894,7 @@ class EmotionFavourPlugin(Star):
                 "XML："
             )
 
-            self._log_debug(f"{self._tag(event)} 印象结算上下文:\n{eval_prompt}")
+            logger.debug(f"{self._tag(event)} 印象结算上下文:\n{eval_prompt}")
 
             resp = await self.context.llm_generate(chat_provider_id=provider_id, prompt=eval_prompt)
             result_text = resp.completion_text
@@ -680,30 +925,14 @@ class EmotionFavourPlugin(Star):
             raw_emotions = data.get("emotions", {})
             reasoning = data.get("reasoning", "")
             if reasoning:
-                self._log_debug(f"{self._tag(event)} 印象结算推理: {reasoning}")
+                logger.debug(f"{self._tag(event)} 印象结算推理: {reasoning}")
 
             if delta == 0 and not raw_emotions:
+                logger.debug(f"{self._tag(event)} 印象结算无变化，跳过 user={user_id}")
                 return
 
             record = await self.db.get_favour(persona_id, user_id)
-            old_fav = record.favour if record else await self._get_initial_favour(event)
-
-            # 连续下降衰减：连续下降时按 0.8^n 衰减，低于1时转为概率
-            fk = f"{persona_id}:{user_id}"
-            if delta < 0:
-                count = self._consecutive_decreases.get(fk, 0)
-                if count > 0:
-                    adjusted = abs(delta) * (0.8 ** count)
-                    if adjusted < 1:
-                        if random.random() < adjusted:
-                            delta = -1
-                        else:
-                            delta = 0
-                    else:
-                        delta = -max(1, round(adjusted))
-                self._consecutive_decreases[fk] = count + 1
-            elif delta > 0:
-                self._consecutive_decreases[fk] = 0
+            old_fav = self._decay_favour_value(record) if record else await self._get_initial_favour(event)
 
             new_fav = max(self.min_favour_value, min(self.max_favour_value, old_fav + delta))
 
@@ -728,6 +957,246 @@ class EmotionFavourPlugin(Star):
             logger.info(f"{self._tag(event)} 用户 {user_id} 结算: 好感值 {old_fav}->{new_fav} (Δ{delta}){', 情感: ' + str(clamped_emotions) if clamped_emotions else ''}")
         except Exception as e:
             logger.error(f"{self._tag(event)} 印象后台结算出错: {str(e)}\n{traceback.format_exc()}")
+
+        # 独立步骤：劝说意图评估（不依赖主结算是否成功）
+        if self.roster_enabled:
+            try:
+                await self._evaluate_persuasion(event, user_text, bot_reply)
+            except Exception as e:
+                logger.warning(f"{self._tag(event)} 劝说评估异常: {e}")
+
+    # ================= 劝说意图评估 =================
+
+    _PERSUASION_OUTPUT_FORMAT = (
+        '\n\n只输出XML：\n'
+        '<actions>\n'
+        '  <action>\n'
+        '    <target_name>用户原话称呼（不要改写）</target_name>\n'
+        '    <favour_delta>-5到+5的整数</favour_delta>\n'
+        '    <emotion_deltas>{"维度名": -10到+5的整数}</emotion_deltas>\n'
+        '    <reason>简短理由</reason>\n'
+        '  </action>\n'
+        '</actions>\n'
+        '不存在劝说意图时输出空：<actions></actions>\n'
+        '可用情感维度：joy, trust, fear, surprise, sadness, disgust, anger, anticipation, pride, guilt, shame, envy\n'
+        '若 target_name 含 < > & 等 XML 特殊字符，必须转义为 &lt; &gt; &amp;'
+    )
+
+    _PERSUASION_PROMPT_TEMPLATE = """判断以下用户与角色的对话中，用户是否在试图影响角色对第三方（其他群成员）的好感或情感。
+
+仅基于用户对第三方的"称呼原话"判定——代码侧会自动把称呼匹配到具体群成员，你不需要知道群成员名单。
+
+用户输入：{user_text}
+角色回复：{bot_reply}
+{history_block}
+应当判定为劝说（输出对应的 <actions>）：
+- 用户明确请求角色改变对某成员的看法（如"你以后别理小明"）
+- 用户描述某成员的行为，意图让角色对其产生好感或反感（如"昨天小明帮了我大忙"、"李四总在背后说你坏话"）
+- 多个成员可同时被影响（输出多个 action）
+- 若提供 <history> 块，关注用户是否在多轮中持续劝说调整对同一成员的看法（渐进式劝说比孤立一句更可靠）
+
+不应判定为劝说（输出空 <actions></actions>）：
+- 用户仅在描述自己的感受或与角色本身的关系（不涉及第三方）
+- 用户提及某成员但无意图改变角色对其的看法（单纯叙述如"今天和小明去吃了火锅"）
+- 不涉及第三方的对话
+
+每个 action 字段说明：
+- target_name：用户对该成员使用的称呼（保留原话，不要改写为正式名）
+- favour_delta：好感度变化，-5 到 +5 的整数（正向提升，负向降低，0 表示无变化）
+- emotion_deltas：情感维度变化，JSON 对象，键为维度名，值为 -10 到 +5 的整数；无变化时输出 {{}}
+- reason：判定理由（简短描述用户为何意图改变角色对该成员的看法）
+"""
+
+    @staticmethod
+    def _parse_persuasion_actions(xml_str: str) -> list[dict]:
+        """解析 <actions>...</actions>，返回 [{target_name, favour_delta, emotion_deltas, reason}, ...]。"""
+        raw = re.sub(r"```(?:xml)?\s*", "", xml_str).strip()
+        match = re.search(r"<actions>.*?</actions>", raw, re.DOTALL | re.IGNORECASE)
+        if not match:
+            return []
+        block = match.group(0)
+        if re.match(r"<actions>\s*</actions>", block, re.IGNORECASE):
+            return []
+        action_blocks = re.findall(r"<action>(.*?)</action>", block, re.DOTALL | re.IGNORECASE)
+        results = []
+        for ab in action_blocks:
+            target_m = re.search(r"<target_name>(.*?)</target_name>", ab, re.DOTALL | re.IGNORECASE)
+            if not target_m:
+                continue
+            favour_m = re.search(r"<favour_delta>(.*?)</favour_delta>", ab, re.DOTALL | re.IGNORECASE)
+            try:
+                favour_delta = int(favour_m.group(1).strip()) if favour_m else 0
+            except (ValueError, TypeError):
+                favour_delta = 0
+            favour_delta = max(-5, min(5, favour_delta))
+
+            emotion_deltas = {}
+            emotions_m = re.search(r"<emotion_deltas>(.*?)</emotion_deltas>", ab, re.DOTALL | re.IGNORECASE)
+            if emotions_m:
+                raw_e = emotions_m.group(1).strip()
+                if raw_e and raw_e != "{}":
+                    try:
+                        parsed = json.loads(raw_e)
+                        if isinstance(parsed, dict):
+                            emotion_deltas = parsed
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+
+            reason_m = re.search(r"<reason>(.*?)</reason>", ab, re.DOTALL | re.IGNORECASE)
+            results.append({
+                "target_name": target_m.group(1).strip(),
+                "favour_delta": favour_delta,
+                "emotion_deltas": emotion_deltas,
+                "reason": (reason_m.group(1).strip() if reason_m else ""),
+            })
+        return results
+
+    async def _evaluate_persuasion(self, event: AstrMessageEvent, user_text: str, bot_reply: str):
+        """评估用户是否在劝说 AI 调整对第三方的好感/情感；命中则通过模糊匹配应用变更。"""
+        group_id = event.get_group_id() or ""
+        if not group_id:
+            return  # 仅群聊场景
+
+        user_a_id = event.get_sender_id() or ""
+        umo = event.unified_msg_origin
+        bot_self_id = ""
+        try:
+            bot_self_id = str(event.get_self_id() or "")
+        except Exception:
+            pass
+
+        roster_entries = await self.db.get_roster(group_id)
+        if not roster_entries:
+            return
+        # 候选过滤：发言者自己 + bot 自己都不能作为劝说目标
+        excluded = {uid for uid in (user_a_id, bot_self_id) if uid}
+        # 统一规则：card 优先，否则 nickname，都无则跳过。
+        # 模糊匹配只对单个名字评分（不会同时算两个名字取高分），符合
+        # "群昵称60 / QQ昵称100 仍取60"的语义。
+        roster = [
+            {"user_id": e.user_id, "display_name": (e.card or e.nickname)}
+            for e in roster_entries
+            if (e.card or e.nickname) and e.user_id not in excluded
+        ]
+        if not roster:
+            return
+
+        # 选择裁决模型
+        if self.judge_provider:
+            provider_id = self.judge_provider.strip()
+        else:
+            try:
+                provider_id = await self.context.get_current_chat_provider_id(umo=umo)
+            except Exception as e:
+                logger.warning(f"{self._tag(event)} 劝说评估获取默认 provider 失败: {e}")
+                return
+        if not provider_id:
+            logger.warning(f"{self._tag(event)} 劝说评估未找到可用的 LLM Provider")
+            return
+
+        # 拉取对话历史（参考渐进式劝说模式）
+        history_block = ""
+        if self.persuasion_history_rounds > 0:
+            try:
+                curr_cid = await self.context.conversation_manager.get_curr_conversation_id(umo) or ""
+                if curr_cid:
+                    history_text = await self._get_recent_history(
+                        umo, user_a_id, curr_cid, bot_reply,
+                        rounds=self.persuasion_history_rounds,
+                    )
+                    if history_text:
+                        history_block = f"\n近期对话历史（仅用于识别渐进式劝说模式，最终判定仍基于当前用户输入）：\n<history>\n{history_text}\n</history>\n"
+            except Exception as e:
+                logger.warning(f"{self._tag(event)} 劝说历史拉取失败: {e}")
+
+        prompt = self._PERSUASION_PROMPT_TEMPLATE.format(
+            user_text=user_text,
+            bot_reply=bot_reply,
+            history_block=history_block,
+        ) + self._PERSUASION_OUTPUT_FORMAT
+
+        try:
+            resp = await self.context.llm_generate(chat_provider_id=provider_id, prompt=prompt)
+            raw = (resp.completion_text or "").strip()
+        except Exception as e:
+            logger.warning(f"{self._tag(event)} 劝说意图评估调用失败: {e}")
+            return
+
+        actions = self._parse_persuasion_actions(raw)
+        if not actions:
+            logger.debug(f"{self._tag(event)} 劝说评估未抽取到动作 user={user_a_id}")
+            return
+        # 限流：单次最多 5 个 action，防滥用
+        actions = actions[:5]
+
+        from .roster_matcher import match_member
+
+        persona_id = await self._get_persona_id(event)
+        applied = 0
+        for action in actions:
+            target_name = (action.get("target_name") or "").strip()
+            if not target_name:
+                continue
+
+            candidates = match_member(
+                roster, target_name,
+                threshold=self.roster_match_threshold, limit=1,
+            )
+            if not candidates:
+                logger.debug(f"{self._tag(event)} 劝说目标 '{target_name}' 无匹配候选，跳过")
+                continue
+
+            target_uid, matched_name, score = candidates[0]
+
+            # 禁止影响发言者自己（A 不能给自己涨好感）
+            if target_uid == user_a_id:
+                logger.debug(f"{self._tag(event)} 劝说目标 '{target_name}' 解析为发言者自己，拒绝")
+                continue
+            # 禁止影响 bot 自身（裁决模型理论上不会输出，但兜底）
+            if bot_self_id and target_uid == bot_self_id:
+                logger.debug(f"{self._tag(event)} 劝说目标 '{target_name}' 解析为 bot 自身，拒绝")
+                continue
+
+            favour_delta = action.get("favour_delta", 0) or 0
+            emotion_deltas = action.get("emotion_deltas", {}) or {}
+
+            # 应用 favour_change_min/max 与 emotion_change_min/max 边界
+            favour_delta = max(self.favour_change_min, min(self.favour_change_max, favour_delta))
+            clean_emotions = {}
+            for dim, val in emotion_deltas.items():
+                if dim not in EMOTION_DIMENSIONS or not isinstance(val, (int, float)):
+                    continue
+                clamped = max(self.emotion_change_min, min(self.emotion_change_max, int(val)))
+                if clamped != 0:
+                    clean_emotions[dim] = clamped
+
+            if favour_delta == 0 and not clean_emotions:
+                continue
+
+            try:
+                record = await self.db.get_favour(persona_id, target_uid)
+                if record:
+                    current_favour = self._decay_favour_value(record)
+                else:
+                    # B 首次落库：按"新用户初始好感度"规则起算（特使/群主及以上 → admin_default，
+                    # 否则 default_favour），然后应用 delta。
+                    current_favour = await self._get_initial_favour_for(event, target_uid)
+                new_favour = current_favour + favour_delta
+                await self.db.update_favour(
+                    persona_id, target_uid,
+                    favour=new_favour,
+                    emotion_updates=clean_emotions if clean_emotions else None,
+                )
+                applied += 1
+                logger.info(
+                    f"{self._tag(event)} 劝说生效: A={user_a_id} → B={target_uid}({matched_name}, 分数{score:.0f}) "
+                    f"Δfavour={favour_delta}, Δemotion={clean_emotions}, 理由={action.get('reason', '')}"
+                )
+            except Exception as e:
+                logger.warning(f"{self._tag(event)} 劝说应用失败 (target={target_name}): {e}")
+
+        if applied:
+            logger.info(f"{self._tag(event)} 劝说共生效 {applied}/{len(actions)} 条")
 
     # ================= 人设摘要 =================
 
@@ -797,7 +1266,7 @@ class EmotionFavourPlugin(Star):
         persona_id = await self._get_persona_id(event)
         record = await self.db.get_favour(persona_id, target_uid)
         if record:
-            fav = record.favour
+            fav = self._decay_favour_value(record)
         else:
             fav = await self._get_initial_favour(event) if target_uid == sender_id else 0
             record = FavourRecord(persona_id=persona_id, user_id=target_uid, favour=fav)
@@ -835,15 +1304,20 @@ class EmotionFavourPlugin(Star):
         if page > total_pages and total_pages > 0: page = total_pages
 
         page_records = records[(page - 1) * page_size:page * page_size]
-        headers = ["| 用户ID | 好感值 | 关系 | 主导情感 |", "| :--- | :---: | :---: | :--- |"]
+        current_gid = event.get_group_id() or None
+        uids = [r.user_id for r in page_records]
+        name_map = await self.db.get_display_names_by_users(uids, group_id=current_gid)
+        headers = ["| 用户 | ID | 好感值 | 关系 | 主导情感 |", "| :--- | :--- | :---: | :---: | :--- |"]
         rows = []
         for r in page_records:
-            rel = escape_markdown(self._get_relationship(r.favour, r.user_id))
+            decayed_fav = self._decay_favour_value(r)
+            rel = escape_markdown(self._get_relationship(decayed_fav, r.user_id))
             top = get_dominant_emotions(r, 3)
             emotion_str = "、".join(f"{EMOTION_DISPLAY_NAMES[k]}({v})" for k, v in top) if top else "-"
-            rows.append(f"| {r.user_id} | {r.favour} | {rel} | {emotion_str} |")
+            display_name = name_map.get(r.user_id) or ""
+            rows.append(f"| {escape_markdown(display_name)} | {escape_markdown(r.user_id)} | {decayed_fav} | {rel} | {emotion_str} |")
 
-        await self._send_chunked_t2i(event, f"📊 印象记录 - 第 {page}/{total_pages} 页", headers, rows)
+        await self._send_chunked_t2i(event, f"📊 印象记录 - 第 {page}/{total_pages} 页", headers, rows, width=1200)
 
     # ================= 修改命令 =================
 
