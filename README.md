@@ -10,6 +10,7 @@
 - **情感时间衰减**：长时间未互动的用户情感自然回归 baseline，防止情绪永久累积
 - **好感度时间衰减**：与情感衰减独立，采用 lazy 求值（读时计算、不跑定时任务），偏离锚点越远衰减越快；仅在裁决模型结算时落盘新值与时间戳
 - **关系区间进度**：对话注入会告诉 AI 当前好感在所处关系区间内的积累百分比（刚进入/稳定/接近下一阶段/巅峰），对冲衰减带来的挫败感，让"刷好感"有可见的进度反馈
+- **互动边界与过渡预告**：advance 模式下每个关系等级可配置 `boundary`（允许/临界/回避的身体接触动作清单，注入对话）、`preview`（高进度时预告下一等级的入门动作）、`rule`（此等级的加分/扣分判定规则，后台结算用）——三者解耦对话行为与数值结算
 - **关系调解（AI 劝说）**：群聊中 A 可通过多轮对话让 AI 调整对第三方 B 的好感度与情感，裁决模型抽取目标 + 意图，rapidfuzz 模糊匹配落地变更
 - **群名单基础设施**：被动观察 + 定时全量拉取，维护 user_id → {card, nickname} 映射，所有名字解析统一走"群名片 > QQ 昵称 > 空"规则
 - **注入渲染**：自动将好感度、关系、情感面板与三层语气渲染注入对话上下文
@@ -33,9 +34,11 @@
 emotion_favour/
 ├── main.py              # 插件主体（Star 类、Hook、命令）
 ├── storage.py           # 数据库模型与管理（SQLModel + aiosqlite）
+├── migrate.py           # 配置版本链式迁移（v0→v1→...）
 ├── roster_matcher.py    # 群名单模糊匹配工具（rapidfuzz）
 ├── utils.py             # 工具函数
 ├── permissions.py       # 权限等级与权限管理
+├── log.py               # 日志器与 debug_to_info 适配
 ├── _conf_schema.json    # 配置项定义
 ├── custom_t2i.html      # T2I 图片渲染模板
 ├── metadata.yaml
@@ -54,6 +57,23 @@ emotion_favour/
 | `default_favour` | 新用户初始好感度 | 0 |
 | `judge_provider` | 裁决模型（留空跟随当前对话模型） | — |
 | `relationship_config` | 关系映射（simple 列表 / advance 自定义区间） | simple |
+| `config_version` | 配置版本号（**自动管理**，插件启动时链式迁移旧配置） | 0 |
+
+### 关系映射配置（relationship_config）
+
+两种模式：
+
+- **simple**：`simple_list` 给一组关系名（从低到高），插件按好感度范围自动均分。仅注入关系名，无边界/规则。
+- **advance**：`advance_config` 用 `template_list` 表单化编辑每个等级。点击「添加项」选「好感度等级」模板，每个等级含六个字段：
+
+| 字段 | 注入位置 | 作用 |
+|------|----------|------|
+| `describe` / `min_value` / `max_value` | 关系名 + 区间匹配 | 等级名称；好感度落在 [min, max] 内则匹配此等级 |
+| `boundary` | 对话 `<情感好感>` 标签 | 允许/临界/回避的身体接触动作，决定 LLM 在当前好感度下的接触尺度 |
+| `preview` | 对话（高进度时） | 本区间积累到 80% 以上时额外注入下一等级的入门动作预告 |
+| `rule` | 后台裁决 prompt | 此等级下什么样的互动会扣分/加分，只影响数值结算 |
+
+> ⚠️ 区间不可重叠——建议等级间留 1 间隙（A=0-30、B=31-60、C=61-100）。老版 JSON 字符串配置会在启动时自动迁移到 template_list 格式。
 
 ### 高级配置（advanced_config）
 
@@ -137,6 +157,17 @@ emotion_favour/
 - **特殊场景**：admin override 关系不注入进度行；挚爱区间（y==x）直接显示 100% 巅峰
 - **与衰减协同**：进度跟着衰减后的 transient 值走，长期不互动 → 进度掉 → AI 表现冷淡，形成"需要维护关系"的自然反馈循环
 
+## 管理员覆盖（admin override）
+
+`admin_default_relationship` 非空时，`favour_envoys` 列表 + Bot 管理员（`admins_id`）的用户走特殊关系路径：
+
+- **关系名展示**：始终展示 `admin_default_relationship`（如「特殊」），不随好感度变化
+- **advance 模式按最高等级处理**：`boundary` / `rule` / `preview` 取自配置中 min_value 最高的等级（如「挚爱」），`is_max_tier=True`，进度行展示「已达最高等级」
+- **后台结算**：`current_rule` 用最高等级的 rule，但描述仍标注 `admin_default_relationship` 名称
+- **simple 模式**：仅替换关系名，无边界/规则字段（simple 模式不配置 tier）
+
+效果：管理员对话注入走最高等级的接触边界（深度亲密），但关系标签仍读作自定义的「特殊」名，不混淆用户。
+
 ## 对话上下文
 
 裁决模型参考的对话历史支持两种来源：
@@ -144,7 +175,7 @@ emotion_favour/
 - **AstrBot 自带上下文**（默认）：从 `conv.history` 读取，群聊场景下所有用户共享上下文
 - **chat_memory 插件**（需安装）：按 `UMO + conversation_id + user_id` 隔离读取，群内每个用户独立历史
 
-> 启用 chat_memory 前需先安装该插件，否则自动回退。
+> 启用 chat_memory 前需先安装该插件（<https://github.com/W-Wolfycz/chat_memory>），否则自动回退到 AstrBot 自带上下文。
 
 ## 依赖
 

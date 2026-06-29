@@ -47,6 +47,12 @@
     "_special": "select_provider",
     "hint": "判断好感度变化的模型，留空则使用当前默认对话模型。"
   },
+  "config_version": {
+    "description": "配置版本号（自动管理）",
+    "type": "int",
+    "default": 0,
+    "hint": "⚠️ 自动管理字段，请勿手动修改。插件启动时会按版本号链式迁移旧配置；手动改大可能跳过必要迁移，改小会导致重复迁移（迁移逻辑幂等，但会浪费一次启动时间）。"
+  },
   "relationship_config": {
     "description": "好感度关系映射配置",
     "type": "object",
@@ -77,10 +83,53 @@
         "hint": "从低到高排列，好感度范围将按项数自动均分。仅在 simple 模式下生效。"
       },
       "advance_config": {
-        "description": "高级模式配置 (JSON格式)",
-        "type": "text",
-        "default": "[{\"describe\":\"极度厌恶\",\"min_value\":-100,\"max_value\":-91,\"rule\":\"无论用户说什么内容，你都会感到十分嫌弃。如果没有其他人请求，该等级用户无法提升好感度。\"},{\"describe\":\"厌恶\",\"min_value\":-90,\"max_value\":-51,\"rule\":\"你对用户抱有很强烈的抗拒感，你会想尽办法不想与其发生交流。该等级用户可以通过正向互动稍微恢复好感度。\"},{\"describe\":\"反感\",\"min_value\":-50,\"max_value\":-1,\"rule\":\"你对用户的行为感到反感，会明显表现出自己对TA没有好感。此等级用户可以正常通过对话进行好感度增减。\"},{\"describe\":\"普通\",\"min_value\":0,\"max_value\":49,\"rule\":\"你对用户的态度为普通朋友。态度很平淡，不会主动表现出喜爱或者厌恶情绪。但是你不喜欢对方缺少分寸感的发言，如果出现，你会感到反感。\"},{\"describe\":\"喜欢\",\"min_value\":50,\"max_value\":89,\"rule\":\"你对于用户有一定的喜欢。用户的言语、动作主要不是特别冒犯，都会让你感到喜欢。此等级用户可以正常通过对话进行好感度增减。\"},{\"describe\":\"亲密\",\"min_value\":90,\"max_value\":99,\"rule\":\"你几乎不会对用户的行为感到不适。用户做什么都会引起你的喜欢。（除非太过强硬，明显违背你的意愿）此等级用户可以正常通过对话进行好感度增减。\"},{\"describe\":\"挚爱\",\"min_value\":100,\"max_value\":100,\"rule\":\"你对用户抱有极深的感情，极为重视用户的每一句话。\"}]",
-        "hint": "JSON数组，每项含 describe(名称)、min_value、max_value、rule(LLM行为规则)。可参考默认值格式修改。"
+        "description": "高级模式配置（好感度等级）",
+        "type": "template_list",
+        "templates": {
+          "custom": {
+            "name": "好感度等级",
+            "hint": "添加一个好感度等级",
+            "items": {
+              "describe": {
+                "description": "等级名称",
+                "type": "string",
+                "default": "",
+                "hint": "等级名称（如「友好」），注入到对话的「关系」字段，让 LLM 知道当前好感度所处的阶段。"
+              },
+              "min_value": {
+                "description": "区间下限",
+                "type": "int",
+                "default": 0,
+                "hint": "好感度区间下限（含）。落在 [min_value, max_value] 内的好感度将匹配此等级。"
+              },
+              "max_value": {
+                "description": "区间上限",
+                "type": "int",
+                "default": 0,
+                "hint": "好感度区间上限（含）。落在 [min_value, max_value] 内的好感度将匹配此等级。"
+              },
+              "boundary": {
+                "description": "互动边界（注入对话）",
+                "type": "text",
+                "default": "",
+                "hint": "对话时 LLM 看到的「互动边界」——允许/临界/回避哪些身体接触动作。每次 LLM 生成回复时都会注入到 <情感好感> 标签内，决定角色在当前好感度下的接触尺度。\n\n建议句式：「允许：A；临界：B；回避：C」（无某段可省略）。\n示例：「允许：朋友式轻度接触（击掌、拍肩、并肩）；临界：牵手、摸头；回避：拥抱、亲吻及更亲密接触」"
+              },
+              "preview": {
+                "description": "过渡预告（高进度时注入）",
+                "type": "text",
+                "default": "",
+                "hint": "当好感度在本区间内积累到 80% 以上时，额外注入给 LLM 的「过渡预告」——告诉它可以开始轻微流露下一等级的入门动作，让等级切换更自然。\n\n写法：取下一等级 boundary 里「允许」段中最轻度的几个动作。\n示例：「可开始流露轻度亲密（牵手、摸头、挽手臂）」\n\n【何时留空】最高等级通常留空，因为没有更高等级可解锁。"
+              },
+              "rule": {
+                "description": "评估规则（后台结算用）",
+                "type": "text",
+                "default": "",
+                "hint": "后台好感度结算时 LLM 看到的「评估规则」——如「情感操控不受高好感保护，仍会正常扣分」。只影响好感度数值变化幅度的判定，不注入到对话。\n\n与 boundary 的区别：boundary 决定「角色此刻愿意做到哪一步」（对话行为），rule 决定「此等级下什么样的互动会扣分/加分」（数值结算）。"
+              }
+            }
+          }
+        },
+        "hint": "好感度等级配置。用户好感度落在哪个区间就用哪个等级的设定。点击「添加项」选择「好感度等级」模板即可创建一个新等级。\n\n【⚠️ 区间不可叠加】不同等级的 [min_value, max_value] 不能重叠！例如 A=0-30、B=30-60 这种共享边界 30 的写法会导致 Undefined Behavior——代码取第一个匹配的等级，但「第一个」取决于列表顺序，行为不稳定。建议等级之间留 1 的间隙：A=0-30、B=31-60、C=61-100。"
       }
     }
   },
@@ -252,7 +301,7 @@
         "description": "使用 chat_memory 插件提供对话上下文",
         "type": "bool",
         "default": false,
-        "hint": "启用后，裁决模型参考的对话历史从 chat_memory 插件按用户ID隔离读取。\n未启用时，从 AstrBot 自带上下文管理读取（群聊场景共享上下文）。\n⚠️ 启用前需先安装 chat_memory 插件，否则自动回退到 AstrBot 自带上下文。"
+        "hint": "启用后，裁决模型参考的对话历史从 chat_memory 插件按用户ID隔离读取。\n未启用时，从 AstrBot 自带上下文管理读取（群聊场景共享上下文）。\n⚠️ 启用前需先安装 chat_memory 插件（https://github.com/W-Wolfycz/chat_memory），否则自动回退到 AstrBot 自带上下文。"
       },
       "emotion_decay_enabled": {
         "description": "启用情感时间衰减",

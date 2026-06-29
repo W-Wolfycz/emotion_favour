@@ -1,6 +1,49 @@
 # 更新日志
 
-## 未发布
+## 3.2.0
+2026-06-30
+
+### 关系等级 template_list 改造
+
+advance 模式的 `relationship_config.advance_config` 从原始 JSON 字符串迁移到 AstrBot 原生的 `template_list` 类型——每个等级是一个独立模板项，WebUI 配置页可表单化编辑，不再需要手写 JSON。
+
+模板项 `好感度等级` 包含六个字段：
+
+- `describe` / `min_value` / `max_value`：等级名称与好感度区间
+- `boundary`：**互动边界**（注入对话）——允许/临界/回避哪些身体接触动作，决定 LLM 在当前好感度下的接触尺度
+- `preview`：**过渡预告**（高进度时注入）——本区间积累到 80% 以上时额外注入下一等级的入门动作，让等级切换更自然
+- `rule`：**评估规则**（后台结算用）——此等级下什么样的互动会扣分/加分，只影响数值结算，不注入对话
+
+`boundary` 与 `rule` 解耦：前者决定「角色此刻愿意做到哪一步」（对话行为），后者决定「此等级下加分/扣分判定」（数值结算）。
+
+### 配置版本迁移系统
+
+新增 `config_version` 字段（自动管理）+ `migrate.py` 链式迁移框架：
+
+- **自动迁移**：插件启动时按版本号链式升级旧配置到 `CURRENT_CONFIG_VERSION`
+- **v0 → v1**：老 JSON 字符串格式的 `advance_config` 自动解析为 list 并注入 `__template_key=custom`，原字段全部保留
+- **幂等可重试**：JSON 损坏时不 bump 版本号，下次启动可重试；已是当前版本时无操作
+- **持久化**：迁移发生时自动调 `save_config()` 落盘，避免内存迁移丢失
+- **健康度自检**：测试覆盖「版本号与注册表一致」「每版有迁移函数」「CURRENT 版本幂等」
+
+### 管理员覆盖按最高等级处理
+
+admin / 特使用户（`admin_default_relationship` 非空 + uid 在特权集）在 advance 模式下走「最高等级」分支：
+
+- **对话注入**：`boundary` / `rule` / `preview` 取自最高等级（如「挚爱」的深度亲密边界），`is_max_tier=True`
+- **关系名**：`<情感好感>` 标签里仍展示 `admin_default_relationship`（如「特殊」），不混淆用户
+- **进度行**：展示「已达最高等级」而非具体百分比
+- **后台结算**：`current_rule` 取最高等级的 rule，描述用 admin_default_relationship 名称
+
+新增辅助方法 `_get_max_tier()` / `_is_admin_override()`，原 `_find_tier` 逻辑保留给非 admin 用户。
+
+### 配置 hint 文案精简
+
+- 删除「端点等级提示」段（最低等级不写 preview / 最高等级不写回避）——硬越界由其他插件处理
+- 删除「动作描写尽量中立、无情感色彩」建议——中立化是插件作者侧的事，不应强加给单人格用户
+- 删除「（与进度语义『接近下一阶段』档对齐）」技术注释
+- preview「何时留空」简化为「最高等级通常留空，因为没有更高等级可解锁」（最低等级有次低可过渡，不再要求留空）
+- `use_chat_memory` hint 补上 chat_memory 插件仓库链接 `https://github.com/W-Wolfycz/chat_memory`
 
 ### 情感衰减分组差异化
 
@@ -14,7 +57,7 @@
 - 新增 `emotion_decay_rate_volatile` / `emotion_decay_rate_standard` / `emotion_decay_rate_sticky` 三个独立旋钮
 - 移除 `emotion_decay_rate`（向后兼容：若用户旧版改过此值且未配新版字段，三组都用旧值）
 
-#### 对话历史时间戳改 XML 注入
+### 对话历史时间戳改 XML 注入
 
 `_get_recent_history` 中每条历史的时间戳由 `(MM-DD HH:MM)` 圆括号前缀改为 `<time>MM-DD HH:MM</time>` 标签——避免 LLM 把时间戳当成正文格式模仿。
 

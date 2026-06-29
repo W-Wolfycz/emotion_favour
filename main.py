@@ -43,6 +43,29 @@ class EmotionFavourPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
 
+        # 配置迁移：把旧版本配置升级到 CURRENT_CONFIG_VERSION
+        # 必须在读取任何配置字段之前完成——原地修改 config dict
+        from .migrate import migrate
+        migrated_version_before = (
+            config.get("config_version", 0) if isinstance(config, dict) else 0
+        )
+        migrate(config)
+        if (
+            isinstance(config, dict)
+            and config.get("config_version", 0) != migrated_version_before
+        ):
+            # 真的发生迁移了 → 持久化到磁盘
+            try:
+                global_config = self._get_context_config()
+                if global_config is not None and hasattr(
+                    global_config, "save_config"
+                ):
+                    global_config.save_config()
+            except Exception as e:
+                logger.warning(
+                    f"[emotion_favour] 迁移后持久化配置失败（内存中已迁移，下次启动会重跑）: {e}"
+                )
+
         # 基础配置
         self.favour_mode = config.get("favour_mode", "galgame")
         self.group_sort_by = config.get("group_sort_by", "default")
@@ -54,6 +77,8 @@ class EmotionFavourPlugin(Star):
         rel_conf = config.get("relationship_config", {})
         self.relationship_mode = rel_conf.get("mode", "simple")
         self.relationship_simple_list = rel_conf.get("simple_list", ["极度厌恶", "厌恶", "反感", "普通", "喜欢", "亲密", "挚爱"])
+        # advance_config 在 schema 中是 template_list（新格式，直接 list）；
+        # 老配置可能是 JSON 字符串，由 _advance_items() 兼容解析
         self.relationship_advance_raw = rel_conf.get("advance_config", "")
 
         # 高级配置
@@ -350,21 +375,29 @@ class EmotionFavourPlugin(Star):
             idx = int((favour - self.min_favour_value) * n / total)
             return items[max(0, min(idx, n - 1))]
         else:
-            try:
-                items = json.loads(self.relationship_advance_raw) if isinstance(self.relationship_advance_raw, str) else self.relationship_advance_raw
-                for item in items:
-                    if item.get("min_value", self.min_favour_value) <= favour <= item.get("max_value", self.max_favour_value):
-                        return item.get("describe", "未知")
-            except (json.JSONDecodeError, TypeError):
-                pass
-            return "未知"
+            tier = self._find_tier(favour)
+            return tier.get("describe", "未知") if tier else "未知"
 
     def _get_relationship_range(self, favour: int, user_id: str = "") -> Optional[Tuple[int, int]]:
         """返回 favour 所处关系区间的 (x, y)，用于进度计算。
         返回 None 表示无法确定区间（admin override、配置异常、空列表等）。
         与 _get_relationship 用同一套 idx 逻辑，保证区间名与范围对齐。
         """
-        if self.admin_default_relationship and user_id and user_id in self._privileged_user_ids:
+        if self._is_admin_override(user_id):
+            # admin 按最高等级处理：advance 模式下用最高等级的 (x, y)，让进度行进入「已达最高等级」分支；
+            # simple 模式无 tier 概念，仍返回 None（进度行不注入）
+            if self.relationship_mode == "advance":
+                max_tier = self._get_max_tier()
+                if max_tier is not None:
+                    result = (
+                        max_tier.get("min_value", self.min_favour_value),
+                        max_tier.get("max_value", self.max_favour_value),
+                    )
+                    logger.debug(
+                        f"[EmotionFavour] _get_relationship_range admin override user={user_id} "
+                        f"-> max_tier range={result}"
+                    )
+                    return result
             logger.debug(f"[EmotionFavour] _get_relationship_range skip: admin override user={user_id}")
             return None
         clamped = max(self.min_favour_value, min(self.max_favour_value, favour))
@@ -393,24 +426,105 @@ class EmotionFavourPlugin(Star):
                         y = self.min_favour_value + round((idx + 1) * total / n) - 1
                     result = (x, y)
         else:
-            try:
-                items = json.loads(self.relationship_advance_raw) if isinstance(self.relationship_advance_raw, str) else self.relationship_advance_raw
-                for item in items:
-                    x = item.get("min_value", self.min_favour_value)
-                    y = item.get("max_value", self.max_favour_value)
-                    if x <= favour <= y:
-                        result = (x, y)
-                        break
-                if result is None:
-                    reason = "no advance interval matched"
-            except (json.JSONDecodeError, TypeError) as e:
-                reason = f"advance_config parse error: {e}"
+            tier = self._find_tier(favour)
+            if tier is not None:
+                result = (
+                    tier.get("min_value", self.min_favour_value),
+                    tier.get("max_value", self.max_favour_value),
+                )
+            else:
+                reason = "no advance interval matched"
 
         logger.debug(
             f"[EmotionFavour] _get_relationship_range favour={favour} mode={self.relationship_mode} "
             f"-> range={result}{' (' + reason + ')' if reason else ''}"
         )
         return result
+
+    def _advance_items(self) -> list:
+        """读取 advance_config，兼容老 JSON 字符串格式与新 template_list 格式。
+        返回标准化的 dict 列表，过滤掉 __template_key 等元字段。"""
+        raw = self.relationship_advance_raw
+        if not raw:
+            return []
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                return []
+            if not isinstance(parsed, list):
+                return []
+            items = parsed
+        elif isinstance(raw, list):
+            items = raw
+        else:
+            return []
+        result = []
+        for r in items:
+            if not isinstance(r, dict):
+                continue
+            result.append({k: v for k, v in r.items() if not k.startswith("__")})
+        return result
+
+    def _find_tier(self, favour: int) -> Optional[dict]:
+        """返回 favour 落在哪个 advance 区间（首个匹配），找不到返回 None。"""
+        for item in self._advance_items():
+            x = item.get("min_value", self.min_favour_value)
+            y = item.get("max_value", self.max_favour_value)
+            if x <= favour <= y:
+                return item
+        return None
+
+    def _find_next_tier(self, favour: int) -> Optional[dict]:
+        """返回 min_value > 当前 favour 的下一个更高等级（按 min_value 升序首个）。
+        用于「临近解锁」预告。"""
+        items = sorted(
+            [i for i in self._advance_items() if i.get("min_value", 0) > favour],
+            key=lambda i: i.get("min_value", 0),
+        )
+        return items[0] if items else None
+
+    def _get_max_tier(self) -> Optional[dict]:
+        """返回 advance 配置中 min_value 最高的等级（用于 admin override）。无配置返回 None。"""
+        items = self._advance_items()
+        if not items:
+            return None
+        return max(items, key=lambda i: i.get("min_value", self.min_favour_value))
+
+    def _is_admin_override(self, user_id: str) -> bool:
+        """是否走管理员关系覆盖路径（admin_default_relationship 非空 + 在特权集）。"""
+        return (
+            bool(self.admin_default_relationship)
+            and bool(user_id)
+            and user_id in self._privileged_user_ids
+        )
+
+    def _get_tier_extras(self, favour: int, user_id: str = "") -> dict:
+        """取当前好感度对应等级的 boundary / rule / preview / next_describe / is_max_tier。
+        供对话注入与后台结算共用。返回 dict，缺字段为空字符串/False。
+
+        admin override：若 user_id 走管理员覆盖路径，按「最高等级」取 extras——
+        boundary/rule/preview 用最高等级的、is_max_tier=True、next_describe=""。
+        这样对话注入走最高等级边界，但 _get_relationship 仍返回 admin_default_relationship 名称。
+        """
+        if self._is_admin_override(user_id):
+            current = self._get_max_tier()
+            next_tier = None  # admin 按最高等级处理，无更高等级
+        else:
+            current = self._find_tier(favour)
+            next_tier = self._find_next_tier(favour)
+        if not current:
+            return {
+                "boundary": "", "preview": "", "rule": "",
+                "next_describe": "", "is_max_tier": False,
+            }
+        return {
+            "boundary": (current.get("boundary") or "").strip(),
+            "preview": (current.get("preview") or "").strip(),
+            "rule": (current.get("rule") or "").strip(),
+            "next_describe": (next_tier.get("describe") or "").strip() if next_tier else "",
+            "is_max_tier": next_tier is None,
+        }
 
     async def _get_initial_favour(self, event: AstrMessageEvent) -> int:
         user_id = event.get_sender_id()
@@ -619,7 +733,14 @@ class EmotionFavourPlugin(Star):
 
             relationship = self._get_relationship(current_favour, user_id)
             favour_range = self._get_relationship_range(current_favour, user_id)
-            prompt_final = build_injection_prompt(record, relationship, favour_range, current_favour)
+            tier_extras = self._get_tier_extras(current_favour, user_id) if self.relationship_mode == "advance" else None
+            prompt_final = build_injection_prompt(
+                record,
+                relationship,
+                favour_range,
+                current_favour,
+                tier_extras=tier_extras,
+            )
 
             req.extra_user_content_parts.append(TextPart(text=prompt_final).mark_as_temp())
             logger.debug(f"{self._tag(event)} 注入的印象上下文:\n{prompt_final}")
@@ -849,18 +970,15 @@ class EmotionFavourPlugin(Star):
 
             # 只取当前好感值对应的那一条关系规则
             current_rule = ""
-            if self.relationship_mode == "advance" and self.relationship_advance_raw:
-                try:
-                    items = json.loads(self.relationship_advance_raw) if isinstance(self.relationship_advance_raw, str) else self.relationship_advance_raw
-                    for item in items:
-                        if item.get("min_value", self.min_favour_value) <= current_favour <= item.get("max_value", self.max_favour_value):
-                            rule = item.get("rule", "")
-                            desc = item.get("describe", "")
-                            if rule:
-                                current_rule = f"【当前关系：{desc}】\n{rule}\n\n"
-                            break
-                except (json.JSONDecodeError, TypeError):
-                    pass
+            if self.relationship_mode == "advance":
+                extras = self._get_tier_extras(current_favour, user_id)
+                if extras["rule"]:
+                    if self._is_admin_override(user_id):
+                        desc = self.admin_default_relationship
+                    else:
+                        tier = self._find_tier(current_favour)
+                        desc = (tier.get("describe") if tier else "") or "未知"
+                    current_rule = f"【当前关系：{desc}】\n{extras['rule']}\n\n"
 
             # 获取近期对话历史
             history_section = ""
