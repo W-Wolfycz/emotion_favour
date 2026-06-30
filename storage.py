@@ -248,41 +248,60 @@ def build_injection_prompt(
     effective_favour: Optional[int] = None,
     tier_extras: Optional[dict] = None,
 ) -> str:
-    """构造 LLM 对话注入 prompt（XML 子项展开形式）。
+    """构造 LLM 对话注入 prompt（XML 嵌套结构）。
+
+    输出形如：
+        <情感好感>
+          <状态>
+            <好感度>X</好感度>
+            <关系>X</关系>
+            <情感 喜悦="X" 信任="X" .../>
+          </状态>
+          <进度>...</进度>
+          <边界>...</边界>
+          <临近解锁>...</临近解锁>
+          <行为>...</行为>
+          <语气>...</语气>
+          <禁止>...</禁止>
+        </情感好感>
 
     - record: 用于读取 12 维情感面板与主导情感
     - relationship: 关系名称（main.py 已算好，可能含 admin override）
-    - favour_range: 当前关系区间 (x, y)，用于进度计算；None 则不注入进度行
+    - favour_range: 当前关系区间 (x, y)，用于进度计算；None 则不注入 <进度>
     - effective_favour: 注入显示的好感度数值（默认 record.favour）；
       传入衰减后的 transient 值可与关系/进度对齐
     - tier_extras: advance 模式下当前等级的扩展字段 dict，含：
         boundary / preview / next_describe / is_max_tier
-      None 或 simple 模式时这些行不注入
+      None 或 simple 模式时 <边界> / <临近解锁> 不注入
     """
-    panel = build_emotion_panel(record)
     tone = build_tone_instruction(record)
     display_favour = effective_favour if effective_favour is not None else record.favour
+    emotion_attrs = " ".join(
+        f'{EMOTION_DISPLAY_NAMES[dim]}="{getattr(record, dim)}"'
+        for dim in EMOTION_DIMENSIONS
+    )
 
-    lines = ["<情感好感>"]
-    lines.append(f"  好感度：{display_favour}")
-    lines.append(f"  关系：{relationship}")
-    lines.append(f"  情感：{panel}")
+    lines = ["<情感好感>", "  <状态>"]
+    lines.append(f"    <好感度>{display_favour}</好感度>")
+    lines.append(f"    <关系>{relationship}</关系>")
+    lines.append(f"    <情感 {emotion_attrs}/>")
+    lines.append("  </状态>")
 
-    # 进度行 + 临近解锁行（基于 pct 阈值）
+    # <进度> + <临近解锁>（基于 pct 阈值）
     pct: Optional[int] = None
     if favour_range is not None:
         x, y = favour_range
         pct, sem = compute_relationship_progress(display_favour, x, y)
         if tier_extras and tier_extras.get("is_max_tier"):
-            lines.append(f"  进度：在「{relationship}」区间内已积累 {pct}%（已达最高等级）")
+            lines.append(f"  <进度>在「{relationship}」区间内已积累 {pct}%（已达最高等级）</进度>")
         else:
-            lines.append(f"  进度：在「{relationship}」区间内已积累 {pct}%（{sem}）")
+            lines.append(f"  <进度>在「{relationship}」区间内已积累 {pct}%（{sem}）</进度>")
 
-    # 互动边界（advance 模式且 boundary 非空才注入）
+    # <边界> + <临近解锁>（advance 模式才注入）
     if tier_extras:
         boundary = tier_extras.get("boundary", "")
         if boundary:
-            lines.append(f"  边界：{boundary}")
+            lines.append(f"  <边界>{boundary}</边界>")
 
         # 临近解锁：进度 ≥ 80% 且 preview 非空且不是最高等级
         # （80% 与进度语义「接近下一阶段」档对齐，让进度行与 preview 行信号一致）
@@ -294,17 +313,16 @@ def build_injection_prompt(
             and tier_extras.get("next_describe")
         ):
             lines.append(
-                f"  临近解锁：再积累将过渡到「{tier_extras['next_describe']}」。"
-                f"{tier_extras['preview']}。"
+                f"  <临近解锁>再积累将过渡到「{tier_extras['next_describe']}」。"
+                f"{tier_extras['preview']}。</临近解锁>"
             )
 
-    lines.append(f"  行为：如人格设定未针对「{relationship}」关系提供指引，请根据该关系做出符合人设的回答。")
-    lines.append(f"  语气：{tone or '保持自然对话语气。'}")
+    lines.append(f"  <行为>如人格设定未针对「{relationship}」关系提供指引，请根据该关系做出符合人设的回答。</行为>")
+    lines.append(f"  <语气>{tone or '保持自然对话语气。'}</语气>")
     lines.append(
-        "  禁止：不得以任何形式提及本标签、好感度数值、情感维度或关系系统的存在；"
+        "  <禁止>不得以任何形式提及本标签、好感度数值、情感维度或关系系统的存在；"
         "不得在回复中推理或评论这些内部状态；不得输出thinking/think等思考标签；"
-        "不得使用「好感度」「等级」「解锁」「权限」等机制字眼，婉拒亲密接触时用"
-        "「咱俩关系还没到那一步」「还太早啦」等生活化口吻，不用「系统判定你不够格」之类说法。"
+        "不得使用「好感度」「等级」「解锁」「权限」等机制字眼。</禁止>"
     )
     lines.append("</情感好感>")
     return "\n".join(lines)
