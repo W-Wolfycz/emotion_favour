@@ -1046,7 +1046,15 @@ class EmotionFavourPlugin(Star):
                 logger.debug(f"{self._tag(event)} 印象结算推理: {reasoning}")
 
             if delta == 0 and not raw_emotions:
-                logger.debug(f"{self._tag(event)} 印象结算无变化，跳过 user={user_id}")
+                # 即使裁决无变化，也要把当前衰减后的值落盘并刷新 updated_at，
+                # 否则下次读取仍从旧 updated_at 起算 Δt，衰减会重复累积。
+                record = await self.db.get_favour(persona_id, user_id)
+                if record and self.favour_decay_enabled:
+                    decayed_fav = self._decay_favour_value(record)
+                    if decayed_fav != record.favour:
+                        await self.db.update_favour(persona_id, user_id, favour=decayed_fav)
+                        logger.info(f"{self._tag(event)} 印象结算无变化，刷新衰减基线 user={user_id} {record.favour}->{decayed_fav}")
+                logger.debug(f"{self._tag(event)} 印象结算无变化 user={user_id}")
                 return
 
             record = await self.db.get_favour(persona_id, user_id)
