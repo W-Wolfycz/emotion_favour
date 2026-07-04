@@ -1,5 +1,18 @@
 # 更新日志
 
+## 3.3.0
+2026-07-05
+
+### 适配 chat_memory v2.0 接口
+
+chat_memory v2.0 由「仅 LLM 触发存档」改为「全量捕获 + 7-tag 配对存储」，原 `query_history` 默认返回范围变化（会含 `non_llm` / `orphan` / `proactive` 等非配对消息），破坏下游「按 2 步长切轮」的解析假设。
+
+- **改用 `query_rounds` 接口**：`_get_recent_history` 调用 chat_memory 时优先走 v2.0 新增的 `query_rounds`，DB 层用 `EXISTS` 子查询严格保证每轮 `[user, assistant]` 配对，过滤单边 user。flatten 后下游去重与解析循环零改动。
+- **移除 v1.x 兼容路径**：`_resolve_chat_memory` 删除 `sys.modules` fallback（v2.0 已删除模块级 `query_history`，该路径成为 dead code）；探测属性由 `query_history` 改为 `query_rounds`，与 v2.0 唯一入口对齐。
+- **不再支持 chat_memory v1.x**：用户需将 chat_memory 升级到 ≥ v2.0.0；未安装或版本过低时自动回退到 AstrBot 自带上下文，行为不变。
+
+字段层：chat_memory v2.0 返回 dict 在原 `role` / `content` / `user_id` / `created_at` 基础上新增 `message_id` / `pair_id` / `tag` 三字段，emotion_favour 仅读旧字段，完全向后兼容。
+
 ## 3.2.0
 2026-06-30
 

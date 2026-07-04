@@ -301,7 +301,7 @@
         "description": "使用 chat_memory 插件提供对话上下文",
         "type": "bool",
         "default": false,
-        "hint": "启用后，裁决模型参考的对话历史从 chat_memory 插件按用户ID隔离读取；未启用时从 AstrBot 自带上下文管理读取（群聊场景共享上下文）。⚠️ 启用前需先安装 chat_memory 插件（https://github.com/W-Wolfycz/chat_memory），否则自动回退到 AstrBot 自带上下文。"
+        "hint": "启用后，裁决模型参考的对话历史从 chat_memory 插件按用户ID隔离读取；未启用时从 AstrBot 自带上下文管理读取（群聊场景共享上下文）。⚠️ 启用前需先安装 chat_memory 插件 ≥ v2.0.0（https://github.com/W-Wolfycz/chat_memory），v1.x 的 query_history 接口已不再支持；未安装时自动回退到 AstrBot 自带上下文。"
       },
       "emotion_decay_enabled": {
         "description": "启用情感时间衰减",

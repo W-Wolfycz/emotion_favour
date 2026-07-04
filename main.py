@@ -179,26 +179,18 @@ class EmotionFavourPlugin(Star):
         asyncio.create_task(self._init_storage())
 
     def _resolve_chat_memory(self):
-        """定位 chat_memory 插件，返回带 query_history 方法的对象。
-        成功后缓存到 self._chat_memory；失败不缓存以便下次重试。
-        优先 AstrBot 插件注册表；失败则直接从 sys.modules 查找，绕过包导入路径问题。
-        """
+        """定位 chat_memory 插件实例。成功后缓存到 self._chat_memory；失败不缓存以便下次重试。"""
         if self._chat_memory is not None:
             return self._chat_memory
         try:
             star = self.context.get_registered_star("chat_memory")
             if star is not None:
                 for candidate in (star, getattr(star, "star", None), getattr(star, "star_cls", None)):
-                    if candidate is not None and hasattr(candidate, "query_history"):
+                    if candidate is not None and hasattr(candidate, "query_rounds"):
                         self._chat_memory = candidate
                         return candidate
         except Exception:
             pass
-        import sys
-        mod = sys.modules.get("chat_memory.main") or sys.modules.get("chat_memory")
-        if mod is not None and hasattr(mod, "query_history"):
-            self._chat_memory = mod
-            return mod
         return None
 
     def _validate_config(self):
@@ -264,7 +256,18 @@ class EmotionFavourPlugin(Star):
 
         try:
             if chat_memory is not None:
-                records = await chat_memory.query_history(umo, conversation_id, user_id, limit=rounds * 2)
+                # chat_memory v2.0+ 改为全量捕获，query_history 会含 non_llm/orphan/proactive 等
+                # 非配对消息破坏下游"按 2 步长切轮"解析；改用 query_rounds 严格按 [user, assistant]
+                # 配对返回（EXISTS 子查询过滤单边 user），再 flatten 成下游期望的一维序列。
+                paired = await chat_memory.query_rounds(
+                    umo, conversation_id, user_id,
+                    limit_rounds=rounds,
+                )
+                records = []
+                for pair in paired:
+                    if len(pair) >= 2:
+                        records.append(pair[0])
+                        records.append(pair[1])
             else:
                 records = await self._read_astrbot_history(umo, conversation_id)
         except Exception as e:
