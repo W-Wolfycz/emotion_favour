@@ -178,6 +178,12 @@ class EmotionFavourPlugin(Star):
 
         asyncio.create_task(self._init_storage())
 
+    async def initialize(self):
+        """AstrBot 启动时注册 Plugin Pages Web API。鉴权继承主 webui 登录态。"""
+        from .web_api import register_web_apis
+        register_web_apis(self.context, self)
+        logger.info("[EmotionFavour] ✅ Web API 已注册")
+
     def _resolve_chat_memory(self):
         """定位 chat_memory 插件实例。成功后缓存到 self._chat_memory；失败不缓存以便下次重试。"""
         if self._chat_memory is not None:

@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>emotion_favour · 印象管理台</title>
+  <link rel="stylesheet" href="style.css">
+  <script>
+    // 防止浅色主题闪烁（FOUC）：AstrBot 主 webui 注入 localStorage 主题
+    (function () {
+      try {
+        var t = localStorage.getItem('astrbot-theme') || 'light';
+        document.documentElement.setAttribute('data-theme', t);
+      } catch (e) {
+        document.documentElement.setAttribute('data-theme', 'light');
+      }
+    })();
+  </script>
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="topbar-title">
+        <span class="title-icon">💖</span>
+        <span>印象管理台</span>
+        <span class="version-tag" id="version-tag">—</span>
+      </div>
+      <div class="topbar-actions">
+        <div class="persona-switcher" id="persona-switcher" hidden>
+          <label>人格</label>
+          <select id="persona-select"></select>
+        </div>
+        <button class="btn btn-ghost btn-sm" id="create-btn" title="新增好感记录">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+            <line x1="12" y1="5" x2="12" y2="19"/>
+            <line x1="5" y1="12" x2="19" y2="12"/>
+          </svg>
+        </button>
+        <button class="btn btn-ghost btn-sm" id="theme-toggle" title="切换主题">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+          </svg>
+        </button>
+        <button class="btn btn-ghost btn-sm" id="refresh-btn" title="刷新">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="23 4 23 10 17 10"/>
+            <polyline points="1 20 1 14 7 14"/>
+            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <main class="content">
+      <div class="stats-bar">
+        <span class="stat-item">人格：<strong id="persona-tag">—</strong></span>
+        <span class="stat-item">共 <strong id="user-count">0</strong> 位用户</span>
+        <span class="stat-item">好感度范围：<strong id="range-tag">—</strong></span>
+        <span class="stat-item" id="mode-tag" hidden>关系模式：<strong id="mode-value">—</strong></span>
+        <span class="sort-bar">
+          <span class="sort-label">排序：</span>
+          <button class="sort-chip" data-key="user_id">用户 ID</button>
+          <button class="sort-chip active" data-key="favour">好感度</button>
+          <button class="sort-chip" data-key="updated_at">修改时间</button>
+        </span>
+      </div>
+
+      <div id="records-list" class="records-list">
+        <div class="loading-wrap"><span class="spinner"></span> 加载中...</div>
+      </div>
+
+      <div id="empty-state" class="empty-state" hidden>
+        <div class="empty-icon">📭</div>
+        <div>当前人格下暂无印象记录</div>
+      </div>
+
+      <div id="error-state" class="error-state" hidden>
+        <div class="error-icon">⚠️</div>
+        <div id="error-msg">加载失败</div>
+      </div>
+    </main>
+
+    <div id="toast" class="toast" hidden></div>
+  </div>
+
+  <!-- ===== 编辑 Dialog（单例，运行时填充） ===== -->
+  <dialog id="edit-dialog" class="dialog">
+    <div class="dialog-header">
+      <div class="dialog-title">
+        <span class="user-id" id="edit-user-id">—</span>
+        <span class="admin-tag" id="edit-admin-tag" hidden>管理员覆盖</span>
+      </div>
+      <button class="dialog-close" id="edit-close" type="button" aria-label="关闭">×</button>
+    </div>
+    <div class="dialog-body">
+      <div class="favour-control">
+        <label>好感度</label>
+        <input type="number" class="favour-input" id="edit-favour">
+        <span class="relationship-tag" id="edit-relationship">—</span>
+        <span class="range-tag" id="edit-range"></span>
+      </div>
+      <div class="emotion-grid" id="edit-emotion-grid"></div>
+    </div>
+    <div class="dialog-footer">
+      <span class="updated-at" id="edit-updated-at">—</span>
+      <div class="action-buttons">
+        <button class="btn btn-secondary btn-sm" id="edit-discard" type="button">放弃</button>
+        <button class="btn btn-success btn-sm" id="edit-confirm" type="button">✓ 确认</button>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- ===== 新增 Dialog ===== -->
+  <dialog id="create-dialog" class="dialog dialog-narrow">
+    <div class="dialog-header">
+      <div class="dialog-title">新增好感记录</div>
+      <button class="dialog-close" id="create-close" type="button" aria-label="关闭">×</button>
+    </div>
+    <div class="dialog-body">
+      <div class="form-row">
+        <label for="create-user-id">QQ / user_id</label>
+        <input type="text" id="create-user-id" placeholder="用户 QQ 号" autocomplete="off">
+      </div>
+      <div class="form-row">
+        <label for="create-persona">人格</label>
+        <select id="create-persona"></select>
+      </div>
+      <div class="form-row">
+        <label for="create-favour">好感度</label>
+        <input type="number" class="favour-input" id="create-favour" value="0">
+        <span class="relationship-tag" id="create-relationship">—</span>
+      </div>
+      <details class="emotions-collapse">
+        <summary>情感（可选，默认全 0）</summary>
+        <div class="emotion-grid" id="create-emotion-grid"></div>
+      </details>
+    </div>
+    <div class="dialog-footer">
+      <span></span>
+      <div class="action-buttons">
+        <button class="btn btn-secondary btn-sm" id="create-cancel" type="button">取消</button>
+        <button class="btn btn-success btn-sm" id="create-submit" type="button">创建</button>
+      </div>
+    </div>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>

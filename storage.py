@@ -617,6 +617,77 @@ class FavourDBManager:
             logger.error(f"更新数据库失败: {str(e)}")
             return False
 
+    async def set_record_fields(
+        self,
+        persona_id: str,
+        user_id: str,
+        favour: Optional[int] = None,
+        emotions_absolute: Optional[dict] = None,
+    ) -> bool:
+        """绝对值写入（WebUI 管理员手动覆盖场景）。
+
+        与 update_favour 的差异：
+        - ``emotions_absolute`` 是绝对值而非 delta，直接覆盖当前值
+        - 不施加 ``diminish_delta`` 收益递减（admin 覆盖不应被软化）
+        - favour 走 min_val/max_val clamp；emotions 每维走 0-100 clamp
+        - record 不存在时按 favour 创建（emotions 部分写入）
+        - 始终刷新 updated_at
+        """
+        await self.init_db()
+        if not _is_valid_userid(user_id):
+            return False
+        try:
+            async with self.async_session() as session:
+                stmt = select(FavourRecord).where(
+                    FavourRecord.persona_id == persona_id,
+                    FavourRecord.user_id == user_id,
+                )
+                result = await session.execute(stmt)
+                record = result.scalars().first()
+
+                if not record:
+                    init_favour = (
+                        max(self.min_val, min(self.max_val, favour))
+                        if favour is not None else 0
+                    )
+                    record = FavourRecord(
+                        persona_id=persona_id,
+                        user_id=user_id,
+                        favour=init_favour,
+                    )
+                    session.add(record)
+                else:
+                    if favour is not None:
+                        record.favour = max(self.min_val, min(self.max_val, favour))
+                    record.updated_at = datetime.now()
+                    session.add(record)
+
+                if emotions_absolute:
+                    for dim, value in emotions_absolute.items():
+                        if dim in EMOTION_DIMENSIONS:
+                            try:
+                                setattr(record, dim, max(0, min(100, int(value))))
+                            except (ValueError, TypeError):
+                                continue
+
+                await session.commit()
+                return True
+        except Exception as e:
+            logger.error(f"绝对值写入失败: {str(e)}")
+            return False
+
+    async def get_distinct_personas(self) -> list[str]:
+        """返回 DB 中存在记录的所有 persona_id（去重、按字母序）。供 WebUI 切换器使用。"""
+        await self.init_db()
+        try:
+            async with self.async_session() as session:
+                stmt = select(FavourRecord.persona_id).distinct()
+                result = await session.execute(stmt)
+                return sorted({row[0] for row in result.fetchall() if row[0]})
+        except Exception as e:
+            logger.error(f"查询 persona 列表失败: {str(e)}")
+            return []
+
     async def delete_favour(self, persona_id: str, user_id: str) -> Tuple[bool, str]:
         await self.init_db()
         try:
