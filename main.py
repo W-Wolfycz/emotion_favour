@@ -16,7 +16,7 @@ from astrbot.core.message.components import Plain
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
 from astrbot.core.agent.message import TextPart
-from astrbot.core.utils.session_waiter import session_waiter, SessionController
+from astrbot.core.utils.session_waiter import session_waiter, SessionController, SessionFilter
 
 from .log import logger, configure as configure_log
 from .permissions import PermLevel, PermissionManager
@@ -26,6 +26,7 @@ from .storage import (
     EMOTION_DISPLAY_NAMES,
     build_emotion_panel,
     build_injection_prompt,
+    build_system_prompt_extra,
     format_emotion_detail,
     get_dominant_emotions,
     diminish_delta,
@@ -37,6 +38,16 @@ from .utils import (
     escape_markdown,
     get_user_display_name,
 )
+
+
+class SenderSessionFilter(SessionFilter):
+    """只让同一发送者的消息触发 waiter，避免群聊他人消息 / 平台 lifecycle 事件干扰。"""
+
+    def __init__(self, sender_id: str) -> None:
+        self.sender_id = str(sender_id)
+
+    def filter(self, event: AstrMessageEvent) -> str:
+        return f"{event.unified_msg_origin}|sender={event.get_sender_id()}"
 
 
 class EmotionFavourPlugin(Star):
@@ -262,12 +273,14 @@ class EmotionFavourPlugin(Star):
 
         try:
             if chat_memory is not None:
-                # chat_memory v2.0+ 改为全量捕获，query_history 会含 non_llm/orphan/proactive 等
-                # 非配对消息破坏下游"按 2 步长切轮"解析；改用 query_rounds 严格按 [user, assistant]
-                # 配对返回（EXISTS 子查询过滤单边 user），再 flatten 成下游期望的一维序列。
+                # chat_memory v2.3+ 的 query_rounds 接受 llm_status 过滤参数：
+                # 仅取走完 LLM 的成功配对（llm_status='llm_success'），过滤掉命令处理、
+                # rule 拦截、LLM 失败、bot 主动消息等非真正对话场景，让情感结算更精准。
+                # v2.0~v2.2 不支持该参数会 TypeError，被外层 except 捕获后回退到 native 上下文。
                 paired = await chat_memory.query_rounds(
                     umo, conversation_id, user_id,
                     limit_rounds=rounds,
+                    llm_status="llm_success",
                 )
                 records = []
                 for pair in paired:
@@ -743,6 +756,16 @@ class EmotionFavourPlugin(Star):
             relationship = self._get_relationship(current_favour, user_id)
             favour_range = self._get_relationship_range(current_favour, user_id)
             tier_extras = self._get_tier_extras(current_favour, user_id) if self.relationship_mode == "advance" else None
+
+            # SystemPrompt 通道：永不变的元规则 + 全档结构总览（提升指令权重 + 命中 prompt cache）
+            sys_extra = build_system_prompt_extra(
+                advance_items=self._advance_items() if self.relationship_mode == "advance" else None,
+                relationship_mode=self.relationship_mode,
+            )
+            if sys_extra:
+                req.system_prompt = (req.system_prompt or "") + "\n\n" + sys_extra
+
+            # User append 通道：当前档位的动态状态（好感度数值、12 维情感、当前 boundary、进度）
             prompt_final = build_injection_prompt(
                 record,
                 relationship,
@@ -1560,7 +1583,11 @@ class EmotionFavourPlugin(Star):
 
         @session_waiter(timeout=30, record_history_chains=False)
         async def confirm_waiter(controller: SessionController, evt: AstrMessageEvent):
-            if evt.message_str.strip() == "确认清空":
+            # 忽略空消息（"正在输入"等 lifecycle 事件）和非文本
+            msg = (evt.message_str or "").strip()
+            if not msg:
+                return
+            if msg == "确认清空":
                 record = await self.db.get_favour(persona_id, uid)
                 if record:
                     backup_file = await self.db.backup_data([record], f"backup_user_{uid}")
@@ -1574,7 +1601,7 @@ class EmotionFavourPlugin(Star):
             controller.stop()
 
         try:
-            await confirm_waiter(event)
+            await confirm_waiter(event, session_filter=SenderSessionFilter(event.get_sender_id()))
         except TimeoutError:
             yield event.plain_result("操作超时，已取消清空。")
         finally:
@@ -1591,7 +1618,10 @@ class EmotionFavourPlugin(Star):
 
         @session_waiter(timeout=30, record_history_chains=False)
         async def confirm_waiter(controller: SessionController, evt: AstrMessageEvent):
-            if evt.message_str.strip() == "确认清空所有数据":
+            msg = (evt.message_str or "").strip()
+            if not msg:
+                return
+            if msg == "确认清空所有数据":
                 records = await self.db.get_global_records(persona_id)
                 if records:
                     backup_file = await self.db.backup_data(records, "backup_all_database")
@@ -1605,7 +1635,7 @@ class EmotionFavourPlugin(Star):
             controller.stop()
 
         try:
-            await confirm_waiter(event)
+            await confirm_waiter(event, session_filter=SenderSessionFilter(event.get_sender_id()))
         except TimeoutError:
             yield event.plain_result("操作超时，已取消清空。")
         finally:

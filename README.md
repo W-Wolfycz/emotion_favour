@@ -169,7 +169,7 @@ emotion_favour/
 - **AstrBot 自带上下文**（默认）：从 `conv.history` 读取，群聊场景下所有用户共享上下文
 - **chat_memory 插件**（需安装）：按 `UMO + conversation_id + user_id` 隔离读取，群内每个用户独立历史
 
-> 启用 chat_memory 前需先安装该插件 **≥ v2.0.0**（<https://github.com/W-Wolfycz/chat_memory>），v1.x 的 `query_history` 接口已不再支持；未安装或版本过低时自动回退到 AstrBot 自带上下文。
+> 启用 chat_memory 前需先安装该插件 **≥ v2.3.0**（<https://github.com/W-Wolfycz/chat_memory>），低版本不支持 `llm_status` 过滤参数；未安装或版本过低时自动回退到 AstrBot 自带上下文。
 
 ## 依赖
 

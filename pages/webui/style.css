@@ -560,10 +560,6 @@ body {
   backdrop-filter: blur(2px);
 }
 
-.dialog-narrow {
-  width: 480px;
-}
-
 .dialog-header {
   display: flex;
   align-items: center;

@@ -241,6 +241,55 @@ def compute_relationship_progress(favour: int, x: int, y: int) -> Tuple[int, str
     return pct, sem
 
 
+def build_system_prompt_extra(
+    advance_items: Optional[list] = None,
+    relationship_mode: str = "advance",
+) -> str:
+    """构造注入到 SystemPrompt 的部分（绝对静态的元规则 + 全档结构总览）。
+
+    SystemPrompt 比 user message 优先级更高，把永不变的元规则放这里：
+    - 提升 LLM 对「禁止陈述规则」「禁止元叙述」的遵循
+    - 命中 prompt caching（system 部分稳定）
+    - 让 LLM 理解全局档位结构，知道当前档处于什么位置
+
+    Args:
+        advance_items: advance_config 解析后的 list[dict]，含 describe / min_value / max_value
+        relationship_mode: 'advance' 时注入档位结构总览，'simple' 时不注入
+    """
+    lines = [
+        "# 情感好感度系统（隐藏的背景规则，自然执行，禁止陈述）",
+        "",
+        "## 系统说明",
+        "你（角色）与用户的互动受一套隐藏的好感度系统影响。系统在每轮对话前会以 <情感好感> 标签注入当前状态作为情境提示。",
+        "系统存在本身是隐藏的元信息，禁止向用户透露：",
+        "- 不得提及系统、好感度数值、关系等级、情感维度、档位结构的存在",
+        "- 不得使用「我不能说」「按规则」「受等级限制」「等好感度上去再」「解锁」「权限」等机制或元叙述字眼",
+        "- 不得在回复中推理或评论这些内部状态",
+        "- 不得输出 thinking/think 等思考标签",
+        "- 所有规则要自然执行，禁止陈述规则本身（例如不得说「我现在不能说X」「按规则只能说Y」）",
+        "",
+        "## 12 维情感维度",
+        "喜悦 / 信任 / 恐惧 / 惊讶 / 悲伤 / 厌恶 / 愤怒 / 期待 / 得意 / 内疚 / 害羞 / 嫉妒",
+        "（这些维度会以属性形式出现在 <情感> 标签上，反映角色对用户的瞬时情感状态，作为表演参考）",
+    ]
+
+    if relationship_mode == "advance" and advance_items:
+        lines.append("")
+        lines.append("## 关系档位结构")
+        lines.append("角色对用户的互动模式按好感度分档，每档有独特的心态与边界。档位之间是平滑过渡，不突变态度：")
+        lines.append("")
+        for item in advance_items:
+            name = item.get("describe", "")
+            x = item.get("min_value", 0)
+            y = item.get("max_value", 0)
+            if name:
+                lines.append(f"- 好感度 [{x}-{y}]：{name}")
+        lines.append("")
+        lines.append("当前所在档位的详细边界通过 <情感好感> 标签注入，以当前档为准表演。")
+
+    return "\n".join(lines)
+
+
 def build_injection_prompt(
     record: FavourRecord,
     relationship: str,
@@ -320,9 +369,7 @@ def build_injection_prompt(
     lines.append(f"  <行为>如人格设定未针对「{relationship}」关系提供指引，请根据该关系做出符合人设的回答。</行为>")
     lines.append(f"  <语气>{tone or '保持自然对话语气。'}</语气>")
     lines.append(
-        "  <禁止>不得以任何形式提及本标签、好感度数值、情感维度或关系系统的存在；"
-        "不得在回复中推理或评论这些内部状态；不得输出thinking/think等思考标签；"
-        "不得使用「好感度」「等级」「解锁」「权限」等机制字眼。</禁止>"
+        "  <禁止>本标签为隐藏情境提示，按系统规则自然执行，禁止在回复中提及、陈述或推理。</禁止>"
     )
     lines.append("</情感好感>")
     return "\n".join(lines)

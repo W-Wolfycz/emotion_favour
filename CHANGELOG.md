@@ -1,5 +1,52 @@
 # 更新日志
 
+## 3.3.3
+2026-07-10
+
+### 提示词结构重构：双通道注入 + `<禁止>` 瘦身
+
+针对实际运行暴露的问题：LLM 复读 boundary 规则（"我不能说 X，只能说 Y"）+ 全部塞 user append 导致指令权重不区分。
+
+**双通道注入**
+
+- 新增 `build_system_prompt_extra`：永不变的元规则 + 全档结构总览 + 12 维情感维度列表，注入到 `req.system_prompt`
+- `build_injection_prompt` 保持原签名，仍注入到 `req.extra_user_content_parts`，只承载当前档位的动态状态（好感度数值、12 维、当前 boundary、进度）
+- 收益：system role 指令权重更高，LLM 对元规则遵循更强；稳定部分命中 prompt caching；user 消息更干净
+
+**禁令归集到 SystemPrompt + `<禁止>` 瘦身**
+
+- 详细禁令（禁元叙述字眼、禁思考标签、禁陈述规则本身等）统一归到 SystemPrompt 权威版（含示例「不得说『我现在不能说X』」）
+- `<情感好感>` 内的 `<禁止>` 子标签瘦身为单行指针：「本标签为隐藏情境提示，按系统规则自然执行，禁止在回复中提及、陈述或推理」
+- 收益：消除双通道重复，SystemPrompt 承载完整禁令命中 caching，user 侧保留就近提醒 + 标签标注功能
+
+## 3.3.2
+2026-07-09
+
+### 适配 chat_memory v2.3+
+
+chat_memory v2.3.0 给 `query_rounds` 新增 `llm_status` 过滤参数（按 LLM 配对状态筛 user 侧）。emotion_favour 调用时显式传 `llm_status="llm_success"`，只取走完 LLM 的成功配对，过滤掉命令处理、rule 拦截、LLM 失败、bot 主动消息等非真正对话场景，让情感结算更精准。
+
+最低版本要求从 ≥ v2.0.0 升到 ≥ v2.3.0（低版本调用会 TypeError，已被外层 except 兜底自动回退到 native 上下文，不崩）。
+
+## 3.3.1
+2026-07-08
+
+### WebUI 印象管理台（首次上线）
+
+新增 Plugin Pages 单页面管理台（`pages/webui/` + 后端 `web_api.py` 5 端点），bot admin 可在主 webui 直接查看与编辑印象数据。
+
+- 列表单行展示 + 12 维情感 chip 摘要（按 group 染色），支持按 user_id / favour / 修改时间排序
+- 编辑走原生 `<dialog>` 模态：favour 实时算关系名，12 滑块按组分组，确认才落盘
+- 顶栏「+」新增记录，`create_only` 防覆盖（已存在则 409）
+
+storage 层新增 `set_record_fields`（绝对值写入，不走 diminish_delta）与 `get_distinct_personas`。
+
+### Bug 修复
+
+- **清空命令 waiter 错捕**：原 `session_waiter` 默认 filter 仅按 session 过滤，群聊他人消息与「正在输入」事件都被当作二次确认。新增 `SenderSessionFilter` 按 sender 严格匹配，handler 内追加空消息兜底过滤。
+- **WebUI persona 加载死锁**：防御逻辑 `if (!state.currentPersona) return` 与初始空字符串冲突，永远走不到赋值。改为非空时自动选第一个。
+- **桥接 SDK 注入时序**：改为运行时 `getBridge()` 查询 + 轮询 `bridge.ready()` 握手；fetch 降级自动附加 `asset_token`，规避 CORS + 401。
+
 ## 3.3.0
 2026-07-05
 
