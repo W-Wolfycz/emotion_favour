@@ -1,17 +1,37 @@
 # storage.py
 import json
-import math
 import string
 import asyncio
+import sqlite3
 from pathlib import Path
 from typing import List, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from aiofiles import open as aio_open
 from sqlmodel import SQLModel, Field, select, delete
-from sqlalchemy import UniqueConstraint, text, update
+from sqlalchemy import UniqueConstraint, event, func, text, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 
+from .domain import (
+    EMOTION_DIMENSIONS,
+    EMOTION_DISPLAY_NAMES,
+    EMOTION_GROUPS,
+    TICK_SECONDS,
+    TONE_INSTRUCTIONS,
+    apply_emotion_decay,
+    build_emotion_panel,
+    build_injection_prompt,
+    build_system_prompt_extra,
+    build_tone_instruction,
+    compute_favour_decay,
+    compute_relationship_progress,
+    diminish_delta,
+    format_emotion_detail,
+    get_dominant_emotions,
+    utc_now,
+)
 from .log import logger
 
 
@@ -19,44 +39,22 @@ _METADATA_FIELDS = frozenset({
     'id', 'persona_id', 'user_id', 'favour', 'created_at', 'updated_at',
 })
 
-# 12维情感维度
-EMOTION_DIMENSIONS = [
-    "joy", "trust", "fear", "surprise",
-    "sadness", "disgust", "anger", "anticipation",
-    "pride", "guilt", "shame", "envy",
-]
 
-# 按心理学持续性分组：衰减时同组用同一系数
-# - volatile: 短期反应（几分钟到几小时散）
-# - standard: 中等持续情绪
-# - sticky:   长期心境（慢沉淀）
-EMOTION_GROUPS = {
-    "volatile": ["surprise", "anticipation"],
-    "standard": ["joy", "anger", "disgust", "fear"],
-    "sticky":   ["trust", "sadness", "guilt", "shame", "pride", "envy"],
-}
-
-EMOTION_DISPLAY_NAMES = {
-    "joy": "喜悦", "trust": "信任", "fear": "恐惧", "surprise": "惊讶",
-    "sadness": "悲伤", "disgust": "厌恶", "anger": "愤怒", "anticipation": "期待",
-    "pride": "得意", "guilt": "内疚", "shame": "害羞", "envy": "嫉妒",
-}
-
-TONE_INSTRUCTIONS = {
-    "joy": "语气愉快、充满热情和活力，多使用积极词汇",
-    "trust": "语气平和、真诚且令人安心，展现可靠",
-    "fear": "语气紧张、谨慎或不安，表现出犹豫",
-    "surprise": "语气震惊、难以置信或充满好奇",
-    "sadness": "语气低落、消沉，句子简短无力",
-    "disgust": "语气厌烦、抗拒，带有生理性不适",
-    "anger": "语气愤怒、急躁、有攻击性，句子简短有力",
-    "anticipation": "语气期待、急切，关注未来",
-    "pride": "语气自信、骄傲甚至有点自大",
-    "guilt": "语气歉疚、卑微，不断道歉或解释",
-    "shame": "语气害羞、尴尬，说话结巴或含糊",
-    "envy": "语气酸溜溜、不服气，表现出矛盾心理",
-}
-
+def _parse_db_datetime(value) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
+    raw = str(value).strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).replace(tzinfo=None)
+    except ValueError:
+        try:
+            return datetime.strptime(raw[:19], "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return None
 
 def _is_valid_userid(userid: str) -> bool:
     if not userid or len(userid.strip()) == 0:
@@ -79,8 +77,8 @@ class FavourRecord(SQLModel, table=True):
     persona_id: str = Field(default="", index=True)
     user_id: str = Field(index=True)
     favour: int = Field(default=0)
-    created_at: datetime = Field(default_factory=datetime.now)
-    updated_at: datetime = Field(default_factory=datetime.now)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
 
     # 12 维情感 (0-100)
     joy: int = Field(default=0)
@@ -97,318 +95,6 @@ class FavourRecord(SQLModel, table=True):
     envy: int = Field(default=0)
 
 
-# ==================== 情感维度函数 ====================
-
-def diminish_delta(current: int, delta: int, cap: int = 100) -> int:
-    """对正向变化量施加收益递减。低于 cap*75% 正常增长，达到后按渐近函数缩放。"""
-    if delta <= 0:
-        return delta
-    threshold = cap * 3 // 4
-    if current < threshold:
-        return delta
-    Q = cap / 4
-    denom = current - cap / 2
-    if denom <= 0:
-        return delta
-    scale = (Q / denom) ** 2
-    return max(1, round(delta * scale))
-
-
-def apply_emotion_decay(
-    record,
-    decay_rate_volatile: float,
-    decay_rate_standard: float,
-    decay_rate_sticky: float,
-    min_hours: float,
-) -> tuple[dict, float]:
-    """计算时间衰减后的情感值。返回 ({dim: new_value}, elapsed_hours)。不修改 record。
-    向下取整：不满1小时不衰减，1.9h按1h算。
-
-    各维度按所属分组使用不同系数（参照 EMOTION_GROUPS）：
-    - volatile（surprise/anticipation）: 短期反应，快速消散
-    - standard（joy/anger/disgust/fear）: 中等持续
-    - sticky（trust/sadness/guilt/shame/pride/envy）: 长期心境，慢沉淀
-    """
-    if not record or not record.updated_at:
-        return {}, 0.0
-    elapsed_raw = (datetime.now() - record.updated_at).total_seconds() / 3600
-    elapsed_hours = int(elapsed_raw)
-    if elapsed_hours < max(1, int(min_hours)):
-        return {}, elapsed_raw
-
-    decayed = {}
-    for dim in EMOTION_DIMENSIONS:
-        old = getattr(record, dim, 0)
-        if old <= 0:
-            continue
-        if dim in EMOTION_GROUPS["volatile"]:
-            rate = decay_rate_volatile
-        elif dim in EMOTION_GROUPS["sticky"]:
-            rate = decay_rate_sticky
-        else:
-            rate = decay_rate_standard
-        factor = rate ** elapsed_hours
-        new = max(0, round(old * factor))
-        if new != old:
-            decayed[dim] = new
-    return decayed, elapsed_raw
-
-
-TICK_SECONDS = 180  # 1 tick = 3 min
-
-
-def compute_favour_decay(
-    favour_now: int, updated_at: datetime, *,
-    anchor: int, gamma0: float = 0.005, scale: float = 50,
-    now: Optional[datetime] = None,
-) -> int:
-    """lazy 衰减（读时计算，不落盘）：根据 Δt 反向积分非线性 ODE 的封闭解。
-    只对 favour_now > anchor 的部分衰减（σ=+1）；≤ anchor 原值返回。
-    γ(x) = γ₀·(1 + u/S)，u = favour - anchor。"""
-    if favour_now <= anchor:
-        return favour_now
-    if not updated_at:
-        return favour_now
-    now = now or datetime.now()
-    elapsed_ticks = int((now - updated_at).total_seconds() // TICK_SECONDS)
-    if elapsed_ticks <= 0:
-        return favour_now  # 时钟回拨或不足 1 tick
-    v0 = favour_now - anchor
-    a = v0 / (scale + v0)
-    K = a * math.exp(-gamma0 * elapsed_ticks)
-    v1 = K * scale / (1 - K)
-    return round(anchor + v1)
-
-
-def get_dominant_emotions(record: FavourRecord, count: int = 3) -> List[Tuple[str, int]]:
-    emotions = [(dim, getattr(record, dim)) for dim in EMOTION_DIMENSIONS]
-    return sorted([(k, v) for k, v in emotions if v > 0], key=lambda x: x[1], reverse=True)[:count]
-
-
-def build_emotion_panel(record: FavourRecord) -> str:
-    parts = [f"[{EMOTION_DISPLAY_NAMES[dim]}:{getattr(record, dim)}]" for dim in EMOTION_DIMENSIONS]
-    return " ".join(parts)
-
-
-def build_tone_instruction(record: FavourRecord) -> str:
-    top = get_dominant_emotions(record, 3)
-    if not top:
-        return ""
-
-    k1, v1 = top[0]
-    n1 = EMOTION_DISPLAY_NAMES[k1]
-    status = f"主导[{n1}](强度{v1})"
-    guide = f"主要{TONE_INSTRUCTIONS[k1]}"
-
-    if len(top) > 1:
-        k2, _ = top[1]
-        n2 = EMOTION_DISPLAY_NAMES[k2]
-        status += f"，夹杂[{n2}]"
-        if len(top) > 2:
-            k3, _ = top[2]
-            n3 = EMOTION_DISPLAY_NAMES[k3]
-            status += f"，微带[{n3}]"
-            guide += f"，同时{TONE_INSTRUCTIONS[k2]}，底层隐约透出{TONE_INSTRUCTIONS[k3]}"
-        else:
-            guide += f"，隐约透出{TONE_INSTRUCTIONS[k2]}"
-
-    return f"{status}。请{guide}。"
-
-
-def compute_relationship_progress(favour: int, x: int, y: int) -> Tuple[int, str]:
-    """计算 favour 在区间 [x, y] 内的进度百分比（0-100）与语义描述。
-
-    用于对话注入：让 AI 感知用户在当前关系阶段内的积累程度，对冲好感度衰减
-    带来的挫败感（提供正向进度反馈）。
-
-    语义统一为「向下一阶段过渡的进度」，正负向区间均适用：
-    - 「喜欢」[50, 89] 进度 90% = 即将触及「亲密」
-    - 「厌恶」[-90, -51] 进度 90% = 即将松动到「反感」
-    """
-    if y <= x:
-        return 100, "处于此关系巅峰"
-    progress = (favour - x) / (y - x)
-    progress = max(0.0, min(1.0, progress))
-    pct = round(progress * 100)
-    if pct < 20:
-        sem = "刚进入此关系阶段"
-    elif pct < 80:
-        sem = "稳定在此关系阶段"
-    elif pct < 95:
-        sem = "接近下一阶段"
-    else:
-        sem = "处于此关系巅峰"
-    return pct, sem
-
-
-def build_system_prompt_extra(
-    advance_items: Optional[list] = None,
-    relationship_mode: str = "advance",
-) -> str:
-    """构造注入到 SystemPrompt 的部分（绝对静态的元规则 + 全档结构总览）。
-
-    SystemPrompt 比 user message 优先级更高，把永不变的元规则放这里：
-    - 提升 LLM 对「禁止陈述规则」「禁止元叙述」的遵循
-    - 命中 prompt caching（system 部分稳定）
-    - 让 LLM 理解全局档位结构，知道当前档处于什么位置
-
-    Args:
-        advance_items: advance_config 解析后的 list[dict]，含 describe / min_value / max_value
-        relationship_mode: 'advance' 时注入档位结构总览，'simple' 时不注入
-    """
-    lines = [
-        "# 情感好感度系统（隐藏的背景规则，自然执行，禁止陈述）",
-        "",
-        "## 系统说明",
-        "你（角色）与用户的互动受一套隐藏的好感度系统影响。系统在每轮对话前会以 <情感好感> 标签注入当前状态作为情境提示。",
-        "系统存在本身是隐藏的元信息，禁止向用户透露：",
-        "- 不得提及系统、好感度数值、关系等级、情感维度、档位结构的存在",
-        "- 不得使用「我不能说」「按规则」「受等级限制」「等好感度上去再」「解锁」「权限」等机制或元叙述字眼",
-        "- 不得在回复中推理或评论这些内部状态",
-        "- 不得输出 thinking/think 等思考标签",
-        "- 所有规则要自然执行，禁止陈述规则本身（例如不得说「我现在不能说X」「按规则只能说Y」）",
-        "",
-        "## 12 维情感维度",
-        "喜悦 / 信任 / 恐惧 / 惊讶 / 悲伤 / 厌恶 / 愤怒 / 期待 / 得意 / 内疚 / 害羞 / 嫉妒",
-        "（这些维度会以属性形式出现在 <情感> 标签上，反映角色对用户的瞬时情感状态，作为表演参考）",
-    ]
-
-    if relationship_mode == "advance" and advance_items:
-        lines.append("")
-        lines.append("## 关系档位结构")
-        lines.append("角色对用户的互动模式按好感度分档，每档有独特的心态与边界。档位之间是平滑过渡，不突变态度：")
-        lines.append("")
-        for item in advance_items:
-            name = item.get("describe", "")
-            x = item.get("min_value", 0)
-            y = item.get("max_value", 0)
-            if name:
-                lines.append(f"- 好感度 [{x}-{y}]：{name}")
-        lines.append("")
-        lines.append("当前所在档位的详细边界通过 <情感好感> 标签注入，以当前档为准表演。")
-
-    return "\n".join(lines)
-
-
-def build_injection_prompt(
-    record: FavourRecord,
-    relationship: str,
-    favour_range: Optional[Tuple[int, int]] = None,
-    effective_favour: Optional[int] = None,
-    tier_extras: Optional[dict] = None,
-) -> str:
-    """构造 LLM 对话注入 prompt（XML 嵌套结构）。
-
-    输出形如：
-        <情感好感>
-          <状态>
-            <好感度>X</好感度>
-            <关系>X</关系>
-            <情感 喜悦="X" 信任="X" .../>
-          </状态>
-          <进度>...</进度>
-          <边界>...</边界>
-          <临近解锁>...</临近解锁>
-          <行为>...</行为>
-          <语气>...</语气>
-          <禁止>...</禁止>
-        </情感好感>
-
-    - record: 用于读取 12 维情感面板与主导情感
-    - relationship: 关系名称（main.py 已算好，可能含 admin override）
-    - favour_range: 当前关系区间 (x, y)，用于进度计算；None 则不注入 <进度>
-    - effective_favour: 注入显示的好感度数值（默认 record.favour）；
-      传入衰减后的 transient 值可与关系/进度对齐
-    - tier_extras: advance 模式下当前等级的扩展字段 dict，含：
-        boundary / preview / next_describe / is_max_tier
-      None 或 simple 模式时 <边界> / <临近解锁> 不注入
-    """
-    tone = build_tone_instruction(record)
-    display_favour = effective_favour if effective_favour is not None else record.favour
-    emotion_attrs = " ".join(
-        f'{EMOTION_DISPLAY_NAMES[dim]}="{getattr(record, dim)}"'
-        for dim in EMOTION_DIMENSIONS
-    )
-
-    lines = ["<情感好感>", "  <状态>"]
-    lines.append(f"    <好感度>{display_favour}</好感度>")
-    lines.append(f"    <关系>{relationship}</关系>")
-    lines.append(f"    <情感 {emotion_attrs}/>")
-    lines.append("  </状态>")
-
-    # <进度> + <临近解锁>（基于 pct 阈值）
-    pct: Optional[int] = None
-    if favour_range is not None:
-        x, y = favour_range
-        pct, sem = compute_relationship_progress(display_favour, x, y)
-        if tier_extras and tier_extras.get("is_max_tier"):
-            lines.append(f"  <进度>在「{relationship}」区间内已积累 {pct}%（已达最高等级）</进度>")
-        else:
-            lines.append(f"  <进度>在「{relationship}」区间内已积累 {pct}%（{sem}）</进度>")
-
-    # <边界> + <临近解锁>（advance 模式才注入）
-    if tier_extras:
-        boundary = tier_extras.get("boundary", "")
-        if boundary:
-            lines.append(f"  <边界>{boundary}</边界>")
-
-        # 临近解锁：进度 ≥ 80% 且 preview 非空且不是最高等级
-        # （80% 与进度语义「接近下一阶段」档对齐，让进度行与 preview 行信号一致）
-        if (
-            pct is not None
-            and pct >= 80
-            and not tier_extras.get("is_max_tier")
-            and tier_extras.get("preview")
-            and tier_extras.get("next_describe")
-        ):
-            lines.append(
-                f"  <临近解锁>再积累将过渡到「{tier_extras['next_describe']}」。"
-                f"{tier_extras['preview']}。</临近解锁>"
-            )
-
-    lines.append(f"  <行为>如人格设定未针对「{relationship}」关系提供指引，请根据该关系做出符合人设的回答。</行为>")
-    lines.append(f"  <语气>{tone or '保持自然对话语气。'}</语气>")
-    lines.append(
-        "  <禁止>本标签为隐藏情境提示，按系统规则自然执行，禁止在回复中提及、陈述或推理。</禁止>"
-    )
-    lines.append("</情感好感>")
-    return "\n".join(lines)
-
-
-def format_emotion_detail(record: FavourRecord, relationship: str) -> str:
-    top = get_dominant_emotions(record, 3)
-    dominant_str = "、".join(
-        f"{EMOTION_DISPLAY_NAMES[k]}({v})" for k, v in top
-    ) if top else "无"
-
-    # 4列×3行，按语义分组：正向 / 负向 / 波动 / 自我
-    groups = [
-        ("正向", [("喜悦", record.joy), ("信任", record.trust), ("期待", record.anticipation)]),
-        ("负向", [("悲伤", record.sadness), ("厌恶", record.disgust), ("愤怒", record.anger)]),
-        ("波动", [("恐惧", record.fear), ("惊讶", record.surprise), ("内疚", record.guilt)]),
-        ("自我", [("得意", record.pride), ("害羞", record.shame), ("嫉妒", record.envy)]),
-    ]
-
-    header = " │ ".join(f"{label}    " for label, _ in groups)
-    rows = []
-    for row_idx in range(3):
-        parts = []
-        for _, items in groups:
-            name, val = items[row_idx]
-            parts.append(f"{name} {val:>3}")
-        rows.append(" │ ".join(parts))
-
-    dim_text = header + "\n" + "\n".join(rows)
-
-    return (
-        f"❤ 好感值：{record.favour}\n"
-        f"🔗 关系：{relationship}\n"
-        f"🎭 主导情感：{dominant_str}\n\n"
-        f"【情感维度详情】\n\n"
-        f'<div style="font-family:Consolas,monospace;white-space:pre;color:#2c3e50;line-height:1.8;">{dim_text}</div>'
-    )
-
-
 class PersonaSummaryRecord(SQLModel, table=True):
     __tablename__ = "persona_summaries"
     __table_args__ = (
@@ -419,41 +105,39 @@ class PersonaSummaryRecord(SQLModel, table=True):
     persona_id: str = Field(default="", unique=True, index=True)
     summary: str = Field(default="")
     persona_hash: str = Field(default="")
-    updated_at: datetime = Field(default_factory=datetime.now)
-
-
-class GroupRosterEntry(SQLModel, table=True):
-    """群名单条目：按群聊维护 user_id → {card, nickname} 映射。
-
-    card = 群名片（用户在该群设置的自定义名）
-    nickname = QQ 昵称（账号级，跨群一致）
-    两者分开存储，便于在不同上下文（群聊 vs 私聊）取用合适的字段。
-    """
-    __tablename__ = "group_roster"
-    __table_args__ = (
-        UniqueConstraint("group_id", "user_id", name="uq_group_user"),
-        {"extend_existing": True},
-    )
-
-    id: Optional[int] = Field(default=None, primary_key=True)
-    group_id: str = Field(index=True)
-    user_id: str = Field(index=True)
-    card: str = Field(default="")
-    nickname: str = Field(default="")
-    updated_at: datetime = Field(default_factory=datetime.now)
-
+    updated_at: datetime = Field(default_factory=utc_now)
 
 
 class FavourDBManager:
-    def __init__(self, data_dir: Path, min_val: int = -100, max_val: int = 100):
+    def __init__(
+        self,
+        data_dir: Path,
+        min_val: int = -100,
+        max_val: int = 100,
+        *,
+        local_timezone: str = "Asia/Shanghai",
+    ):
         self.data_dir = data_dir
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.data_dir / "favour.db"
         self.db_url = f"sqlite+aiosqlite:///{self.db_path}"
         self.min_val = min_val
         self.max_val = max_val
+        try:
+            self.local_tz = ZoneInfo(local_timezone)
+        except Exception:
+            self.local_tz = ZoneInfo("Asia/Shanghai")
 
         self.engine = create_async_engine(self.db_url, echo=False)
+
+        @event.listens_for(self.engine.sync_engine, "connect")
+        def _set_sqlite_pragmas(dbapi_connection, _):
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA busy_timeout=5000")
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.close()
+
         self.async_session = sessionmaker(
             self.engine, class_=AsyncSession, expire_on_commit=False
         )
@@ -476,6 +160,66 @@ class FavourDBManager:
         ("envy", "INTEGER DEFAULT 0"),
     ]
 
+    async def _backup_sqlite(self, prefix: str) -> Optional[Path]:
+        """使用 SQLite backup API 创建一致性数据库备份。"""
+        if not self.db_path.exists() or self.db_path.stat().st_size == 0:
+            return None
+        backup_dir = self.data_dir / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = utc_now().strftime("%Y%m%d_%H%M%S_UTC")
+        target = backup_dir / f"{prefix}_{stamp}.db"
+
+        def _copy() -> None:
+            source_conn = sqlite3.connect(self.db_path)
+            target_conn = sqlite3.connect(target)
+            try:
+                source_conn.backup(target_conn)
+            finally:
+                target_conn.close()
+                source_conn.close()
+
+        await asyncio.to_thread(_copy)
+        return target
+
+    async def _migrate_timestamps_to_utc(self, conn) -> int:
+        """把旧版按服务器本地时间写入的 naive 时间转换成 UTC naive。"""
+        converted = 0
+        table_columns = {
+            "favour_records": ("created_at", "updated_at"),
+            "persona_summaries": ("updated_at",),
+        }
+        for table_name, columns in table_columns.items():
+            exists = await conn.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table' AND name=:name"),
+                {"name": table_name},
+            )
+            if exists.fetchone() is None:
+                continue
+            selected = ", ".join(("id", *columns))
+            rows = (await conn.execute(text(f"SELECT {selected} FROM {table_name}"))).fetchall()
+            for row in rows:
+                updates = {}
+                for index, column in enumerate(columns, start=1):
+                    old = _parse_db_datetime(row[index])
+                    if old is None:
+                        continue
+                    utc_value = (
+                        old.replace(tzinfo=self.local_tz)
+                        .astimezone(timezone.utc)
+                        .replace(tzinfo=None)
+                    )
+                    updates[column] = utc_value
+                if not updates:
+                    continue
+                assignments = ", ".join(f"{column}=:{column}" for column in updates)
+                updates["row_id"] = row[0]
+                await conn.execute(
+                    text(f"UPDATE {table_name} SET {assignments} WHERE id=:row_id"),
+                    updates,
+                )
+                converted += 1
+        return converted
+
     async def init_db(self):
         if self._initialized:
             return
@@ -483,6 +227,13 @@ class FavourDBManager:
         async with self._init_lock:
             if self._initialized:
                 return
+
+            migration_marker = self.data_dir / ".timestamps_utc_v1"
+            preexisting = self.db_path.exists() and self.db_path.stat().st_size > 0
+            if preexisting and not migration_marker.exists():
+                backup_path = await self._backup_sqlite("pre_utc_migration")
+                if backup_path:
+                    logger.info(f"UTC 时间迁移前数据库备份完成: {backup_path}")
 
             try:
                 async with self.engine.begin() as conn:
@@ -553,42 +304,46 @@ class FavourDBManager:
                         "CREATE INDEX IF NOT EXISTS ix_persona_summaries_pid ON persona_summaries (persona_id)"
                     ))
 
-                    # 群名单表（user_id → {card, nickname}，按群聊维度）
                     await conn.execute(text("""
-                        CREATE TABLE IF NOT EXISTS group_roster (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            group_id TEXT NOT NULL,
-                            user_id TEXT NOT NULL,
-                            card TEXT NOT NULL DEFAULT '',
-                            nickname TEXT NOT NULL DEFAULT '',
-                            updated_at DATETIME,
-                            CONSTRAINT uq_group_user UNIQUE (group_id, user_id)
+                        CREATE TABLE IF NOT EXISTS emotion_favour_meta (
+                            key TEXT PRIMARY KEY,
+                            value TEXT NOT NULL DEFAULT ''
                         )
                     """))
-                    # 旧表迁移：display_name → card
-                    try:
-                        cols = {row[1] for row in (await conn.execute(text("PRAGMA table_info(group_roster)"))).fetchall()}
-                    except Exception:
-                        cols = set()
-                    if 'display_name' in cols and 'card' not in cols:
-                        await conn.execute(text("ALTER TABLE group_roster ADD COLUMN card TEXT NOT NULL DEFAULT ''"))
-                        await conn.execute(text("UPDATE group_roster SET card = display_name WHERE card = '' AND display_name != ''"))
-                        logger.info("group_roster: 已将 display_name 迁移到 card（nickname 列待全量拉取填充）")
-                    elif 'card' not in cols:
-                        await conn.execute(text("ALTER TABLE group_roster ADD COLUMN card TEXT NOT NULL DEFAULT ''"))
-                    if 'nickname' not in cols:
-                        await conn.execute(text("ALTER TABLE group_roster ADD COLUMN nickname TEXT NOT NULL DEFAULT ''"))
-                    await conn.execute(text(
-                        "CREATE INDEX IF NOT EXISTS ix_group_roster_group_id ON group_roster (group_id)"
+                    storage_row = await conn.execute(text(
+                        "SELECT value FROM emotion_favour_meta WHERE key='timestamp_storage'"
                     ))
-                    await conn.execute(text(
-                        "CREATE INDEX IF NOT EXISTS ix_group_roster_user_id ON group_roster (user_id)"
-                    ))
+                    timestamp_storage = storage_row.scalar_one_or_none()
+                    if table_exists and timestamp_storage != "utc_naive_v1":
+                        converted = await self._migrate_timestamps_to_utc(conn)
+                        logger.info(
+                            f"数据库时间迁移完成: local naive -> UTC naive, rows={converted}"
+                        )
+                    await conn.execute(text("""
+                        INSERT INTO emotion_favour_meta(key, value)
+                        VALUES ('timestamp_storage', 'utc_naive_v1')
+                        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                    """))
 
                 self._initialized = True
+                migration_marker.write_text("utc_naive_v1\n", encoding="utf-8")
                 logger.info(f"印象数据库已初始化: {self.db_path}")
             except Exception as e:
                 logger.error(f"数据库初始化失败: {e}")
+                raise
+
+    async def close(self) -> None:
+        await self.engine.dispose()
+        self._initialized = False
+
+    def to_local_datetime(self, value: Optional[datetime]) -> Optional[datetime]:
+        if value is None:
+            return None
+        return (
+            value.replace(tzinfo=timezone.utc)
+            .astimezone(self.local_tz)
+            .replace(tzinfo=None)
+        )
 
     async def backup_data(self, records: List[FavourRecord], prefix: str) -> Optional[str]:
         if not records:
@@ -596,7 +351,7 @@ class FavourDBManager:
         try:
             backup_dir = self.data_dir / "backups"
             backup_dir.mkdir(exist_ok=True)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            timestamp = utc_now().strftime("%Y%m%d_%H%M%S_UTC")
             filename = backup_dir / f"{prefix}_{timestamp}.json"
 
             data_to_save = []
@@ -624,40 +379,43 @@ class FavourDBManager:
             return result.scalars().first()
 
     async def update_favour(self, persona_id: str, user_id: str, favour: Optional[int] = None, emotion_updates: Optional[dict] = None) -> bool:
+        """原子 UPSERT：favour 为绝对值，emotion_updates 为增量。"""
         await self.init_db()
         if not _is_valid_userid(user_id):
             return False
 
         try:
             async with self.async_session() as session:
-                stmt = select(FavourRecord).where(
-                    FavourRecord.persona_id == persona_id,
-                    FavourRecord.user_id == user_id,
+                now = utc_now()
+                clean_deltas: dict[str, int] = {}
+                for dim, value in (emotion_updates or {}).items():
+                    if dim not in EMOTION_DIMENSIONS:
+                        continue
+                    try:
+                        clean_deltas[dim] = int(value)
+                    except (TypeError, ValueError):
+                        continue
+
+                insert_values = {
+                    "persona_id": persona_id,
+                    "user_id": user_id,
+                    "favour": max(self.min_val, min(self.max_val, favour)) if favour is not None else 0,
+                    "created_at": now,
+                    "updated_at": now,
+                    **{dim: max(0, min(100, delta)) for dim, delta in clean_deltas.items()},
+                }
+                stmt = sqlite_insert(FavourRecord).values(**insert_values)
+                updates = {"updated_at": now}
+                if favour is not None:
+                    updates["favour"] = max(self.min_val, min(self.max_val, favour))
+                for dim, delta in clean_deltas.items():
+                    column = getattr(FavourRecord, dim)
+                    updates[dim] = func.max(0, func.min(100, column + delta))
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=["persona_id", "user_id"],
+                    set_=updates,
                 )
-                result = await session.execute(stmt)
-                record = result.scalars().first()
-
-                if not record:
-                    init_favour = max(self.min_val, min(self.max_val, favour)) if favour is not None else 0
-                    record = FavourRecord(
-                        persona_id=persona_id,
-                        user_id=user_id,
-                        favour=init_favour,
-                    )
-                    session.add(record)
-                else:
-                    if favour is not None:
-                        record.favour = max(self.min_val, min(self.max_val, favour))
-                    record.updated_at = datetime.now()
-                    session.add(record)
-
-                # Apply emotion dimension updates
-                if emotion_updates:
-                    for dim, value in emotion_updates.items():
-                        if dim not in _METADATA_FIELDS and hasattr(record, dim):
-                            current = getattr(record, dim)
-                            setattr(record, dim, max(0, min(100, current + value)))
-
+                await session.execute(stmt)
                 await session.commit()
                 return True
         except Exception as e:
@@ -685,42 +443,71 @@ class FavourDBManager:
             return False
         try:
             async with self.async_session() as session:
-                stmt = select(FavourRecord).where(
-                    FavourRecord.persona_id == persona_id,
-                    FavourRecord.user_id == user_id,
+                now = utc_now()
+                clean_emotions: dict[str, int] = {}
+                for dim, value in (emotions_absolute or {}).items():
+                    if dim not in EMOTION_DIMENSIONS:
+                        continue
+                    try:
+                        clean_emotions[dim] = max(0, min(100, int(value)))
+                    except (ValueError, TypeError):
+                        continue
+                insert_values = {
+                    "persona_id": persona_id,
+                    "user_id": user_id,
+                    "favour": max(self.min_val, min(self.max_val, favour)) if favour is not None else 0,
+                    "created_at": now,
+                    "updated_at": now,
+                    **clean_emotions,
+                }
+                stmt = sqlite_insert(FavourRecord).values(**insert_values)
+                updates = {"updated_at": now, **clean_emotions}
+                if favour is not None:
+                    updates["favour"] = max(self.min_val, min(self.max_val, favour))
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=["persona_id", "user_id"],
+                    set_=updates,
                 )
-                result = await session.execute(stmt)
-                record = result.scalars().first()
-
-                if not record:
-                    init_favour = (
-                        max(self.min_val, min(self.max_val, favour))
-                        if favour is not None else 0
-                    )
-                    record = FavourRecord(
-                        persona_id=persona_id,
-                        user_id=user_id,
-                        favour=init_favour,
-                    )
-                    session.add(record)
-                else:
-                    if favour is not None:
-                        record.favour = max(self.min_val, min(self.max_val, favour))
-                    record.updated_at = datetime.now()
-                    session.add(record)
-
-                if emotions_absolute:
-                    for dim, value in emotions_absolute.items():
-                        if dim in EMOTION_DIMENSIONS:
-                            try:
-                                setattr(record, dim, max(0, min(100, int(value))))
-                            except (ValueError, TypeError):
-                                continue
-
+                await session.execute(stmt)
                 await session.commit()
                 return True
         except Exception as e:
             logger.error(f"绝对值写入失败: {str(e)}")
+            return False
+
+    async def create_record(
+        self,
+        persona_id: str,
+        user_id: str,
+        *,
+        favour: int = 0,
+        emotions_absolute: Optional[dict] = None,
+    ) -> bool:
+        """原子创建记录；已存在时返回 False。"""
+        await self.init_db()
+        if not _is_valid_userid(user_id):
+            return False
+        now = utc_now()
+        values = {
+            "persona_id": persona_id,
+            "user_id": user_id,
+            "favour": max(self.min_val, min(self.max_val, int(favour))),
+            "created_at": now,
+            "updated_at": now,
+        }
+        for dim, value in (emotions_absolute or {}).items():
+            if dim in EMOTION_DIMENSIONS:
+                values[dim] = max(0, min(100, int(value)))
+        try:
+            async with self.async_session() as session:
+                stmt = sqlite_insert(FavourRecord).values(**values).on_conflict_do_nothing(
+                    index_elements=["persona_id", "user_id"],
+                )
+                result = await session.execute(stmt)
+                await session.commit()
+                return bool(result.rowcount)
+        except Exception as e:
+            logger.error(f"创建记录失败: {e}")
             return False
 
     async def get_distinct_personas(self) -> list[str]:
@@ -763,13 +550,57 @@ class FavourDBManager:
             result = await session.execute(stmt)
             return list(result.scalars().all())
 
+    async def count_records(self, persona_id: str, *, user_id_search: str = "") -> int:
+        await self.init_db()
+        async with self.async_session() as session:
+            conditions = [FavourRecord.persona_id == persona_id]
+            if user_id_search:
+                conditions.append(FavourRecord.user_id.contains(user_id_search))
+            stmt = select(func.count(FavourRecord.id)).where(*conditions)
+            result = await session.execute(stmt)
+            return int(result.scalar_one() or 0)
+
+    async def list_records(
+        self,
+        persona_id: str,
+        *,
+        offset: int = 0,
+        limit: int = 50,
+        sort_by: str = "favour",
+        sort_order: str = "desc",
+        user_id_search: str = "",
+    ) -> List[FavourRecord]:
+        """数据库侧分页；favour 排序基于存储值，展示时仍计算 transient 衰减值。"""
+        await self.init_db()
+        columns = {
+            "user_id": FavourRecord.user_id,
+            "favour": FavourRecord.favour,
+            "updated_at": FavourRecord.updated_at,
+            "created_at": FavourRecord.created_at,
+        }
+        column = columns.get(sort_by, FavourRecord.favour)
+        ordering = column.asc() if sort_order == "asc" else column.desc()
+        async with self.async_session() as session:
+            conditions = [FavourRecord.persona_id == persona_id]
+            if user_id_search:
+                conditions.append(FavourRecord.user_id.contains(user_id_search))
+            stmt = (
+                select(FavourRecord)
+                .where(*conditions)
+                .order_by(ordering, FavourRecord.id.asc())
+                .offset(max(0, int(offset)))
+                .limit(max(1, min(200, int(limit))))
+            )
+            result = await session.execute(stmt)
+            return list(result.scalars().all())
+
     async def reset_all_emotions_by_persona(self, persona_id: str) -> int:
         """重置指定人格下所有用户的情感维度归零（好感度保留）。返回受影响行数。"""
         await self.init_db()
         try:
             async with self.async_session() as session:
                 values = {dim: 0 for dim in EMOTION_DIMENSIONS}
-                values["updated_at"] = datetime.now()
+                values["updated_at"] = utc_now()
                 stmt = (
                     update(FavourRecord)
                     .where(FavourRecord.persona_id == persona_id)
@@ -817,22 +648,22 @@ class FavourDBManager:
         await self.init_db()
         try:
             async with self.async_session() as session:
-                stmt = select(PersonaSummaryRecord).where(
-                    PersonaSummaryRecord.persona_id == persona_id
+                now = utc_now()
+                stmt = sqlite_insert(PersonaSummaryRecord).values(
+                    persona_id=persona_id,
+                    summary=summary,
+                    persona_hash=persona_hash,
+                    updated_at=now,
                 )
-                result = await session.execute(stmt)
-                record = result.scalars().first()
-                if record:
-                    record.summary = summary
-                    record.persona_hash = persona_hash
-                    record.updated_at = datetime.now()
-                else:
-                    record = PersonaSummaryRecord(
-                        persona_id=persona_id,
-                        summary=summary,
-                        persona_hash=persona_hash,
-                    )
-                    session.add(record)
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=["persona_id"],
+                    set_={
+                        "summary": stmt.excluded.summary,
+                        "persona_hash": stmt.excluded.persona_hash,
+                        "updated_at": now,
+                    },
+                )
+                await session.execute(stmt)
                 await session.commit()
                 return True
         except Exception as e:
@@ -854,190 +685,3 @@ class FavourDBManager:
         except Exception as e:
             logger.error(f"删除人设摘要失败: {e}")
             return False
-
-    # ================= 群名单 =================
-
-    async def upsert_roster_entry(
-        self,
-        group_id: str,
-        user_id: str,
-        card: str = "",
-        nickname: str = "",
-    ) -> bool:
-        """单条增量更新。card/nickname 任一非空即可写入；只更新非空字段。
-
-        被动观察调用时：群聊场景下 get_sender_name() 难以区分群名片与 QQ 昵称，
-        统一写入 card 字段（最坏情况下存的是 QQ 昵称，但群聊展示时本来就回退到 nickname，无影响）。
-        全量拉取调用时：card/nickname 分别从 API 的 card/nickname 字段取，明确区分。
-        """
-        if not group_id or not _is_valid_userid(user_id):
-            return False
-        card = card or ""
-        nickname = nickname or ""
-        if not card and not nickname:
-            return False
-        await self.init_db()
-        try:
-            async with self.async_session() as session:
-                stmt = select(GroupRosterEntry).where(
-                    GroupRosterEntry.group_id == group_id,
-                    GroupRosterEntry.user_id == user_id,
-                )
-                result = await session.execute(stmt)
-                record = result.scalars().first()
-                touched = False
-                if record:
-                    if card and record.card != card:
-                        record.card = card
-                        touched = True
-                    if nickname and record.nickname != nickname:
-                        record.nickname = nickname
-                        touched = True
-                    if touched:
-                        record.updated_at = datetime.now()
-                        session.add(record)
-                else:
-                    session.add(GroupRosterEntry(
-                        group_id=group_id,
-                        user_id=user_id,
-                        card=card,
-                        nickname=nickname,
-                    ))
-                await session.commit()
-                return True
-        except Exception as e:
-            logger.error(f"更新群名单失败: {e}")
-            return False
-
-    async def upsert_roster_batch(
-        self, group_id: str, entries: list[tuple[str, str, str]]
-    ) -> int:
-        """全量拉取后批量写入。entries: [(user_id, card, nickname), ...]。返回写入条数。"""
-        if not group_id or not entries:
-            return 0
-        await self.init_db()
-        written = 0
-        try:
-            async with self.async_session() as session:
-                for user_id, card, nickname in entries:
-                    if not _is_valid_userid(user_id):
-                        continue
-                    card = card or ""
-                    nickname = nickname or ""
-                    if not card and not nickname:
-                        continue
-                    stmt = select(GroupRosterEntry).where(
-                        GroupRosterEntry.group_id == group_id,
-                        GroupRosterEntry.user_id == user_id,
-                    )
-                    result = await session.execute(stmt)
-                    record = result.scalars().first()
-                    touched = False
-                    if record:
-                        if card and record.card != card:
-                            record.card = card
-                            touched = True
-                        if nickname and record.nickname != nickname:
-                            record.nickname = nickname
-                            touched = True
-                        if touched:
-                            record.updated_at = datetime.now()
-                            session.add(record)
-                    else:
-                        session.add(GroupRosterEntry(
-                            group_id=group_id,
-                            user_id=user_id,
-                            card=card,
-                            nickname=nickname,
-                        ))
-                    written += 1
-                await session.commit()
-            return written
-        except Exception as e:
-            logger.error(f"批量写入群名单失败: {e}")
-            return written
-
-    async def get_roster(self, group_id: str) -> list[GroupRosterEntry]:
-        """返回整群名单。"""
-        await self.init_db()
-        async with self.async_session() as session:
-            stmt = select(GroupRosterEntry).where(
-                GroupRosterEntry.group_id == group_id
-            )
-            result = await session.execute(stmt)
-            return list(result.scalars().all())
-
-    async def get_known_groups(self) -> list[str]:
-        """返回 roster 表中出现过的所有 group_id（定时任务遍历用）。"""
-        await self.init_db()
-        async with self.async_session() as session:
-            stmt = select(GroupRosterEntry.group_id).distinct()
-            result = await session.execute(stmt)
-            return [row[0] for row in result.all()]
-
-    async def get_display_names_by_users(
-        self, user_ids: list[str], group_id: Optional[str] = None
-    ) -> dict[str, str]:
-        """批量查询多个 user_id 的展示名。
-
-        - 有 group_id（群聊）：严格按当前群视角取值，**群名片优先，QQ 昵称兜底**，不做跨群回退。
-        - 无 group_id（私聊）：跨所有群兜底，**仅返回 QQ 昵称（nickname）**，
-          不返回任何群名片——私聊场景下展示群名片是错误的语义。
-          每个 user_id 取最近更新的一条。
-        """
-        if not user_ids:
-            return {}
-        await self.init_db()
-        try:
-            async with self.async_session() as session:
-                if group_id:
-                    stmt = (
-                        select(GroupRosterEntry.user_id, GroupRosterEntry.card, GroupRosterEntry.nickname)
-                        .where(
-                            GroupRosterEntry.user_id.in_(user_ids),
-                            GroupRosterEntry.group_id == group_id,
-                        )
-                    )
-                    result = await session.execute(stmt)
-                    rows = result.all()
-                    out: dict[str, str] = {}
-                    from_card = 0
-                    from_nick = 0
-                    for uid, card, nickname in rows:
-                        if card:
-                            out[uid] = card
-                            from_card += 1
-                        elif nickname:
-                            out[uid] = nickname
-                            from_nick += 1
-                    logger.debug(
-                        f"[roster] group query: group={group_id}, uids={len(user_ids)}, "
-                        f"rows={len(rows)}, matched={len(out)} (card={from_card}, nickname_fallback={from_nick})"
-                    )
-                    return out
-                stmt = (
-                    select(
-                        GroupRosterEntry.user_id,
-                        GroupRosterEntry.nickname,
-                        GroupRosterEntry.updated_at,
-                    )
-                    .where(
-                        GroupRosterEntry.user_id.in_(user_ids),
-                        GroupRosterEntry.nickname != "",
-                    )
-                    .order_by(GroupRosterEntry.updated_at.desc())
-                )
-                result = await session.execute(stmt)
-                rows = result.all()
-                names: dict[str, str] = {}
-                for uid, nickname, _ in rows:
-                    if nickname and uid not in names:
-                        names[uid] = nickname
-                logger.debug(
-                    f"[roster] private query (nickname only): uids={len(user_ids)}, "
-                    f"candidate_rows={len(rows)}, matched={len(names)}"
-                )
-                return names
-        except Exception as e:
-            logger.error(f"批量查询群名片失败: {e}")
-            return {}

@@ -136,25 +136,25 @@
   "advanced_config": {
     "description": "高级配置",
     "type": "object",
-    "hint": "包含数值波动范围、管理员设置等高级选项。",
+    "hint": "包含数值波动范围、特殊用户和运行时控制等高级选项。",
     "items": {
       "admin_default_favour": {
-        "description": "框架管理员/特使初始好感度",
+        "description": "特殊用户初始好感度",
         "type": "int",
         "default": 50,
-        "hint": "好感度特使和Bot管理员的初始好感度值。"
+        "hint": "仅 favour_envoys 列表内用户首次建立记录时使用；Bot管理员、群主和群管理员不会自动应用。"
       },
       "admin_default_relationship": {
-        "description": "框架管理员/特使关系",
+        "description": "特殊用户关系",
         "type": "string",
         "default": "",
-        "hint": "留空则使用 relationship_config 中的映射关系。非空则框架管理员/特使在计算时使用该特殊值。"
+        "hint": "留空则使用 relationship_config 映射。非空时，仅 favour_envoys 中明确填写的用户使用该特殊关系。"
       },
       "favour_envoys": {
-        "description": "好感度特使用户ID列表",
+        "description": "特殊关系用户ID列表",
         "type": "list",
         "default": [],
-        "hint": "列表中的用户将获得与管理员相同的初始好感度，一行一个，回车确认。"
+        "hint": "ID 填谁，谁就使用上面的特殊初始好感度和特殊关系。填写 QQ 号即可，一行一个；管理员不会自动加入。"
       },
       "favour_change_min": {
         "description": "好感度单次变化最小值",
@@ -180,117 +180,6 @@
         "default": 5,
         "hint": "每个情感维度单次变化的上限（正值）。"
       },
-      "level_threshold": {
-        "description": "高等级成员的群等级阈值",
-        "type": "int",
-        "default": 50,
-        "hint": "群成员等级达到此值时视为HIGH权限。"
-      },
-      "member_commands": {
-        "description": "允许普通成员使用的命令",
-        "type": "list",
-        "options": [
-          "查询印象",
-          "查询全局印象",
-          "修改印象",
-          "修改情感",
-          "清空印象",
-          "清空全局印象",
-          "印象帮助",
-          "印象指令帮助"
-        ],
-        "default": [
-          "查询印象",
-          "印象帮助",
-          "印象指令帮助"
-        ],
-        "hint": "普通成员可使用的命令列表。所有角色默认继承此列表。"
-      },
-      "high_commands": {
-        "description": "允许高等级群员额外使用的命令",
-        "type": "list",
-        "options": [
-          "查询印象",
-          "查询全局印象",
-          "修改印象",
-          "修改情感",
-          "清空印象",
-          "清空全局印象",
-          "印象帮助",
-          "印象指令帮助"
-        ],
-        "default": [],
-        "hint": "高等级群员在普通成员基础上可额外使用的命令列表。"
-      },
-      "admin_commands": {
-        "description": "允许群管理员额外使用的命令",
-        "type": "list",
-        "options": [
-          "查询印象",
-          "查询全局印象",
-          "修改印象",
-          "修改情感",
-          "清空印象",
-          "清空全局印象",
-          "印象帮助",
-          "印象指令帮助"
-        ],
-        "default": [
-          "修改印象",
-          "修改情感"
-        ],
-        "hint": "群管理员在高等级群员基础上可额外使用的命令列表。"
-      },
-      "owner_commands": {
-        "description": "允许群主额外使用的命令",
-        "type": "list",
-        "options": [
-          "查询印象",
-          "查询全局印象",
-          "修改印象",
-          "修改情感",
-          "清空印象",
-          "清空全局印象",
-          "印象帮助",
-          "印象指令帮助"
-        ],
-        "default": [
-          "清空印象"
-        ],
-        "hint": "群主在群管理员基础上可额外使用的命令列表。"
-      },
-      "superuser_commands": {
-        "description": "允许Bot管理员额外使用的命令",
-        "type": "list",
-        "options": [
-          "查询印象",
-          "查询全局印象",
-          "修改印象",
-          "修改情感",
-          "清空印象",
-          "清空全局印象",
-          "印象帮助",
-          "印象指令帮助"
-        ],
-        "default": [
-          "查询全局印象",
-          "清空全局印象"
-        ],
-        "hint": "Bot管理员在群主基础上可额外使用的命令列表。"
-      },
-      "query_others_favour_level": {
-        "description": "允许查看其他人印象的最低等级",
-        "type": "string",
-        "default": "群管理员",
-        "options": [
-          "普通成员",
-          "高等级群员",
-          "群管理员",
-          "群主",
-          "Bot管理员"
-        ],
-        "hint": "低于此等级的用户使用「查询印象」时只能查看自身印象，无法查看他人。"
-      },
       "history_rounds": {
         "description": "裁决模型参考的近期对话轮数",
         "type": "int",
@@ -301,7 +190,7 @@
         "description": "使用 chat_memory 插件提供对话上下文",
         "type": "bool",
         "default": false,
-        "hint": "启用后，裁决模型参考的对话历史从 chat_memory 插件按用户ID隔离读取；未启用时从 AstrBot 自带上下文管理读取（群聊场景共享上下文）。⚠️ 启用前需先安装 chat_memory 插件 ≥ v2.3.0（https://github.com/W-Wolfycz/chat_memory），低版本不支持 llm_status 过滤参数；未安装或版本过低时自动回退到 AstrBot 自带上下文。"
+        "hint": "启用后，裁决模型从 chat_memory 正式版 ≥ 1.0.0 按用户ID和当前人格读取严格配对的 LLM 历史；未启用时使用 AstrBot 自带上下文（群聊场景共享）。未安装、版本不兼容或查询失败时，本轮自动回退到 AstrBot 自带上下文。https://github.com/W-Wolfycz/chat_memory"
       },
       "emotion_decay_enabled": {
         "description": "启用情感时间衰减",
@@ -359,6 +248,24 @@
         "type": "int",
         "default": 50,
         "hint": "好感度向此值回归。只有高于锚点的部分会衰减；≤ 锚点的好感度不衰减（负面印象不会被时间冲淡）。范围跟随 min/max_favour_value。"
+      },
+      "settlement_max_concurrency": {
+        "description": "后台裁决最大并发数",
+        "type": "int",
+        "default": 3,
+        "hint": "好感结算和人设摘要共用的后台 LLM 并发上限。值过大会增加 Provider 压力；同一 persona/user 始终串行结算。"
+      },
+      "settlement_timeout_seconds": {
+        "description": "后台裁决超时/秒",
+        "type": "float",
+        "default": 60.0,
+        "hint": "单次好感结算或人设摘要 LLM 调用的最长等待时间，范围运行时钳制为 5-300 秒。"
+      },
+      "terminate_flush_timeout_seconds": {
+        "description": "插件终止任务收尾时间/秒",
+        "type": "float",
+        "default": 8.0,
+        "hint": "插件禁用或热重载时，允许正在进行的短期数据库/裁决任务完成的最长时间；超时后取消。"
       }
     }
   },
@@ -378,31 +285,6 @@
         "type": "bool",
         "default": false,
         "hint": "启用后，所有 debug 级别日志以 info 级别输出，无需调整后端日志级别即可查看详细运行信息。插件热重载即可生效。"
-      }
-    }
-  },
-  "persuasion_config": {
-    "description": "关系调解（AI劝说）",
-    "type": "object",
-    "hint": "启用后，A 在与 AI 对话时可以请 AI 调整对 B（不在场的第三方群成员）的好感度与情感。",
-    "items": {
-      "enabled": {
-        "description": "启用关系调解",
-        "type": "bool",
-        "default": true,
-        "hint": "关闭后不影响其他功能。"
-      },
-      "match_threshold": {
-        "description": "匹配分数",
-        "type": "int",
-        "default": 70,
-        "hint": "0-100，裁决模型判断「名字匹配是否可信」的标准。100=仅精确匹配（最严格，外号/缩写一律不认）；70=默认推荐，允许常见外号、缩写、子串包含（如「小明」匹配「小明（上班版）」）；60 以下=过于宽松，可能误判到无关成员。裁决模型会用此分数决定是否相信某条匹配并据此调整对 B 的情感——分数越高，模型越需要确信。"
-      },
-      "history_rounds": {
-        "description": "参考对话轮数",
-        "type": "int",
-        "default": 0,
-        "hint": "裁决模型判定劝说意图时参考的近期对话轮数（0-10）。0=仅看当前一轮；推荐 3-5 轮以识别'渐进式劝说'（A 多轮逐步诋毁/夸奖 B）。轮数越大 Token 开销越高。"
       }
     }
   }

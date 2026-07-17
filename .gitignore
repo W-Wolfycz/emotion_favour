@@ -1,2 +1,30 @@
-__pycache__
-tests/
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# 本地测试缓存与报告
+.pytest_cache/
+.coverage
+htmlcov/
+playwright-report/
+test-results/
+
+# AstrBot 运行数据与渲染缓存
+data/
+plugin_data/
+t2i_output/
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# 本地环境与编辑器
+.env
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 本地审阅文档与备份
+docs/
+backups/

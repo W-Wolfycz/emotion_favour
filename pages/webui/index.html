@@ -27,8 +27,9 @@
       </div>
       <div class="topbar-actions">
         <div class="persona-switcher" id="persona-switcher" hidden>
-          <label>人格</label>
-          <select id="persona-select"></select>
+          <label for="persona-select">人格</label>
+          <input id="persona-select" type="search" list="persona-options" placeholder="搜索人格" autocomplete="off">
+          <datalist id="persona-options"></datalist>
         </div>
         <button class="btn btn-ghost btn-sm" id="create-btn" title="新增好感记录">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
@@ -65,8 +66,30 @@
         </span>
       </div>
 
+      <div class="records-toolbar">
+        <label for="user-search">用户 ID</label>
+        <input id="user-search" type="search" placeholder="搜索全部记录" autocomplete="off">
+        <button class="btn btn-secondary btn-sm" id="clear-search" type="button" hidden>清除</button>
+      </div>
+
       <div id="records-list" class="records-list">
         <div class="loading-wrap"><span class="spinner"></span> 加载中...</div>
+      </div>
+
+      <div id="pager" class="pager" hidden>
+        <button class="btn btn-secondary btn-sm" id="page-prev" type="button">上一页</button>
+        <span id="page-info">第 1 / 1 页</span>
+        <button class="btn btn-secondary btn-sm" id="page-next" type="button">下一页</button>
+        <label for="page-size">每页</label>
+        <select id="page-size">
+          <option value="20">20</option>
+          <option value="50" selected>50</option>
+          <option value="100">100</option>
+          <option value="200">200</option>
+        </select>
+        <label for="page-jump">跳至</label>
+        <input id="page-jump" type="number" min="1" value="1">
+        <button class="btn btn-secondary btn-sm" id="page-jump-btn" type="button">跳转</button>
       </div>
 
       <div id="empty-state" class="empty-state" hidden>
@@ -88,22 +111,25 @@
     <div class="dialog-header">
       <div class="dialog-title">
         <span class="user-id" id="edit-user-id">—</span>
-        <span class="admin-tag" id="edit-admin-tag" hidden>管理员覆盖</span>
+        <span class="admin-tag" id="edit-admin-tag" hidden>特殊关系</span>
       </div>
       <button class="dialog-close" id="edit-close" type="button" aria-label="关闭">×</button>
     </div>
     <div class="dialog-body">
       <div class="favour-control">
-        <label>好感度</label>
+        <label>当前有效好感</label>
         <input type="number" class="favour-input" id="edit-favour">
         <span class="relationship-tag" id="edit-relationship">—</span>
         <span class="range-tag" id="edit-range"></span>
+        <span class="stored-favour-note" id="edit-stored-favour"></span>
       </div>
       <div class="emotion-grid" id="edit-emotion-grid"></div>
     </div>
     <div class="dialog-footer">
       <span class="updated-at" id="edit-updated-at">—</span>
       <div class="action-buttons">
+        <button class="btn btn-secondary btn-sm" id="edit-zero-emotions" type="button">情感归零</button>
+        <button class="btn btn-secondary btn-sm" id="edit-restore" type="button">恢复原值</button>
         <button class="btn btn-secondary btn-sm" id="edit-discard" type="button">放弃</button>
         <button class="btn btn-success btn-sm" id="edit-confirm" type="button">✓ 确认</button>
       </div>
@@ -123,7 +149,8 @@
       </div>
       <div class="form-row">
         <label for="create-persona">人格</label>
-        <select id="create-persona"></select>
+        <input id="create-persona" type="search" list="create-persona-options" placeholder="搜索人格" autocomplete="off">
+        <datalist id="create-persona-options"></datalist>
       </div>
       <div class="form-row">
         <label for="create-favour">好感度</label>

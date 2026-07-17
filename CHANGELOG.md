@@ -1,9 +1,70 @@
 # 更新日志
 
+## 3.4.0
+2026-07-17
+
+本次版本集中修复 P0/P1/P2 架构问题，并保持配置版本 `config_version=1` 不变；已有配置无需重新填写。
+
+### P0：生命周期、并发与数据安全
+
+- 将数据库、脚本准备、Playwright 预热和 Web API 注册移入异步 `initialize()`；初始化失败会回收已创建资源并交回 AstrBot 失败插件处理。
+- 最终插件类直接实现 `terminate()`；统一停止受管后台任务、关闭自定义 Playwright 和释放数据库连接。
+- 所有后台任务纳入 `TaskSupervisor`，对同一 `(persona_id, user_id)` 使用 keyed lock 串行化结算、命令和 WebUI 写入。
+- SQLite 启用 WAL、busy timeout、foreign keys；情感增量、记录创建和字段写入改为原子 UPSERT/SQL 更新。
+- 旧服务器本地 naive 时间首次启动自动备份并迁移为 UTC naive（按配置时区解释），API 展示仍转换为本地时间。
+
+### P1：Hook、LLM 和 persona 一致性
+
+- 结算 Hook 改为 `after_message_sent`，只表示发送流程结束/发送尝试完成，不宣称平台已确认送达。
+- 结算和人设摘要统一使用并发上限与共用超时；补充 persona/目标用户锁，避免竞态和缓存击穿。
+- 人设摘要和 favour 记录均使用当前会话解析出的 persona ID，不再误用默认 persona。
+- ChatMemory 历史查询显式传当前 resolved `persona_id`，查询不可用时回退 AstrBot 自带上下文。
+
+### P2：模块边界与管理台
+
+- 新增无 AstrBot/数据库依赖的 `domain.py`，集中纯情感计算、衰减和提示词构造；`storage.py` 保留兼容导出。
+- Web API 增加 persona、分页和排序字段；WebUI 只走 `window.AstrBotPluginPage` Bridge，不再自行拼接 `asset_token` 或调用 `fetch`。
+- WebUI 的人格切换和新增记录支持搜索现有人格。
+- WebUI 增加服务端用户 ID 搜索、每页数量选择和页码跳转。
+- 好感展示区分衰减后的当前有效值与数据库原值；编辑窗口支持情感归零、恢复打开时数值和未保存修改提醒。
+- 自定义 Playwright T2I 按现有用户选择保留，增加 15 秒网络/页面超时、浏览器锁、页面 finally 关闭和带版本/宽度的缓存名。
+- 补充架构静态测试、运行期并发测试、SQLite 并发/UTC 迁移测试和改造说明文档。
+
+### 功能收敛与权限策略
+
+- 删除关系调节/AI 劝说、群名单观察与定时同步、`persuasion_config`、`roster_matcher.py` 和 `rapidfuzz`；旧 `group_roster` 表只作历史保留，不再创建、迁移或读写。
+- 普通成员仅可自查和查看帮助；查询他人、全局查询、修改、清空和人设摘要管理统一由 AstrBot `admins_id` Bot 管理员操作。
+- 特殊关系和特殊初始好感只认 `favour_envoys` 明确列出的 ID，Bot 管理员不会自动获得特殊值。
+- 使用生产数据库的 SQLite backup 快照完成兼容验证，原有业务记录数量保持不变且 `PRAGMA integrity_check=ok`。
+
+## 3.3.4
+2026-07-15
+
+### persona_id 解析对齐 chat_memory（修复切人格后 favour 错位）
+
+`_get_persona_id` 改走 `persona_manager.resolve_selected_persona`，与 LLM 实际使用的 persona 同源（`_ensure_persona_and_skills`）。
+
+- **旧行为**：只取 `provider_settings.default_personality`，忽略 `/persona` 切换与 conversation 级 persona 设置
+- **新行为**：按 session 规则 > conversation.persona_id > config 默认 优先级解析
+- **影响**：用户 `/persona 客服小姐` 后再聊天，favour 正确读写到「客服小姐」分区，不再错位到 default
+- 失败兜底回退 `"default"`，与旧实现一致
+
+### `<禁止>` 禁令归集到 SystemPrompt + 瘦身
+
+3.3.3 引入双通道注入后，详细禁令在 SystemPrompt 与 `<情感好感>` 内双写，语义 90% 重叠。
+
+- 详细禁令（禁元叙述字眼、禁思考标签、禁陈述规则本身等）统一归到 SystemPrompt 权威版（含示例「不得说『我现在不能说X』」）
+- `<情感好感>` 内的 `<禁止>` 子标签瘦身为单行指针：「本标签为隐藏情境提示，按系统规则自然执行，禁止在回复中提及、陈述或推理」
+- 收益：消除双通道重复，SystemPrompt 承载完整禁令命中 caching，user 侧保留就近提醒 + 标签标注功能
+
+### WebUI 新增 Dialog 默认拉宽
+
+新增好感记录 dialog 从 480px 拉宽到 900px（与编辑 dialog 一致），避免展开「情感（可选）」后 12 个滑块左右滚动。删除不再使用的 `.dialog-narrow` CSS 规则；窄屏仍由现有响应式断点兜底（95vw / 96vw）。
+
 ## 3.3.3
 2026-07-10
 
-### 提示词结构重构：双通道注入 + `<禁止>` 瘦身
+### 提示词结构重构：双通道注入 + `<禁止>` 扩展元叙述禁令
 
 针对实际运行暴露的问题：LLM 复读 boundary 规则（"我不能说 X，只能说 Y"）+ 全部塞 user append 导致指令权重不区分。
 
@@ -13,11 +74,9 @@
 - `build_injection_prompt` 保持原签名，仍注入到 `req.extra_user_content_parts`，只承载当前档位的动态状态（好感度数值、12 维、当前 boundary、进度）
 - 收益：system role 指令权重更高，LLM 对元规则遵循更强；稳定部分命中 prompt caching；user 消息更干净
 
-**禁令归集到 SystemPrompt + `<禁止>` 瘦身**
+**`<禁止>` 扩展元叙述禁令**
 
-- 详细禁令（禁元叙述字眼、禁思考标签、禁陈述规则本身等）统一归到 SystemPrompt 权威版（含示例「不得说『我现在不能说X』」）
-- `<情感好感>` 内的 `<禁止>` 子标签瘦身为单行指针：「本标签为隐藏情境提示，按系统规则自然执行，禁止在回复中提及、陈述或推理」
-- 收益：消除双通道重复，SystemPrompt 承载完整禁令命中 caching，user 侧保留就近提醒 + 标签标注功能
+新增「不得使用『我不能说』『按规则』『受等级限制』等元叙述字眼」「禁止在回复中陈述规则本身（如『我现在不能说 X，只能说 Y』）」。配合 boundary 正向重写，根治复读问题。
 
 ## 3.3.2
 2026-07-09
@@ -86,16 +145,16 @@ advance 模式的 `relationship_config.advance_config` 从原始 JSON 字符串�
 - **持久化**：迁移发生时自动调 `save_config()` 落盘，避免内存迁移丢失
 - **健康度自检**：测试覆盖「版本号与注册表一致」「每版有迁移函数」「CURRENT 版本幂等」
 
-### 管理员覆盖按最高等级处理
+### 特殊用户覆盖按最高等级处理
 
-admin / 特使用户（`admin_default_relationship` 非空 + uid 在特权集）在 advance 模式下走「最高等级」分支：
+显式特殊用户（`admin_default_relationship` 非空 + uid 在 `favour_envoys`）在 advance 模式下走「最高等级」分支：
 
 - **对话注入**：`boundary` / `rule` / `preview` 取自最高等级（如「挚爱」的深度亲密边界），`is_max_tier=True`
 - **关系名**：`<情感好感>` 标签里仍展示 `admin_default_relationship`（如「特殊」），不混淆用户
 - **进度行**：展示「已达最高等级」而非具体百分比
 - **后台结算**：`current_rule` 取最高等级的 rule，描述用 admin_default_relationship 名称
 
-新增辅助方法 `_get_max_tier()` / `_is_admin_override()`，原 `_find_tier` 逻辑保留给非 admin 用户。
+新增辅助方法 `_get_max_tier()` / `_is_special_override()`，原 `_find_tier` 逻辑保留给普通用户。
 
 ### 配置 hint 文案精简
 
@@ -140,7 +199,7 @@ admin / 特使用户（`admin_default_relationship` 非空 + uid 在特权集）
 - **进度计算**：`(z - x) / (y - x)`，其中 [x, y] 为当前关系区间；语义分 4 档（刚进入 <20% / 稳定 20-80% / 接近下一阶段 80-95% / 处于此关系巅峰 ≥95%）
 - **正负向统一**：语义均为"向下一阶段过渡的进度"——「厌恶」区间 90% 表示"即将松动到「反感」"，而非"厌恶加深"
 - **区间对齐**：`_get_relationship_range` 与 `_get_relationship` 共用 idx 逻辑，保证关系名与区间范围一致；simple 模式最后区间 y 取 `max_favour_value` 覆盖端点
-- **特殊场景**：admin override 关系不注入进度行；挚爱区间（y==x）直接显示 100% 巅峰
+- **特殊场景**：特殊用户覆盖关系不注入进度行；挚爱区间（y==x）直接显示 100% 巅峰
 
 ### 对话注入 XML 结构展开
 

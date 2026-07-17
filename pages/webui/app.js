@@ -5,13 +5,10 @@
  * 点击编辑弹原生 <dialog>，内部完整呈现 favour + 12 维滑块；
  * 顶栏「+ 新增」按钮弹另一个 dialog，手动添加 record。
  *
- * vanilla JS，无框架。AstrBot 主 webui 注入 bridge 时优先用 bridge，
- * 降级走 fetch（本地开发调试）。
+ * vanilla JS，无框架。API 与鉴权统一通过 AstrBot Plugin Page Bridge。
  */
 
 // ==================== [1] 桥接 + 状态 ====================
-
-const PLUGIN_NAME = 'emotion_favour';
 
 // 桥接对象由后端注入的 bridge-sdk.js 提供。
 // 注入时序晚于本脚本首次执行 → 用函数运行时读取，并轮询等待就绪。
@@ -26,7 +23,7 @@ const GROUP_LABELS = {
 };
 
 // user_id 白名单（与后端 _is_valid_userid 同步）
-const USERID_RE = /^[a-zA-Z0-9_-]{1,64}$/;
+const USERID_RE = /^[a-zA-Z0-9_\-:@.]{1,64}$/;
 
 // 维度 → 所属 group（供 chip 染色用，与后端 EMOTION_GROUPS 同步）
 const DIM_TO_GROUP = {
@@ -43,6 +40,11 @@ const state = {
   records: [],            // 后端原始数据，唯一的真相源
   sortKey: 'favour',      // 'user_id' | 'favour' | 'updated_at'
   sortOrder: 'desc',      // 'asc' | 'desc'
+  page: 1,
+  pageSize: 50,
+  total: 0,
+  totalPages: 1,
+  userIdSearch: '',
 };
 
 // dialog 运行时上下文（打开时填，关闭时清）
@@ -51,67 +53,43 @@ let createCtx = null;     // { refs }
 
 // ==================== [2] API client ====================
 
-// 从当前 URL 提取 asset_token（后端鉴权用，TTL 60s）。降级 fetch 必须手动附加。
-function getAssetToken() {
-  try {
-    return new URLSearchParams(window.location.search).get('asset_token') || '';
-  } catch (e) {
-    return '';
-  }
-}
-
 async function apiGet(endpoint, params = {}) {
   const bridge = getBridge();
-  if (bridge && typeof bridge.apiGet === 'function') {
-    return bridge.apiGet(endpoint, params);
+  if (!bridge || typeof bridge.apiGet !== 'function') {
+    throw new Error('AstrBot Plugin Page Bridge 未就绪');
   }
-  const qs = new URLSearchParams();
-  Object.entries(params).forEach(([k, v]) => {
-    if (v !== undefined && v !== null && v !== '') qs.set(k, String(v));
-  });
-  const token = getAssetToken();
-  if (token) qs.set('asset_token', token);
-  const query = qs.toString();
-  const url = `/api/${PLUGIN_NAME}/${endpoint}${query ? '?' + query : ''}`;
-  const resp = await fetch(url, { credentials: 'include' });
-  return resp.json();
+  return bridge.apiGet(endpoint, params);
 }
 
 async function apiPost(endpoint, body = {}) {
   const bridge = getBridge();
-  if (bridge && typeof bridge.apiPost === 'function') {
-    return bridge.apiPost(endpoint, body);
+  if (!bridge || typeof bridge.apiPost !== 'function') {
+    throw new Error('AstrBot Plugin Page Bridge 未就绪');
   }
-  const token = getAssetToken();
-  const query = token ? `?asset_token=${encodeURIComponent(token)}` : '';
-  const resp = await fetch(`/api/${PLUGIN_NAME}/${endpoint}${query}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-    credentials: 'include',
-  });
-  return resp.json();
+  return bridge.apiPost(endpoint, body);
 }
 
 const api = {
   getAbout: () => apiGet('about'),
   getPersonas: () => apiGet('personas'),
-  getRecords: (persona_id) => apiGet('records', { persona_id }),
+  getRecords: (persona_id, page, page_size, sort_by, sort_order, user_id_search) =>
+    apiGet('records', { persona_id, page, page_size, sort_by, sort_order, user_id_search }),
   getRelationship: (persona_id, user_id, favour) =>
     apiGet('relationship', { persona_id, user_id, favour }),
   saveRecord: (payload) => apiPost('records/save', payload),
 };
 
-/** 等待 bridge-sdk 注入完成（最多轮询 2 秒）。降级模式立即返回。 */
+/** 等待核心自动注入的 bridge-sdk 就绪。 */
 async function waitBridgeReady() {
   for (let i = 0; i < 20; i++) {
     const bridge = getBridge();
     if (bridge && typeof bridge.ready === 'function') {
-      try { await bridge.ready(); } catch (e) { /* 握手失败仍允许尝试调用 */ }
+      await bridge.ready();
       return;
     }
     await new Promise(r => setTimeout(r, 100));
   }
+  throw new Error('AstrBot Plugin Page Bridge 注入超时');
 }
 
 // ==================== [3] 工具 ====================
@@ -175,7 +153,8 @@ async function loadPersonas() {
   }
   state.personas = resp.personas || [];
   const switcher = document.getElementById('persona-switcher');
-  const select = document.getElementById('persona-select');
+  const input = document.getElementById('persona-select');
+  const options = document.getElementById('persona-options');
 
   if (state.personas.length === 0) {
     switcher.hidden = true;
@@ -186,17 +165,14 @@ async function loadPersonas() {
   // currentPersona 不在 personas 列表里（首次进入 / 切换后失效）→ 重置到第一个
   if (!state.currentPersona || !state.personas.includes(state.currentPersona)) {
     state.currentPersona = state.personas[0];
+    state.page = 1;
   }
 
-  if (state.personas.length > 1) {
-    const cur = state.currentPersona;
-    select.innerHTML = state.personas.map(p =>
-      `<option value="${escapeHtml(p)}"${p === cur ? ' selected' : ''}>${escapeHtml(p)}</option>`
-    ).join('');
-    switcher.hidden = false;
-  } else {
-    switcher.hidden = true;
-  }
+  options.innerHTML = state.personas.map(p =>
+    `<option value="${escapeHtml(p)}"></option>`
+  ).join('');
+  input.value = state.currentPersona;
+  switcher.hidden = state.personas.length <= 1;
 
   await loadRecords();
 }
@@ -208,7 +184,14 @@ async function loadRecords() {
   }
   showLoading();
   try {
-    const resp = await api.getRecords(state.currentPersona);
+    const resp = await api.getRecords(
+      state.currentPersona,
+      state.page,
+      state.pageSize,
+      state.sortKey,
+      state.sortOrder,
+      state.userIdSearch,
+    );
     if (!resp.success) {
       showError(resp.error || '加载记录失败');
       return;
@@ -222,8 +205,12 @@ async function loadRecords() {
       relationship_mode: resp.relationship_mode,
     };
     state.records = resp.records || [];
+    state.page = resp.page || 1;
+    state.total = resp.total || 0;
+    state.totalPages = resp.total_pages || 1;
     renderStats();
     renderRecords();
+    renderPager();
   } catch (e) {
     showError('加载记录异常：' + (e?.message || e));
   }
@@ -231,7 +218,7 @@ async function loadRecords() {
 
 function renderStats() {
   document.getElementById('persona-tag').textContent = state.currentPersona;
-  document.getElementById('user-count').textContent = state.records.length;
+  document.getElementById('user-count').textContent = state.total;
   if (state.meta) {
     document.getElementById('range-tag').textContent = `${state.meta.favour_min} ~ ${state.meta.favour_max}`;
     const modeTag = document.getElementById('mode-tag');
@@ -244,24 +231,18 @@ function renderStats() {
 }
 
 function getSortedRecords() {
-  const key = state.sortKey;
-  const order = state.sortOrder === 'asc' ? 1 : -1;
-  const sorted = [...state.records];
-  sorted.sort((a, b) => {
-    let av, bv;
-    if (key === 'user_id') {
-      av = a.user_id; bv = b.user_id;
-      return order * String(av).localeCompare(String(bv));
-    }
-    if (key === 'updated_at') {
-      av = a.updated_at || ''; bv = b.updated_at || '';
-      return order * String(av).localeCompare(String(bv));
-    }
-    // favour
-    av = Number(a.favour) || 0; bv = Number(b.favour) || 0;
-    return order * (av - bv);
-  });
-  return sorted;
+  return state.records;
+}
+
+function renderPager() {
+  const pager = document.getElementById('pager');
+  document.getElementById('page-info').textContent =
+    `第 ${state.page} / ${state.totalPages} 页`;
+  document.getElementById('page-jump').value = state.page;
+  document.getElementById('page-jump').max = state.totalPages;
+  document.getElementById('page-prev').disabled = state.page <= 1;
+  document.getElementById('page-next').disabled = state.page >= state.totalPages;
+  pager.hidden = state.total === 0;
 }
 
 function renderRecords() {
@@ -277,6 +258,13 @@ function renderRecords() {
   if (state.records.length === 0) {
     list.innerHTML = '';
     empty.hidden = false;
+    if (state.userIdSearch) {
+      empty.innerHTML = `
+        <div class="empty-icon">🔎</div>
+        <div>没有匹配“${escapeHtml(state.userIdSearch)}”的用户 ID</div>
+      `;
+      return;
+    }
     if (state.personas && state.personas.length === 0) {
       empty.innerHTML = `
         <div class="empty-icon">📭</div>
@@ -316,8 +304,13 @@ function buildCard(record) {
   row.className = 'card-row';
   row.innerHTML = `
     <span class="user-id">${escapeHtml(record.user_id)}</span>
-    ${record.is_admin_override ? '<span class="admin-tag">管理员覆盖</span>' : ''}
-    <span class="favour-display">${record.favour}</span>
+    ${record.is_special_override ? '<span class="admin-tag">特殊关系</span>' : ''}
+    <span class="favour-wrap">
+      <span class="favour-display" title="当前实际生效值">${record.favour}</span>
+      ${record.stored_favour !== record.favour
+        ? `<span class="stored-favour" title="数据库中的原始值">库内 ${record.stored_favour}</span>`
+        : ''}
+    </span>
     <span class="relationship-tag">${escapeHtml(record.relationship)}</span>
     <span class="range-tag">${escapeHtml(rangeText(record.relationship_range))}</span>
     <span class="updated-at">${formatDate(record.updated_at)}</span>
@@ -403,6 +396,25 @@ function bindSliderEvents(container) {
   });
 }
 
+function setEmotionValues(container, emotions) {
+  container.querySelectorAll('input[type="range"]').forEach(slider => {
+    const value = emotions[slider.dataset.dim] ?? 0;
+    slider.value = value;
+    slider.parentElement.querySelector('.slider-value').textContent = value;
+    slider.style.setProperty('--progress', `${value}%`);
+  });
+}
+
+function isEditDirty() {
+  if (!editCtx) return false;
+  const favour = parseInt(document.getElementById('edit-favour').value, 10);
+  if (favour !== editCtx.snapshot.favour) return true;
+  const emotions = collectEmotions(document.getElementById('edit-emotion-grid'));
+  return Object.keys(editCtx.snapshot.emotions || {}).some(
+    dim => emotions[dim] !== editCtx.snapshot.emotions[dim]
+  );
+}
+
 function openEditDialog(userId) {
   const record = state.records.find(r => r.user_id === userId);
   if (!record) {
@@ -418,11 +430,15 @@ function openEditDialog(userId) {
   favourInput.max = favourMax;
 
   document.getElementById('edit-user-id').textContent = record.user_id;
-  document.getElementById('edit-admin-tag').hidden = !record.is_admin_override;
+  document.getElementById('edit-admin-tag').hidden = !record.is_special_override;
   document.getElementById('edit-updated-at').textContent = '最后更新：' + formatDate(record.updated_at);
   favourInput.value = record.favour;
   document.getElementById('edit-relationship').textContent = record.relationship;
   document.getElementById('edit-range').textContent = rangeText(record.relationship_range);
+  const storedNote = document.getElementById('edit-stored-favour');
+  storedNote.textContent = record.stored_favour !== record.favour
+    ? `库内原值：${record.stored_favour}（保存后以当前输入值为准）`
+    : '当前有效值与库内原值一致';
 
   const grid = document.getElementById('edit-emotion-grid');
   buildEmotionGrid(grid, record.emotions || {});
@@ -457,10 +473,23 @@ function openEditDialog(userId) {
   dialog.showModal();
 }
 
-function closeEditDialog() {
+function closeEditDialog(force = false) {
+  if (!force && isEditDirty() && !window.confirm('存在未保存的修改，确定放弃吗？')) {
+    return false;
+  }
   const dialog = document.getElementById('edit-dialog');
   if (dialog.open) dialog.close();
   editCtx = null;
+  return true;
+}
+
+function restoreEditSnapshot() {
+  if (!editCtx) return;
+  const snapshot = editCtx.snapshot;
+  const favourInput = document.getElementById('edit-favour');
+  favourInput.value = snapshot.favour;
+  favourInput.dispatchEvent(new Event('input', { bubbles: true }));
+  setEmotionValues(document.getElementById('edit-emotion-grid'), snapshot.emotions || {});
 }
 
 async function onEditConfirm() {
@@ -504,7 +533,7 @@ async function onEditConfirm() {
         oldCard.replaceWith(newCard);
       }
     }
-    closeEditDialog();
+    closeEditDialog(true);
     showToast('已保存', 'success');
   } catch (e) {
     showToast('保存异常：' + (e?.message || e), 'error');
@@ -519,11 +548,13 @@ async function onEditConfirm() {
 
 function openCreateDialog() {
   const dialog = document.getElementById('create-dialog');
-  const personaSelect = document.getElementById('create-persona');
+  const personaInput = document.getElementById('create-persona');
+  const personaOptions = document.getElementById('create-persona-options');
 
-  personaSelect.innerHTML = state.personas.map(p =>
-    `<option value="${escapeHtml(p)}"${p === state.currentPersona ? ' selected' : ''}>${escapeHtml(p)}</option>`
+  personaOptions.innerHTML = state.personas.map(p =>
+    `<option value="${escapeHtml(p)}"></option>`
   ).join('');
+  personaInput.value = state.currentPersona;
 
   document.getElementById('create-user-id').value = '';
   const favourInput = document.getElementById('create-favour');
@@ -542,9 +573,9 @@ function openCreateDialog() {
   document.querySelector('.emotions-collapse').open = false;
 
   // 关系实时反馈
-  const userIdForRel = '__new__';  // 后端用 user_id 算 admin override / 关系区间；新用户不是 admin
+  const userIdForRel = '__new__';  // 后端用 user_id 算特殊关系覆盖；新用户默认不是特殊用户
   const updateRelationship = debounce(async (favour) => {
-    const personaId = personaSelect.value;
+    const personaId = personaInput.value.trim();
     try {
       const resp = await api.getRelationship(personaId, userIdForRel, favour);
       if (!resp.success) return;
@@ -577,7 +608,7 @@ function closeCreateDialog() {
 
 async function onCreateSubmit() {
   const userId = document.getElementById('create-user-id').value.trim();
-  const personaId = document.getElementById('create-persona').value;
+  const personaId = document.getElementById('create-persona').value.trim();
   const favourInput = document.getElementById('create-favour');
   const favour = parseInt(favourInput.value, 10);
 
@@ -586,7 +617,11 @@ async function onCreateSubmit() {
     return;
   }
   if (!USERID_RE.test(userId)) {
-    showToast('user_id 含非法字符（仅字母数字下划线短横线，1-64 位）', 'error');
+    showToast('user_id 含非法字符（允许字母、数字、_、-、:、@、.，1-64 位）', 'error');
+    return;
+  }
+  if (!state.personas.includes(personaId)) {
+    showToast('请选择现有的人格', 'error');
     return;
   }
   if (Number.isNaN(favour)) {
@@ -617,11 +652,9 @@ async function onCreateSubmit() {
       showToast(msg, 'error');
       return;
     }
-    // 如果是当前 persona，把新记录加进列表
     if (resp.record && resp.record.persona_id === state.currentPersona) {
-      state.records.push(resp.record);
-      // 简单方式：重新渲染整个列表
-      renderRecords();
+      state.page = 1;
+      await loadRecords();
     }
     closeCreateDialog();
     showToast('已创建', 'success');
@@ -639,7 +672,30 @@ async function onCreateSubmit() {
 function setupEventListeners() {
   // persona 切换
   document.getElementById('persona-select').addEventListener('change', async (e) => {
-    state.currentPersona = e.target.value;
+    const personaId = e.target.value.trim();
+    if (!state.personas.includes(personaId)) {
+      e.target.value = state.currentPersona;
+      showToast('请选择现有的人格', 'error');
+      return;
+    }
+    state.currentPersona = personaId;
+    state.page = 1;
+    await loadRecords();
+  });
+
+  const userSearch = document.getElementById('user-search');
+  const runUserSearch = debounce(async () => {
+    state.userIdSearch = userSearch.value.trim();
+    state.page = 1;
+    document.getElementById('clear-search').hidden = !state.userIdSearch;
+    await loadRecords();
+  }, 300);
+  userSearch.addEventListener('input', runUserSearch);
+  document.getElementById('clear-search').addEventListener('click', async () => {
+    userSearch.value = '';
+    state.userIdSearch = '';
+    state.page = 1;
+    document.getElementById('clear-search').hidden = true;
     await loadRecords();
   });
 
@@ -663,16 +719,12 @@ function setupEventListeners() {
 
   // 新增按钮
   document.getElementById('create-btn').addEventListener('click', () => {
-    if (state.personas.length === 0) {
-      showToast('当前实例暂无 persona 数据，无法新增', 'error');
-      return;
-    }
     openCreateDialog();
   });
 
   // 排序 chips
   document.querySelectorAll('.sort-chip').forEach(chip => {
-    chip.addEventListener('click', () => {
+    chip.addEventListener('click', async () => {
       const key = chip.dataset.key;
       if (state.sortKey === key) {
         state.sortOrder = state.sortOrder === 'asc' ? 'desc' : 'asc';
@@ -681,8 +733,35 @@ function setupEventListeners() {
         // 默认顺序：ID/时间用 desc（最新在前），favour 用 desc（高在前）
         state.sortOrder = 'desc';
       }
-      renderRecords();
+      state.page = 1;
+      await loadRecords();
     });
+  });
+
+  document.getElementById('page-prev').addEventListener('click', async () => {
+    if (state.page <= 1) return;
+    state.page -= 1;
+    await loadRecords();
+  });
+  document.getElementById('page-next').addEventListener('click', async () => {
+    if (state.page >= state.totalPages) return;
+    state.page += 1;
+    await loadRecords();
+  });
+  document.getElementById('page-size').addEventListener('change', async (e) => {
+    state.pageSize = parseInt(e.target.value, 10) || 50;
+    state.page = 1;
+    await loadRecords();
+  });
+  const jumpToPage = async () => {
+    const input = document.getElementById('page-jump');
+    const target = Math.max(1, Math.min(state.totalPages, parseInt(input.value, 10) || 1));
+    state.page = target;
+    await loadRecords();
+  };
+  document.getElementById('page-jump-btn').addEventListener('click', jumpToPage);
+  document.getElementById('page-jump').addEventListener('keydown', async (e) => {
+    if (e.key === 'Enter') await jumpToPage();
   });
 }
 
@@ -690,12 +769,22 @@ function setupDialogs() {
   // ===== 编辑 =====
   const editDialog = document.getElementById('edit-dialog');
   document.getElementById('edit-confirm').addEventListener('click', onEditConfirm);
-  document.getElementById('edit-discard').addEventListener('click', closeEditDialog);
-  document.getElementById('edit-close').addEventListener('click', closeEditDialog);
+  document.getElementById('edit-discard').addEventListener('click', () => closeEditDialog());
+  document.getElementById('edit-close').addEventListener('click', () => closeEditDialog());
+  document.getElementById('edit-zero-emotions').addEventListener('click', () => {
+    setEmotionValues(document.getElementById('edit-emotion-grid'), {});
+  });
+  document.getElementById('edit-restore').addEventListener('click', restoreEditSnapshot);
 
   // Esc / 遮罩点击：原生 dialog 的 close 事件已处理，无需额外
   editDialog.addEventListener('close', () => {
     editCtx = null;
+  });
+  editDialog.addEventListener('cancel', (e) => {
+    if (isEditDirty()) {
+      e.preventDefault();
+      closeEditDialog();
+    }
   });
   // 点击 dialog 自身（backdrop 区域）关闭：原生 dialog 的 click outside 检测
   editDialog.addEventListener('click', (e) => {
@@ -723,6 +812,7 @@ function showLoading() {
     '<div class="loading-wrap"><span class="spinner"></span> 加载中...</div>';
   document.getElementById('empty-state').hidden = true;
   document.getElementById('error-state').hidden = true;
+  document.getElementById('pager').hidden = true;
 }
 
 function showEmpty() {
@@ -747,6 +837,7 @@ function showEmpty() {
     `;
   }
   document.getElementById('error-state').hidden = true;
+  document.getElementById('pager').hidden = true;
 }
 
 function showError(msg) {
@@ -754,8 +845,14 @@ function showError(msg) {
   document.getElementById('empty-state').hidden = true;
   document.getElementById('error-state').hidden = false;
   document.getElementById('error-msg').textContent = msg;
+  document.getElementById('pager').hidden = true;
 }
 
 // ==================== [9] 启动 ====================
 
 document.addEventListener('DOMContentLoaded', init);
+window.addEventListener('beforeunload', (e) => {
+  if (!isEditDirty()) return;
+  e.preventDefault();
+  e.returnValue = '';
+});

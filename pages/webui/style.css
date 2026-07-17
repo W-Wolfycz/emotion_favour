@@ -117,20 +117,19 @@ body {
   font-size: 13px;
 }
 
-.persona-switcher select {
+.persona-switcher input {
   background: rgba(255, 255, 255, 0.15);
   color: #fff;
   border: 1px solid rgba(255, 255, 255, 0.3);
   border-radius: 6px;
   padding: 5px 10px;
   font-size: 13px;
-  cursor: pointer;
   backdrop-filter: blur(10px);
+  width: 190px;
 }
 
-.persona-switcher select option {
-  background: #2c3e50;
-  color: #fff;
+.persona-switcher input::placeholder {
+  color: rgba(255, 255, 255, 0.72);
 }
 
 /* ==================== 按钮 ==================== */
@@ -274,6 +273,46 @@ body {
   gap: 8px;
 }
 
+.pager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  margin-top: 18px;
+  color: var(--text-muted);
+  font-size: 13px;
+  flex-wrap: wrap;
+}
+
+.pager select,
+.pager input,
+.records-toolbar input {
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--content-bg-color);
+  color: var(--text-color);
+  padding: 5px 8px;
+}
+
+.pager input {
+  width: 64px;
+}
+
+.records-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.records-toolbar input {
+  width: min(360px, 100%);
+}
+
+.pager[hidden] {
+  display: none;
+}
+
 .record-card {
   background: var(--content-bg-color);
   border-radius: 10px;
@@ -326,6 +365,21 @@ body {
   min-width: 44px;
   text-align: right;
   flex-shrink: 0;
+}
+
+.favour-wrap {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-end;
+  min-width: 58px;
+  line-height: 1.15;
+}
+
+.stored-favour,
+.stored-favour-note {
+  font-size: 10px;
+  color: var(--text-muted);
+  white-space: nowrap;
 }
 
 .card-row .relationship-tag {
@@ -813,7 +867,7 @@ body {
     flex-basis: 100%;
     justify-content: flex-end;
   }
-  .persona-switcher select {
+  .persona-switcher input {
     max-width: 160px;
   }
   .stats-bar {

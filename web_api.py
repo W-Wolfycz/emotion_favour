@@ -21,7 +21,8 @@ from quart import jsonify, request
 
 from astrbot.api import logger
 
-from .storage import EMOTION_DIMENSIONS, EMOTION_DISPLAY_NAMES, EMOTION_GROUPS, _is_valid_userid
+from .domain import EMOTION_DIMENSIONS, EMOTION_DISPLAY_NAMES, EMOTION_GROUPS
+from .storage import _is_valid_userid
 
 
 PLUGIN_NAME = "emotion_favour"
@@ -65,7 +66,7 @@ def _internal_error(e: Exception):
 
 # ==================== 序列化辅助 ====================
 
-def _record_to_dict(plugin, record) -> dict:
+def _record_to_dict(plugin, record, persona_id: str | None = None) -> dict:
     """把 FavourRecord 序列化为前端 dict。
 
     返回的 favour 是 decayed（transient）值——展示与编辑基准都用它，
@@ -74,17 +75,20 @@ def _record_to_dict(plugin, record) -> dict:
     """
     decayed = plugin._decay_favour_value(record)
     emotions = {dim: int(getattr(record, dim, 0)) for dim in EMOTION_DIMENSIONS}
-    is_admin = plugin._is_admin_override(record.user_id)
+    is_special = plugin._is_special_override(record.user_id)
+    created_at = plugin.db.to_local_datetime(record.created_at)
+    updated_at = plugin.db.to_local_datetime(record.updated_at)
     return {
+        "persona_id": persona_id or record.persona_id,
         "user_id": record.user_id,
         "favour": decayed,
         "stored_favour": record.favour,
         "relationship": plugin._get_relationship(decayed, record.user_id),
         "relationship_range": list(plugin._get_relationship_range(decayed, record.user_id) or []),
-        "is_admin_override": is_admin,
+        "is_special_override": is_special,
         "emotions": emotions,
-        "created_at": str(record.created_at) if record.created_at else "",
-        "updated_at": str(record.updated_at) if record.updated_at else "",
+        "created_at": str(created_at) if created_at else "",
+        "updated_at": str(updated_at) if updated_at else "",
     }
 
 
@@ -95,11 +99,16 @@ def register_web_apis(context, plugin) -> None:
 
     plugin 需暴露：
     - plugin.db: FavourDBManager
-    - plugin._get_relationship / _get_relationship_range / _is_admin_override
+    - plugin._get_relationship / _get_relationship_range / _is_special_override
     - plugin._decay_favour_value
     - plugin.min_favour_value / max_favour_value
     - plugin.relationship_mode
     """
+
+    def _not_ready():
+        if plugin.is_ready():
+            return None
+        return _err(f"插件当前状态为 {plugin._state}，存储尚不可用", 503)
 
     # ==================== 端点：about ====================
 
@@ -119,8 +128,19 @@ def register_web_apis(context, plugin) -> None:
 
     async def get_personas():
         try:
-            personas = await plugin.db.get_distinct_personas()
-            return _ok(personas=personas)
+            unavailable = _not_ready()
+            if unavailable:
+                return unavailable
+            personas = set(await plugin.db.get_distinct_personas())
+            personas.add("default")
+            try:
+                for item in getattr(plugin.persona_mgr, "personas_v3", []) or []:
+                    name = str(item.get("name", "") or "").strip()
+                    if name:
+                        personas.add(name)
+            except Exception:
+                pass
+            return _ok(personas=sorted(personas))
         except Exception as e:
             return _internal_error(e)
 
@@ -128,18 +148,54 @@ def register_web_apis(context, plugin) -> None:
 
     async def get_records():
         try:
+            unavailable = _not_ready()
+            if unavailable:
+                return unavailable
             persona_id = (request.args.get("persona_id") or "").strip()
             if not persona_id:
                 return _err("persona_id 不能为空", 400)
             if len(persona_id) > 64:
                 return _err("persona_id 过长", 400)
 
-            records = await plugin.db.get_global_records(persona_id)
-            items = [_record_to_dict(plugin, r) for r in records]
+            try:
+                page = max(1, int(request.args.get("page") or 1))
+                page_size = max(1, min(200, int(request.args.get("page_size") or 50)))
+            except (TypeError, ValueError):
+                return _err("page 和 page_size 必须是整数", 400)
+            sort_by = (request.args.get("sort_by") or "favour").strip()
+            sort_order = (request.args.get("sort_order") or "desc").strip().lower()
+            user_id_search = (request.args.get("user_id_search") or "").strip()
+            if len(user_id_search) > 64:
+                return _err("user_id_search 过长", 400)
+            if sort_by not in {"user_id", "favour", "updated_at", "created_at"}:
+                return _err("sort_by 不受支持", 400)
+            if sort_order not in {"asc", "desc"}:
+                return _err("sort_order 必须是 asc 或 desc", 400)
+
+            total = await plugin.db.count_records(
+                persona_id, user_id_search=user_id_search,
+            )
+            total_pages = max(1, (total + page_size - 1) // page_size)
+            page = min(page, total_pages)
+            records = await plugin.db.list_records(
+                persona_id,
+                offset=(page - 1) * page_size,
+                limit=page_size,
+                sort_by=sort_by,
+                sort_order=sort_order,
+                user_id_search=user_id_search,
+            )
+            items = [_record_to_dict(plugin, r, persona_id) for r in records]
             return _ok(
                 persona_id=persona_id,
                 records=items,
-                total=len(items),
+                total=total,
+                page=page,
+                page_size=page_size,
+                total_pages=total_pages,
+                sort_by=sort_by,
+                sort_order=sort_order,
+                user_id_search=user_id_search,
                 favour_min=plugin.min_favour_value,
                 favour_max=plugin.max_favour_value,
                 relationship_mode=plugin.relationship_mode,
@@ -174,7 +230,7 @@ def register_web_apis(context, plugin) -> None:
                 favour=favour,
                 name=name,
                 range=list(range_tuple) if range_tuple else [],
-                is_admin_override=plugin._is_admin_override(user_id),
+                is_special_override=plugin._is_special_override(user_id),
             )
         except Exception as e:
             return _internal_error(e)
@@ -183,6 +239,9 @@ def register_web_apis(context, plugin) -> None:
 
     async def save_record():
         try:
+            unavailable = _not_ready()
+            if unavailable:
+                return unavailable
             data = await request.get_json() or {}
             persona_id = str(data.get("persona_id", "")).strip()
             user_id = str(data.get("user_id", "")).strip()
@@ -221,23 +280,31 @@ def register_web_apis(context, plugin) -> None:
 
             create_only = bool(data.get("create_only", False))
             if create_only:
-                existing = await plugin.db.get_favour(persona_id, user_id)
-                if existing is not None:
+                created = await plugin.create_record(
+                    persona_id,
+                    user_id,
+                    favour=favour if favour is not None else 0,
+                    emotions_absolute=emotions_absolute,
+                )
+                if not created:
+                    existing = await plugin.db.get_favour(persona_id, user_id)
+                    if existing is None:
+                        return _err("创建失败，请检查日志", 500)
                     return _err(
                         f"该用户在 persona={persona_id} 下已存在记录，请用编辑修改",
                         409,
                     )
-
-            ok = await plugin.db.set_record_fields(
-                persona_id, user_id,
-                favour=favour,
-                emotions_absolute=emotions_absolute,
-            )
-            if not ok:
-                return _err("保存失败，请检查日志", 500)
+            else:
+                ok = await plugin.set_record_fields(
+                    persona_id, user_id,
+                    favour=favour,
+                    emotions_absolute=emotions_absolute,
+                )
+                if not ok:
+                    return _err("保存失败，请检查日志", 500)
 
             record = await plugin.db.get_favour(persona_id, user_id)
-            return _ok(record=_record_to_dict(plugin, record) if record else None)
+            return _ok(record=_record_to_dict(plugin, record, persona_id) if record else None)
         except Exception as e:
             return _internal_error(e)
 
