@@ -1,4 +1,4 @@
-"""3.4.0 架构边界与 AstrBot 集成约束的静态回归测试。"""
+"""3.4.x 架构边界与 AstrBot 集成约束的静态回归测试。"""
 
 import ast
 import json
@@ -74,6 +74,42 @@ class TestAstrBotLifecycleShape(unittest.TestCase):
             and node.func.attr == "_get_recent_history"
         )
         self.assertIn("persona_id", {item.arg for item in history_call.keywords})
+
+    def test_commands_use_one_alias_free_emotion_group(self):
+        group_method = next(
+            node for node in self.plugin.body
+            if isinstance(node, ast.FunctionDef) and node.name == "emotion_group"
+        )
+        self.assertEqual(
+            [ast.unparse(item) for item in group_method.decorator_list],
+            ["filter.command_group('emotion')"],
+        )
+
+        expected_subcommands = {
+            "me", "query", "list", "set", "mood", "clear", "clear-all",
+            "persona", "persona-clear", "help",
+        }
+        actual_subcommands = set()
+        top_level_commands = []
+        for method in self.plugin.body:
+            if not isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for decorator in method.decorator_list:
+                rendered = ast.unparse(decorator)
+                if rendered.startswith("emotion_group.command("):
+                    self.assertNotIn("alias=", rendered)
+                    actual_subcommands.add(decorator.args[0].value)
+                elif rendered.startswith("filter.command("):
+                    top_level_commands.append((method.name, decorator))
+        self.assertEqual(actual_subcommands, expected_subcommands)
+        self.assertEqual(len(top_level_commands), 1)
+
+        method_name, legacy_decorator = top_level_commands[0]
+        self.assertEqual(method_name, "legacy_query_self")
+        self.assertEqual(legacy_decorator.args[0].value, "查询印象")
+        alias_kw = next(item for item in legacy_decorator.keywords if item.arg == "alias")
+        aliases = {item.value for item in alias_kw.value.elts}
+        self.assertEqual(aliases, {"印象", "查询好感度", "好感度"})
 
 
 class TestModuleBoundaries(unittest.TestCase):

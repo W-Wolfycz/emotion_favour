@@ -42,28 +42,28 @@ class TestPermissionPolicy(unittest.TestCase):
     def test_public_commands_are_available_to_everyone(self):
         method = self.permission_ns["_check_command_permission"]
         plugin = types.SimpleNamespace(
-            _PUBLIC_COMMANDS=frozenset({"查询印象", "印象帮助", "印象指令帮助"}),
-            _BOT_ADMIN_COMMANDS=frozenset({"修改印象"}),
+            _PUBLIC_COMMANDS=frozenset({"me", "help"}),
+            _BOT_ADMIN_COMMANDS=frozenset({"set"}),
             _is_bot_admin=lambda event: False,
         )
-        self.assertTrue(asyncio.run(method(plugin, _Event("10002"), "查询印象")))
-        self.assertTrue(asyncio.run(method(plugin, _Event("10002"), "印象帮助")))
+        self.assertTrue(asyncio.run(method(plugin, _Event("10002"), "me")))
+        self.assertTrue(asyncio.run(method(plugin, _Event("10002"), "help")))
 
     def test_management_commands_require_bot_admin(self):
         method = self.permission_ns["_check_command_permission"]
         non_admin = types.SimpleNamespace(
-            _PUBLIC_COMMANDS=frozenset({"查询印象"}),
-            _BOT_ADMIN_COMMANDS=frozenset({"修改印象", "清空全局印象"}),
+            _PUBLIC_COMMANDS=frozenset({"me", "help"}),
+            _BOT_ADMIN_COMMANDS=frozenset({"set", "clear-all"}),
             _is_bot_admin=lambda event: False,
         )
         bot_admin = types.SimpleNamespace(
-            _PUBLIC_COMMANDS=frozenset({"查询印象"}),
-            _BOT_ADMIN_COMMANDS=frozenset({"修改印象", "清空全局印象"}),
+            _PUBLIC_COMMANDS=frozenset({"me", "help"}),
+            _BOT_ADMIN_COMMANDS=frozenset({"set", "clear-all"}),
             _is_bot_admin=lambda event: True,
         )
-        self.assertFalse(asyncio.run(method(non_admin, _Event("10002"), "修改印象")))
-        self.assertFalse(asyncio.run(method(non_admin, _Event("10002"), "清空全局印象")))
-        self.assertTrue(asyncio.run(method(bot_admin, _Event("10001"), "修改印象")))
+        self.assertFalse(asyncio.run(method(non_admin, _Event("10002"), "set")))
+        self.assertFalse(asyncio.run(method(non_admin, _Event("10002"), "clear-all")))
+        self.assertTrue(asyncio.run(method(bot_admin, _Event("10001"), "set")))
 
     def test_explicit_special_ids_only_get_special_initial_favour(self):
         method = self.initial_ns["_get_initial_favour"]

@@ -446,15 +446,16 @@ class EmotionFavourPlugin(Star):
             logger.debug(f"[EmotionFavour] resolve_selected_persona 失败，回退 default: {e}")
             return "default"
 
-    _PUBLIC_COMMANDS = frozenset({"查询印象", "印象帮助", "印象指令帮助"})
+    _PUBLIC_COMMANDS = frozenset({"me", "help"})
     _BOT_ADMIN_COMMANDS = frozenset({
-        "查询全局印象",
-        "修改印象",
-        "修改情感",
-        "清空印象",
-        "清空全局印象",
-        "查看印象人设",
-        "清除印象人设",
+        "query",
+        "list",
+        "set",
+        "mood",
+        "clear",
+        "clear-all",
+        "persona",
+        "persona-clear",
     })
 
     def _is_bot_admin(self, event: AstrMessageEvent) -> bool:
@@ -1213,27 +1214,24 @@ class EmotionFavourPlugin(Star):
             logger.warning(f"[EmotionFavour] 人设摘要提取失败: {e}")
             return ""
 
-    # ================= 查询命令 =================
+    # ================= 指令组 =================
 
-    @filter.command("查询印象", alias={'印象', '查询好感度', '好感度'})
-    async def query_favour(self, event: AstrMessageEvent, target: str = ""):
-        """查询自己或指定用户的好感度与12维情感状态"""
-        if not await self._check_command_permission(event, "查询印象"):
-            yield event.plain_result("权限不足！你无法使用此命令。")
-            return
+    @filter.command_group("emotion")
+    def emotion_group(self):
+        """情感与印象管理指令组。"""
 
-        sender_id = event.get_sender_id()
-        target_uid = get_target_uid(event, target) or sender_id
-
-        if target_uid != sender_id and not self._is_bot_admin(event):
-            yield event.plain_result("权限不足！只有 Bot 管理员可以查看他人的印象。")
-            return
-
+    async def _query_favour_impl(
+        self,
+        event: AstrMessageEvent,
+        target_uid: str,
+    ):
+        """查询指定用户；权限由公开入口在调用前处理。"""
         persona_id = await self._get_persona_id(event)
         record = await self.db.get_favour(persona_id, target_uid)
         if record:
             fav = self._decay_favour_value(record)
         else:
+            sender_id = str(event.get_sender_id())
             fav = await self._get_initial_favour(event) if target_uid == sender_id else 0
             record = FavourRecord(persona_id=persona_id, user_id=target_uid, favour=fav)
 
@@ -1249,10 +1247,39 @@ class EmotionFavourPlugin(Star):
             logger.warning(f"{self._tag(event)} 印象查询 T2I 失败，回退纯文本: {e}")
             yield event.plain_result(f"🔍 用户：{name}\n🆔 ID：{target_uid}\n{detail}")
 
-    @filter.command("查询全局印象", alias={'全局印象', '全局好感度', '查询全局好感度'})
+    @emotion_group.command("me")
+    async def emotion_me(self, event: AstrMessageEvent):
+        """查询自己的好感度与情感状态。"""
+        async for result in self._query_favour_impl(
+            event, str(event.get_sender_id()),
+        ):
+            yield result
+
+    @filter.command("查询印象", alias={"印象", "查询好感度", "好感度"})
+    async def legacy_query_self(self, event: AstrMessageEvent):
+        """兼容旧入口：仅查询发送者本人。"""
+        async for result in self._query_favour_impl(
+            event, str(event.get_sender_id()),
+        ):
+            yield result
+
+    @emotion_group.command("query")
+    async def emotion_query(self, event: AstrMessageEvent, target: str):
+        """Bot 管理员查询指定用户。"""
+        if not await self._check_command_permission(event, "query"):
+            yield event.plain_result("权限不足！只有 Bot 管理员可以查询他人的印象。")
+            return
+        target_uid = get_target_uid(event, target)
+        if not target_uid:
+            yield event.plain_result("未找到用户，请使用 @ 或输入 ID。")
+            return
+        async for result in self._query_favour_impl(event, target_uid):
+            yield result
+
+    @emotion_group.command("list")
     async def query_global_favour(self, event: AstrMessageEvent, page: int = 1):
         """分页查看当前人格下所有用户的好感度记录"""
-        if not await self._check_command_permission(event, "查询全局印象"):
+        if not await self._check_command_permission(event, "list"):
             yield event.plain_result("权限不足！你无法使用此命令。")
             return
 
@@ -1313,10 +1340,10 @@ class EmotionFavourPlugin(Star):
 
     # ================= 修改命令 =================
 
-    @filter.command("修改印象")
+    @emotion_group.command("set")
     async def modify_favour(self, event: AstrMessageEvent, target: str, value: int):
         """修改指定用户的好感度数值"""
-        if not await self._check_command_permission(event, "修改印象"):
+        if not await self._check_command_permission(event, "set"):
             yield event.plain_result("权限不足！你无法使用此命令。")
             return
         uid = get_target_uid(event, target)
@@ -1333,10 +1360,10 @@ class EmotionFavourPlugin(Star):
             logger.error(f"{self._tag(event)} 修改印象失败: {e}")
             yield event.plain_result("修改失败，请检查日志。")
 
-    @filter.command("修改情感")
+    @emotion_group.command("mood")
     async def modify_emotion(self, event: AstrMessageEvent, target: str, dimension: str = "", value: int = 0):
         """修改指定用户的单个或全部情感维度"""
-        if not await self._check_command_permission(event, "修改情感"):
+        if not await self._check_command_permission(event, "mood"):
             yield event.plain_result("权限不足！你无法使用此命令。")
             return
         uid = get_target_uid(event, target)
@@ -1344,7 +1371,7 @@ class EmotionFavourPlugin(Star):
             yield event.plain_result("未找到用户，请使用 @ 或输入 ID。")
             return
 
-        # 如果 dimension 看起来是数字，说明用户省略了维度名：/修改情感 @user 80
+        # 如果 dimension 看起来是数字，说明用户省略了维度名：/emotion mood 10001 80
         if dimension and not value and dimension.lstrip('-').isdigit():
             value = int(dimension)
             dimension = ""
@@ -1418,10 +1445,10 @@ class EmotionFavourPlugin(Star):
 
     # ================= 清空命令 =================
 
-    @filter.command("清空印象")
+    @emotion_group.command("clear")
     async def clear_user_favour(self, event: AstrMessageEvent, target: str):
         """清空指定用户的好感度与情感数据（需二次确认，自动备份）"""
-        if not await self._check_command_permission(event, "清空印象"):
+        if not await self._check_command_permission(event, "clear"):
             yield event.plain_result("权限不足！你无法使用此命令。")
             return
         uid = get_target_uid(event, target)
@@ -1463,10 +1490,10 @@ class EmotionFavourPlugin(Star):
         finally:
             event.stop_event()
 
-    @filter.command("清空全局印象")
+    @emotion_group.command("clear-all")
     async def clear_all_favour(self, event: AstrMessageEvent):
         """清空当前人格下所有用户的好感度数据（需二次确认，自动备份）"""
-        if not await self._check_command_permission(event, "清空全局印象"):
+        if not await self._check_command_permission(event, "clear-all"):
             yield event.plain_result("权限不足！你无法使用此命令。")
             return
         persona_id = await self._get_persona_id(event)
@@ -1508,42 +1535,35 @@ class EmotionFavourPlugin(Star):
 
     # ================= 帮助命令 =================
 
-    @filter.command("印象帮助", alias={'查看印象帮助'})
+    @emotion_group.command("help")
     async def help_menu(self, event: AstrMessageEvent):
-        """显示印象插件命令菜单"""
-        msg = ["⭐ 印象插件命令菜单 ⭐"]
+        """按当前权限显示 emotion 指令帮助。"""
+        msg = [
+            "⭐ emotion 指令帮助 ⭐",
+            "",
+            "[个人查询]",
+            "- /emotion me",
+            "- 兼容入口：/查询印象、/印象、/查询好感度、/好感度",
+        ]
 
-        query_cmds = []
-        if await self._check_command_permission(event, "查询印象"):
-            query_cmds.append(
-                "- 查询印象 [@用户]" if self._is_bot_admin(event) else "- 查询印象"
-            )
-        if await self._check_command_permission(event, "查询全局印象"):
-            query_cmds.append("- 查询全局印象 [页码]")
-        if query_cmds:
-            msg.append("\n[查询命令]")
-            msg.extend(query_cmds)
-
-        modify_cmds = []
-        if await self._check_command_permission(event, "修改印象"):
-            modify_cmds.append("- 修改印象 @用户 <数值>")
-        if await self._check_command_permission(event, "修改情感"):
-            modify_cmds.append("- 修改情感 @用户 <维度> <数值>")
-        if modify_cmds:
-            msg.append("\n[修改命令]")
-            msg.extend(modify_cmds)
-
-        clear_cmds = []
-        if await self._check_command_permission(event, "清空印象"):
-            clear_cmds.append("- 清空印象 @用户")
-        if await self._check_command_permission(event, "清空全局印象"):
-            clear_cmds.append("- 清空全局印象")
-        if clear_cmds:
-            msg.append("\n[清空命令]")
-            msg.extend(clear_cmds)
-
-        if await self._check_command_permission(event, "印象指令帮助"):
-            msg.append("\n- 印象指令帮助")
+        if self._is_bot_admin(event):
+            msg.extend([
+                "",
+                "[Bot 管理员]",
+                "- /emotion query <@用户或ID>",
+                "- /emotion list [页码]",
+                "- /emotion set <@用户或ID> <好感度>",
+                "- /emotion mood <@用户或ID> [维度] <数值>",
+                "- /emotion clear <@用户或ID>",
+                "- /emotion clear-all",
+                "- /emotion persona",
+                "- /emotion persona-clear",
+                "",
+                "示例：",
+                "- /emotion query 10001",
+                "- /emotion set 10001 60",
+                "- /emotion mood 10001 喜悦 80",
+            ])
 
         md_text = "\n".join(msg)
         try:
@@ -1553,58 +1573,12 @@ class EmotionFavourPlugin(Star):
             logger.warning(f"{self._tag(event)} 帮助菜单 T2I 失败，回退纯文本: {e}")
             yield event.plain_result(md_text)
 
-    @filter.command("印象指令帮助")
-    async def help_usage(self, event: AstrMessageEvent):
-        """显示印象指令的详细用法示例"""
-        msg_parts = ["⭐ 印象指令用法示例 ⭐"]
-        section = 0
-
-        has_query = await self._check_command_permission(event, "查询印象") or await self._check_command_permission(event, "查询全局印象")
-        if has_query:
-            section += 1
-            msg_parts.append(f"\n{section}. 查询印象")
-            if await self._check_command_permission(event, "查询印象"):
-                if self._is_bot_admin(event):
-                    msg_parts += ["   用法: /查询印象 [@用户]", "   示例: /查询印象 @Wolfycz"]
-                else:
-                    msg_parts += ["   用法: /查询印象", "   说明: 查看自己的印象和情感维度。"]
-            if await self._check_command_permission(event, "查询全局印象"):
-                msg_parts += ["   用法: /查询全局印象 [页码]", "   示例: /查询全局印象 2"]
-
-        has_modify = await self._check_command_permission(event, "修改印象")
-        has_modify_emotion = await self._check_command_permission(event, "修改情感")
-        if has_modify:
-            section += 1
-            msg_parts += [f"\n{section}. 修改印象", "   用法: /修改印象 @用户 <数值>", "   示例: /修改印象 @Wolfycz 60"]
-        if has_modify_emotion:
-            section += 1
-            msg_parts += [f"\n{section}. 修改情感", "   用法: /修改情感 @用户 <维度> <数值>", "   示例: /修改情感 @Wolfycz 喜悦 80", "   说明: 维度可用中文或英文（如 喜悦/joy），数值范围 0~100。"]
-
-        clear_cmds = []
-        if await self._check_command_permission(event, "清空印象"):
-            clear_cmds.append("   用法: /清空印象 @用户")
-        if await self._check_command_permission(event, "清空全局印象"):
-            clear_cmds.append("   用法: /清空全局印象")
-        if clear_cmds:
-            section += 1
-            msg_parts.append(f"\n{section}. 清空操作")
-            msg_parts.extend(clear_cmds)
-            msg_parts.append("   说明: 清空操作需要二次确认，并会自动备份数据。")
-
-        md_text = "\n".join(msg_parts)
-        try:
-            img_path = await self._render_t2i(md_text)
-            yield event.image_result(img_path)
-        except Exception as e:
-            logger.warning(f"{self._tag(event)} 指令帮助 T2I 失败，回退纯文本: {e}")
-            yield event.plain_result(md_text)
-
     # ================= 人设摘要管理（仅管理员） =================
 
-    @filter.command("查看印象人设")
+    @emotion_group.command("persona")
     async def cmd_view_persona_summary(self, event: AstrMessageEvent):
         """查看当前人格的AI提取性格摘要"""
-        if not self._is_bot_admin(event):
+        if not await self._check_command_permission(event, "persona"):
             yield event.plain_result("权限不足！只有 Bot 管理员可以查看印象人设摘要。")
             return
         persona_id = await self._get_persona_id(event)
@@ -1614,10 +1588,10 @@ class EmotionFavourPlugin(Star):
         else:
             yield event.plain_result(f"当前无人设摘要 (persona_id={persona_id})")
 
-    @filter.command("清除印象人设")
+    @emotion_group.command("persona-clear")
     async def cmd_delete_persona_summary(self, event: AstrMessageEvent):
         """清除当前人格的AI提取性格摘要缓存"""
-        if not self._is_bot_admin(event):
+        if not await self._check_command_permission(event, "persona-clear"):
             yield event.plain_result("权限不足！只有 Bot 管理员可以清除印象人设摘要。")
             return
         persona_id = await self._get_persona_id(event)
