@@ -20,6 +20,7 @@ from astrbot.core.utils.session_waiter import session_waiter, SessionController,
 from .log import logger, configure as configure_log
 from .config import PluginSettings, validate_advance_tiers
 from .runtime import KeyedLockPool, TaskSupervisor
+from .playwright_support import install_chromium, is_missing_chromium_error
 from .storage import FavourDBManager, FavourRecord
 from .domain import (
     EMOTION_DIMENSIONS,
@@ -120,6 +121,7 @@ class EmotionFavourPlugin(Star):
         # Playwright T2I
         self._pw_instance = None
         self._pw_browser = None
+        self._chromium_install_attempted = False
         self._t2i_output_dir = self.data_dir / "t2i_output"
         self._t2i_output_dir.mkdir(parents=True, exist_ok=True)
         plugin_dir = Path(__file__).parent
@@ -141,10 +143,16 @@ class EmotionFavourPlugin(Star):
             await self.db.init_db()
             await self._ensure_local_scripts()
             try:
-                await self._ensure_browser()
+                await self._ensure_browser(auto_install=False)
                 logger.info("[EmotionFavour] Playwright 浏览器预热完成")
             except Exception as e:
-                logger.warning(f"[EmotionFavour] Playwright 浏览器预热失败，将按需重试: {e}")
+                if is_missing_chromium_error(e):
+                    logger.info(
+                        "[EmotionFavour] 未检测到 Playwright Chromium，"
+                        "将在首次 T2I 渲染时自动安装"
+                    )
+                else:
+                    logger.warning(f"[EmotionFavour] Playwright 浏览器预热失败，将按需重试: {e}")
             register_web_apis(self.context, self)
             self._state = "READY"
             logger.info("[EmotionFavour] ✅ 初始化完成，Web API 已注册")
@@ -742,20 +750,63 @@ class EmotionFavourPlugin(Star):
             except Exception as e:
                 logger.warning(f"[EmotionFavour] 异步下载脚本 {filename} 失败: {e}")
 
-    async def _ensure_browser_locked(self):
-        if self._pw_browser is None or not self._pw_browser.is_connected():
-            from playwright.async_api import async_playwright
-            if self._pw_instance is not None:
-                await self._pw_instance.stop()
-            self._pw_instance = await async_playwright().start()
+    async def _start_browser(self):
+        """启动一套新的 Playwright driver/browser，失败时回收半初始化资源。"""
+        from playwright.async_api import async_playwright
+
+        if self._pw_instance is not None:
+            await self._pw_instance.stop()
+        self._pw_instance = await async_playwright().start()
+        try:
             self._pw_browser = await self._pw_instance.chromium.launch()
+        except Exception:
+            await self._pw_instance.stop()
+            self._pw_instance = None
+            self._pw_browser = None
+            raise
         return self._pw_browser
 
-    async def _ensure_browser(self):
+    async def _ensure_browser_locked(self, *, auto_install: bool = True):
+        if self._pw_browser is None or not self._pw_browser.is_connected():
+            try:
+                await self._start_browser()
+            except Exception as launch_error:
+                if not auto_install or not is_missing_chromium_error(launch_error):
+                    raise
+                if self._chromium_install_attempted:
+                    raise RuntimeError(
+                        "Playwright Chromium 自动安装已在本次进程中尝试过，"
+                        "浏览器仍不可用；请检查网络、磁盘权限和 Playwright 安装日志，"
+                        "或在 AstrBot Python 环境手动执行 "
+                        "`python -m playwright install chromium`"
+                    ) from launch_error
+
+                self._chromium_install_attempted = True
+                logger.info(
+                    "[EmotionFavour] Playwright Chromium 未安装，"
+                    "正在使用当前 AstrBot Python 环境自动下载（首次可能耗时较长）"
+                )
+                await install_chromium()
+                logger.info("[EmotionFavour] Playwright Chromium 自动安装完成，正在启动浏览器")
+                await self._start_browser()
+        return self._pw_browser
+
+    async def _ensure_browser(self, *, auto_install: bool = True):
         async with self._browser_lock:
-            return await self._ensure_browser_locked()
+            return await self._ensure_browser_locked(auto_install=auto_install)
 
     async def _render_t2i(self, md_text: str, width: int = 800) -> str:
+        try:
+            return await self._render_custom_t2i(md_text, width=width)
+        except Exception as e:
+            logger.warning(
+                "[EmotionFavour] 自定义 Playwright T2I 失败，"
+                f"回退 AstrBot 内置 T2I: {type(e).__name__}: {e}"
+            )
+            return await self.text_to_image(md_text, return_url=False)
+
+    async def _render_custom_t2i(self, md_text: str, width: int = 800) -> str:
+        """使用插件自定义 Playwright 模板渲染；异常由上层统一回退。"""
         async with self._browser_lock:
             browser = await self._ensure_browser_locked()
             page = await browser.new_page(viewport={"width": width, "height": 600})

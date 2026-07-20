@@ -1,5 +1,20 @@
 # 更新日志
 
+## 3.4.2
+2026-07-20
+
+### Playwright Chromium 自动安装
+
+- 启动预热只快速探测 Chromium，不在 AstrBot 同步加载插件期间执行大体积下载。
+- 首次实际 T2I 渲染若确认浏览器可执行文件缺失，自动使用当前 AstrBot Python 环境执行 `python -m playwright install chromium`，成功后重试启动。
+- 单次进程只自动尝试安装一次，并为安装设置 10 分钟超时；网络、权限、系统动态库等非“浏览器未安装”错误不会误触发重复下载。
+- 自定义 Playwright T2I 仍不可用时自动回退 AstrBot 内置 T2I，不再让图片查询直接失败。
+
+### 数据库热重载兼容
+
+- 插件模块热重载时主动重建 `favour_records` / `persona_summaries` 的 SQLModel Table 映射，避免历史版本已删除字段残留在全局 metadata 后被 ORM 继续查询。
+- 不向现有数据库补回 `session_id`、`relationship` 等废弃列；当前模型与真实表结构保持一致。
+
 ## 3.4.1
 2026-07-17
 

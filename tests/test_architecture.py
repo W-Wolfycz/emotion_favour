@@ -43,6 +43,22 @@ class TestAstrBotLifecycleShape(unittest.TestCase):
         )
         self.assertTrue(any(isinstance(node, ast.Raise) for node in ast.walk(method)))
 
+    def test_custom_t2i_falls_back_to_astrbot_renderer(self):
+        method = next(
+            node for node in self.plugin.body
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_render_t2i"
+        )
+        fallback_call = next(
+            node for node in ast.walk(method)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "text_to_image"
+        )
+        return_url = next(
+            item for item in fallback_call.keywords if item.arg == "return_url"
+        )
+        self.assertIs(return_url.value.value, False)
+
     def test_chat_memory_history_is_persona_isolated(self):
         history_method = next(
             node for node in self.plugin.body

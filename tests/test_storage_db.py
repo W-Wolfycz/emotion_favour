@@ -1,4 +1,5 @@
 import asyncio
+import importlib
 import sqlite3
 import sys
 import tempfile
@@ -11,9 +12,13 @@ if str(PLUGIN_PARENT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_PARENT))
 
 try:
+    import emotion_favour.storage as storage_module
     from emotion_favour.storage import FavourDBManager
+    from sqlalchemy import Column, String
 except (ImportError, ModuleNotFoundError):
+    storage_module = None
     FavourDBManager = None
+    Column = String = None
 
 
 @unittest.skipIf(FavourDBManager is None, "当前 Python 环境未安装 AstrBot/SQLModel 运行依赖")
@@ -112,6 +117,25 @@ class TestUtcMigration(unittest.IsolatedAsyncioTestCase):
             backups = list((Path(tmp) / "backups").glob("pre_utc_migration_*.db"))
             self.assertEqual(len(backups), 1)
             await manager.close()
+
+
+@unittest.skipIf(FavourDBManager is None, "当前 Python 环境未安装 AstrBot/SQLModel 运行依赖")
+class TestSqlModelHotReload(unittest.TestCase):
+    def test_removed_legacy_columns_do_not_survive_reload(self):
+        table = storage_module.FavourRecord.__table__
+        table.append_column(Column("session_id", String(), nullable=True))
+        self.assertIn("session_id", table.columns)
+
+        reloaded = importlib.reload(storage_module)
+        self.assertNotIn("session_id", reloaded.FavourRecord.__table__.columns)
+        self.assertEqual(
+            list(reloaded.FavourRecord.__table__.columns.keys()),
+            [
+                "id", "persona_id", "user_id", "favour", "created_at", "updated_at",
+                "joy", "trust", "fear", "surprise", "sadness", "disgust", "anger",
+                "anticipation", "pride", "guilt", "shame", "envy",
+            ],
+        )
 
 
 if __name__ == "__main__":

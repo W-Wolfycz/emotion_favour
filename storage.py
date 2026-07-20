@@ -66,11 +66,21 @@ def _is_valid_userid(userid: str) -> bool:
     return all(c in allowed_chars for c in userid)
 
 
+def _reset_plugin_table_metadata(*table_names: str) -> None:
+    """热重载前移除旧 Table 映射，避免已删除字段残留在 SQLModel metadata。"""
+    for table_name in table_names:
+        existing = SQLModel.metadata.tables.get(table_name)
+        if existing is not None:
+            SQLModel.metadata.remove(existing)
+
+
+_reset_plugin_table_metadata("favour_records", "persona_summaries")
+
+
 class FavourRecord(SQLModel, table=True):
     __tablename__ = "favour_records"
     __table_args__ = (
         UniqueConstraint("persona_id", "user_id", name="uq_persona_user"),
-        {"extend_existing": True},
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -97,9 +107,6 @@ class FavourRecord(SQLModel, table=True):
 
 class PersonaSummaryRecord(SQLModel, table=True):
     __tablename__ = "persona_summaries"
-    __table_args__ = (
-        {"extend_existing": True},
-    )
 
     id: Optional[int] = Field(default=None, primary_key=True)
     persona_id: str = Field(default="", unique=True, index=True)

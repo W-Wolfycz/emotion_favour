@@ -178,7 +178,7 @@ emotion_favour/
 - AstrBot ≥ 4.16（已在 4.26.3 验证）
 - sqlmodel, aiosqlite, aiofiles
 - PyYAML（Web API 元数据读取）
-- playwright（自定义 T2I 渲染；Python 包之外还需在 AstrBot Python 环境执行 `python -m playwright install chromium`）
+- playwright（自定义 T2I 渲染；插件首次需要 T2I 且检测到 Chromium 缺失时，会使用当前 AstrBot Python 环境自动执行 `python -m playwright install chromium`；包缺失、下载失败或浏览器启动失败时自动回退 AstrBot 内置 T2I）
 
 ## 3.4.0 架构说明
 
