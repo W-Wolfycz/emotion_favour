@@ -186,6 +186,9 @@ def register_web_apis(context, plugin) -> None:
                 user_id_search=user_id_search,
             )
             items = [_record_to_dict(plugin, r, persona_id) for r in records]
+            # 批量读取昵称缓存
+            uids = [r.user_id for r in records]
+            nicknames = plugin.db.get_cached_nicknames(uids) if hasattr(plugin.db, 'get_cached_nicknames') else {}
             return _ok(
                 persona_id=persona_id,
                 records=items,
@@ -201,6 +204,7 @@ def register_web_apis(context, plugin) -> None:
                 relationship_mode=plugin.relationship_mode,
                 emotion_dimensions=list(EMOTION_DIMENSIONS),
                 emotion_display_names=dict(EMOTION_DISPLAY_NAMES),
+                nicknames=nicknames,
                 emotion_groups=dict(EMOTION_GROUPS),
             )
         except Exception as e:
