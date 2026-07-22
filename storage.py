@@ -339,7 +339,40 @@ class FavourDBManager:
                 logger.error(f"数据库初始化失败: {e}")
                 raise
 
+    # ============ 昵称缓存 ============
+
+    def _nickname_cache_path(self) -> Path:
+        return self.data_dir / "nicknames.json"
+
+    def _read_nickname_cache(self) -> dict:
+        try:
+            if self._nickname_cache_path().exists():
+                return json.loads(self._nickname_cache_path().read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        return {}
+
+    def get_cached_nicknames(self, user_ids: list[str]) -> dict[str, str]:
+        """批量读取昵称缓存，返回 {user_id: nickname}。"""
+        cache = self._read_nickname_cache()
+        return {uid: cache.get(uid, "") for uid in user_ids if cache.get(uid)}
+
+    def cache_nickname(self, user_id: str, nickname: str) -> None:
+        """保存单个用户昵称到缓存。"""
+        if not user_id or not nickname or nickname == user_id:
+            return
+        cache = self._read_nickname_cache()
+        cache[user_id] = nickname
+        try:
+            self._nickname_cache_path().write_text(
+                json.dumps(cache, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
     async def close(self) -> None:
+
         await self.engine.dispose()
         self._initialized = False
 

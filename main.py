@@ -1287,6 +1287,8 @@ class EmotionFavourPlugin(Star):
             record = FavourRecord(persona_id=persona_id, user_id=target_uid, favour=fav)
 
         name = await get_user_display_name(event, target_uid)
+        if name and name != target_uid:
+            self.db.cache_nickname(target_uid, name)
         relationship = self._get_relationship(fav, target_uid)
         detail = format_emotion_detail(record, relationship, effective_favour=fav)
 
@@ -1372,11 +1374,11 @@ class EmotionFavourPlugin(Star):
             *(get_user_display_name(event, uid) for uid in uids),
             return_exceptions=True,
         )
-        name_map = {
-            uid: name
-            for uid, name in zip(uids, resolved_names)
-            if isinstance(name, str) and name and name != uid
-        }
+        name_map = {}
+        for uid, name in zip(uids, resolved_names):
+            if isinstance(name, str) and name and name != uid:
+                name_map[uid] = name
+                self.db.cache_nickname(uid, name)
         headers = ["| 用户 | ID | 好感值 | 关系 | 主导情感 |", "| :--- | :--- | :---: | :---: | :--- |"]
         rows = []
         for r in page_records:
