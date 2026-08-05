@@ -59,6 +59,7 @@ class PluginSettings:
     emotion_decay_min_hours: float
     favour_decay_enabled: bool
     favour_decay_anchor: int
+    backup_retention_days: int
 
     settlement_max_concurrency: int
     settlement_timeout_seconds: float
@@ -171,6 +172,9 @@ class PluginSettings:
             favour_decay_enabled=bool(adv.get("favour_decay_enabled", True)),
             favour_decay_anchor=_clamp(
                 _as_int(adv.get("favour_decay_anchor"), 50), min_favour, max_favour,
+            ),
+            backup_retention_days=max(
+                0, _as_int(adv.get("backup_retention_days"), 0),
             ),
             settlement_max_concurrency=_clamp(_as_int(adv.get("settlement_max_concurrency"), 3), 1, 32),
             settlement_timeout_seconds=_clamp(_as_float(adv.get("settlement_timeout_seconds"), 60.0), 5.0, 300.0),

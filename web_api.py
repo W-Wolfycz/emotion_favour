@@ -4,10 +4,14 @@
 
 端点清单：
 - GET  /emotion_favour/about                        版本号
-- GET  /emotion_favour/personas                     DB 中存在记录的所有 persona_id
-- GET  /emotion_favour/records?persona_id=          该 persona 下所有用户记录
+- GET  /emotion_favour/personas                     可用、已存储或可恢复的 persona_id
+- GET  /emotion_favour/records?persona_id=          指定 persona 的分页记录
 - GET  /emotion_favour/relationship?favour=&user_id= 实时计算关系名（前端编辑即时反馈）
 - POST /emotion_favour/records/save                 单行保存（绝对值写入，不走 diminish_delta）
+- GET  /emotion_favour/backups?persona_id=          当前人格可恢复备份
+- POST /emotion_favour/backups/create               创建当前人格手动备份
+- POST /emotion_favour/backups/restore              合并恢复当前人格备份
+- POST /emotion_favour/backups/delete               删除当前人格备份文件
 
 统一响应信封：``{success: bool, ...data | error: str}``
 鉴权继承 AstrBot 主 webui 登录态。
@@ -21,7 +25,7 @@ from quart import jsonify, request
 
 from astrbot.api import logger
 
-from .domain import EMOTION_DIMENSIONS, EMOTION_DISPLAY_NAMES, EMOTION_GROUPS
+from .domain import EMOTION_DIMENSIONS, EMOTION_DISPLAY_NAMES, EMOTION_GROUPS, utc_now
 from .storage import _is_valid_userid
 
 
@@ -66,14 +70,20 @@ def _internal_error(e: Exception):
 
 # ==================== 序列化辅助 ====================
 
-def _record_to_dict(plugin, record, persona_id: str | None = None) -> dict:
+def _record_to_dict(
+    plugin,
+    record,
+    persona_id: str | None = None,
+    *,
+    now=None,
+) -> dict:
     """把 FavourRecord 序列化为前端 dict。
 
     返回的 favour 是 decayed（transient）值——展示与编辑基准都用它，
     避免管理员看到「存储 60 但实际生效 55」的混淆。
     stored_favour 仅作只读信息附带。
     """
-    decayed = plugin._decay_favour_value(record)
+    decayed = plugin._decay_favour_value(record, now=now)
     emotions = {dim: int(getattr(record, dim, 0)) for dim in EMOTION_DIMENSIONS}
     is_special = plugin._is_special_override(record.user_id)
     created_at = plugin.db.to_local_datetime(record.created_at)
@@ -110,6 +120,14 @@ def register_web_apis(context, plugin) -> None:
             return None
         return _err(f"插件当前状态为 {plugin._state}，存储尚不可用", 503)
 
+    def _persona_id_from(value) -> tuple[str, object | None]:
+        persona_id = str(value or "").strip()
+        if not persona_id:
+            return "", _err("persona_id 不能为空", 400)
+        if len(persona_id) > 64:
+            return "", _err("persona_id 过长", 400)
+        return persona_id, None
+
     # ==================== 端点：about ====================
 
     async def get_about():
@@ -132,6 +150,7 @@ def register_web_apis(context, plugin) -> None:
             if unavailable:
                 return unavailable
             personas = set(await plugin.db.get_distinct_personas())
+            personas.update(await plugin.db.get_backup_personas())
             personas.add("default")
             try:
                 for item in getattr(plugin.persona_mgr, "personas_v3", []) or []:
@@ -177,15 +196,32 @@ def register_web_apis(context, plugin) -> None:
             )
             total_pages = max(1, (total + page_size - 1) // page_size)
             page = min(page, total_pages)
-            records = await plugin.db.list_records(
-                persona_id,
-                offset=(page - 1) * page_size,
-                limit=page_size,
-                sort_by=sort_by,
-                sort_order=sort_order,
-                user_id_search=user_id_search,
-            )
-            items = [_record_to_dict(plugin, r, persona_id) for r in records]
+            now = utc_now()
+            if sort_by == "favour":
+                records = await plugin.db.get_records_for_effective_sort(
+                    persona_id,
+                    user_id_search=user_id_search,
+                )
+                records.sort(key=lambda record: record.id or 0)
+                records.sort(
+                    key=lambda record: plugin._decay_favour_value(record, now=now),
+                    reverse=sort_order == "desc",
+                )
+                start = (page - 1) * page_size
+                records = records[start:start + page_size]
+            else:
+                records = await plugin.db.list_records(
+                    persona_id,
+                    offset=(page - 1) * page_size,
+                    limit=page_size,
+                    sort_by=sort_by,
+                    sort_order=sort_order,
+                    user_id_search=user_id_search,
+                )
+            items = [
+                _record_to_dict(plugin, record, persona_id, now=now)
+                for record in records
+            ]
             return _ok(
                 persona_id=persona_id,
                 records=items,
@@ -305,6 +341,99 @@ def register_web_apis(context, plugin) -> None:
 
             record = await plugin.db.get_favour(persona_id, user_id)
             return _ok(record=_record_to_dict(plugin, record, persona_id) if record else None)
+        except RuntimeError as e:
+            return _err(str(e), 409)
+        except Exception as e:
+            return _internal_error(e)
+
+    # ==================== 端点：backups ====================
+
+    async def get_backups():
+        try:
+            unavailable = _not_ready()
+            if unavailable:
+                return unavailable
+            persona_id, error = _persona_id_from(request.args.get("persona_id"))
+            if error:
+                return error
+            backups = await plugin.db.list_backups(persona_id)
+            record_count = await plugin.db.count_records(persona_id)
+            return _ok(
+                persona_id=persona_id,
+                record_count=record_count,
+                backups=backups,
+            )
+        except Exception as e:
+            return _internal_error(e)
+
+    async def create_backup():
+        try:
+            unavailable = _not_ready()
+            if unavailable:
+                return unavailable
+            data = await request.get_json() or {}
+            persona_id, error = _persona_id_from(data.get("persona_id"))
+            if error:
+                return error
+            filename, record_count = await plugin.create_persona_backup(persona_id)
+            return _ok(
+                persona_id=persona_id,
+                filename=filename,
+                record_count=record_count,
+            )
+        except ValueError as e:
+            return _err(str(e), 400)
+        except RuntimeError as e:
+            return _err(str(e), 409)
+        except Exception as e:
+            return _internal_error(e)
+
+    async def restore_backup():
+        try:
+            unavailable = _not_ready()
+            if unavailable:
+                return unavailable
+            data = await request.get_json() or {}
+            persona_id, error = _persona_id_from(data.get("persona_id"))
+            if error:
+                return error
+            filename = str(data.get("filename", "")).strip()
+            if not filename:
+                return _err("filename 不能为空", 400)
+            restored_count, pre_restore_backup = await plugin.restore_persona_backup(
+                persona_id, filename
+            )
+            return _ok(
+                persona_id=persona_id,
+                filename=filename,
+                restored_count=restored_count,
+                pre_restore_backup=pre_restore_backup,
+            )
+        except ValueError as e:
+            return _err(str(e), 400)
+        except RuntimeError as e:
+            return _err(str(e), 409)
+        except Exception as e:
+            return _internal_error(e)
+
+    async def delete_backup():
+        try:
+            unavailable = _not_ready()
+            if unavailable:
+                return unavailable
+            data = await request.get_json() or {}
+            persona_id, error = _persona_id_from(data.get("persona_id"))
+            if error:
+                return error
+            filename = str(data.get("filename", "")).strip()
+            if not filename:
+                return _err("filename 不能为空", 400)
+            await plugin.delete_persona_backup(persona_id, filename)
+            return _ok(persona_id=persona_id, filename=filename)
+        except ValueError as e:
+            return _err(str(e), 400)
+        except RuntimeError as e:
+            return _err(str(e), 409)
         except Exception as e:
             return _internal_error(e)
 
@@ -317,7 +446,7 @@ def register_web_apis(context, plugin) -> None:
         f"/{PLUGIN_NAME}/personas", get_personas, ["GET"], "获取所有 persona_id 列表"
     )
     context.register_web_api(
-        f"/{PLUGIN_NAME}/records", get_records, ["GET"], "获取指定 persona 的所有用户记录"
+        f"/{PLUGIN_NAME}/records", get_records, ["GET"], "分页获取指定 persona 的用户记录"
     )
     context.register_web_api(
         f"/{PLUGIN_NAME}/relationship", get_relationship, ["GET"], "实时计算好感度对应的关系名"
@@ -325,5 +454,17 @@ def register_web_apis(context, plugin) -> None:
     context.register_web_api(
         f"/{PLUGIN_NAME}/records/save", save_record, ["POST"], "保存单行用户记录变更"
     )
+    context.register_web_api(
+        f"/{PLUGIN_NAME}/backups", get_backups, ["GET"], "获取当前人格数据备份"
+    )
+    context.register_web_api(
+        f"/{PLUGIN_NAME}/backups/create", create_backup, ["POST"], "创建当前人格数据备份"
+    )
+    context.register_web_api(
+        f"/{PLUGIN_NAME}/backups/restore", restore_backup, ["POST"], "恢复当前人格数据备份"
+    )
+    context.register_web_api(
+        f"/{PLUGIN_NAME}/backups/delete", delete_backup, ["POST"], "删除当前人格数据备份"
+    )
 
-    logger.info(f"[{PLUGIN_NAME}] ✅ Web API 已注册（共 5 个端点）")
+    logger.info(f"[{PLUGIN_NAME}] ✅ Web API 已注册（共 9 个端点）")

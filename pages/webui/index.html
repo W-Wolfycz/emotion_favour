@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>emotion_favour · 印象管理台</title>
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="style.css?v=3.4.3-r6">
   <script>
     // 防止浅色主题闪烁（FOUC）：AstrBot 主 webui 注入 localStorage 主题
     (function () {
@@ -28,9 +28,21 @@
       <div class="topbar-actions">
         <div class="persona-switcher" id="persona-switcher" hidden>
           <label for="persona-select">人格</label>
-          <input id="persona-select" type="search" list="persona-options" placeholder="搜索人格" autocomplete="off">
-          <datalist id="persona-options"></datalist>
+          <div class="persona-combobox">
+            <input id="persona-select" type="search" placeholder="搜索人格" autocomplete="off"
+                   role="combobox" aria-autocomplete="list" aria-controls="persona-menu" aria-expanded="false">
+            <div id="persona-menu" class="persona-menu" role="listbox" hidden></div>
+          </div>
         </div>
+        <button class="btn btn-ghost btn-sm" id="backup-btn" title="备份与恢复">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <ellipse cx="12" cy="5" rx="7" ry="3"/>
+            <path d="M5 5v6c0 1.7 3.1 3 7 3 1.1 0 2.2-.1 3.1-.3"/>
+            <path d="M5 11v6c0 1.7 3.1 3 7 3"/>
+            <path d="M19 5v5"/>
+            <path d="m16 19 2 2 4-4"/>
+          </svg>
+        </button>
         <button class="btn btn-ghost btn-sm" id="create-btn" title="新增好感记录">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
             <line x1="12" y1="5" x2="12" y2="19"/>
@@ -149,8 +161,11 @@
       </div>
       <div class="form-row">
         <label for="create-persona">人格</label>
-        <input id="create-persona" type="search" list="create-persona-options" placeholder="搜索人格" autocomplete="off">
-        <datalist id="create-persona-options"></datalist>
+        <div class="persona-combobox">
+          <input id="create-persona" type="search" placeholder="搜索人格" autocomplete="off"
+                 role="combobox" aria-autocomplete="list" aria-controls="create-persona-menu" aria-expanded="false">
+          <div id="create-persona-menu" class="persona-menu" role="listbox" hidden></div>
+        </div>
       </div>
       <div class="form-row">
         <label for="create-favour">好感度</label>
@@ -171,6 +186,48 @@
     </div>
   </dialog>
 
-  <script src="app.js"></script>
+  <!-- ===== 备份与恢复 Dialog ===== -->
+  <dialog id="backup-dialog" class="dialog backup-dialog">
+    <div class="dialog-header">
+      <div class="dialog-title">备份与恢复 · <span id="backup-persona">—</span></div>
+      <button class="dialog-close" id="backup-close" type="button" aria-label="关闭">×</button>
+    </div>
+    <div class="dialog-body">
+      <div class="backup-toolbar">
+        <span id="backup-summary">—</span>
+        <button class="btn btn-success btn-sm" id="backup-create" type="button">创建备份</button>
+      </div>
+      <div id="backup-result" class="backup-result" hidden></div>
+      <div id="backup-list" class="backup-list">
+        <div class="loading-wrap"><span class="spinner"></span> 加载中...</div>
+      </div>
+    </div>
+    <div class="dialog-footer">
+      <span class="backup-footnote">恢复会覆盖备份中的同名用户，其他记录保持不变。</span>
+      <div class="action-buttons">
+        <button class="btn btn-secondary btn-sm" id="backup-done" type="button">关闭</button>
+      </div>
+    </div>
+  </dialog>
+
+  <!-- ===== 页面内确认 Dialog（iframe sandbox 不允许原生 confirm） ===== -->
+  <dialog id="confirm-dialog" class="dialog confirm-dialog">
+    <div class="dialog-header">
+      <div class="dialog-title" id="confirm-title">确认操作</div>
+    </div>
+    <div class="dialog-body">
+      <div id="confirm-message" class="confirm-message"></div>
+    </div>
+    <div class="dialog-footer">
+      <span></span>
+      <div class="action-buttons">
+        <button class="btn btn-secondary btn-sm" id="confirm-cancel" type="button">取消</button>
+        <button class="btn btn-success btn-sm" id="confirm-submit" type="button">确认</button>
+      </div>
+    </div>
+  </dialog>
+
+  <script src="persona_logic.js?v=3.4.3-r6"></script>
+  <script src="app.js?v=3.4.3-r6"></script>
 </body>
 </html>

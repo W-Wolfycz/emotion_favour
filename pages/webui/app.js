@@ -1,5 +1,5 @@
 /**
- * emotion_favour WebUI · 印象管理台 v2
+ * emotion_favour WebUI · 印象管理台 v3
  *
  * 列表展示精要信息 + 单行编辑按钮；
  * 点击编辑弹原生 <dialog>，内部完整呈现 favour + 12 维滑块；
@@ -24,6 +24,12 @@ const GROUP_LABELS = {
 
 // user_id 白名单（与后端 _is_valid_userid 同步）
 const USERID_RE = /^[a-zA-Z0-9_\-:@.]{1,64}$/;
+const PERSONA_STORAGE_KEY = 'emotion_favour:selected_persona';
+const {
+  chooseInitialPersona,
+  filterPersonaOptions,
+  nextPersonaIndex,
+} = window.EmotionFavourPersonaLogic;
 
 // 维度 → 所属 group（供 chip 染色用，与后端 EMOTION_GROUPS 同步）
 const DIM_TO_GROUP = {
@@ -50,6 +56,9 @@ const state = {
 // dialog 运行时上下文（打开时填，关闭时清）
 let editCtx = null;       // { userId, snapshot, refs }
 let createCtx = null;     // { refs }
+let confirmResolver = null;
+let topPersonaCombobox = null;
+let createPersonaCombobox = null;
 
 // ==================== [2] API client ====================
 
@@ -77,6 +86,12 @@ const api = {
   getRelationship: (persona_id, user_id, favour) =>
     apiGet('relationship', { persona_id, user_id, favour }),
   saveRecord: (payload) => apiPost('records/save', payload),
+  getBackups: (persona_id) => apiGet('backups', { persona_id }),
+  createBackup: (persona_id) => apiPost('backups/create', { persona_id }),
+  restoreBackup: (persona_id, filename) =>
+    apiPost('backups/restore', { persona_id, filename }),
+  deleteBackup: (persona_id, filename) =>
+    apiPost('backups/delete', { persona_id, filename }),
 };
 
 /** 等待核心自动注入的 bridge-sdk 就绪。 */
@@ -102,14 +117,193 @@ function debounce(fn, ms) {
   };
 }
 
+function readStoredPersona() {
+  try {
+    return (localStorage.getItem(PERSONA_STORAGE_KEY) || '').trim();
+  } catch (e) {
+    return '';
+  }
+}
+
+function storeSelectedPersona(personaId) {
+  try {
+    localStorage.setItem(PERSONA_STORAGE_KEY, personaId);
+  } catch (e) {}
+}
+
+function createSearchCombobox(inputId, menuId, onSelect, getFallbackValue) {
+  const input = document.getElementById(inputId);
+  const menu = document.getElementById(menuId);
+  let options = [];
+  let visibleOptions = [];
+  let activeIndex = -1;
+  let blurTimer = null;
+  let selectedValue = '';
+
+  function closeMenu() {
+    menu.hidden = true;
+    input.setAttribute('aria-expanded', 'false');
+    activeIndex = -1;
+  }
+
+  function renderMenu(query = '') {
+    visibleOptions = filterPersonaOptions(options, query);
+    activeIndex = -1;
+    menu.replaceChildren();
+
+    if (visibleOptions.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'persona-menu-empty';
+      empty.textContent = '没有匹配的人格';
+      menu.appendChild(empty);
+    } else {
+      visibleOptions.forEach((option, index) => {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'persona-option';
+        button.setAttribute('role', 'option');
+        button.textContent = option;
+        button.addEventListener('mousedown', event => event.preventDefault());
+        button.addEventListener('click', () => selectValue(option));
+        menu.appendChild(button);
+      });
+    }
+    menu.hidden = false;
+    input.setAttribute('aria-expanded', 'true');
+  }
+
+  function updateActiveOption(nextIndex) {
+    if (visibleOptions.length === 0) return;
+    activeIndex = nextIndex;
+    menu.querySelectorAll('.persona-option').forEach((button, index) => {
+      const active = index === activeIndex;
+      button.classList.toggle('active', active);
+      button.setAttribute('aria-selected', String(active));
+      if (active) button.scrollIntoView({ block: 'nearest' });
+    });
+  }
+
+  function selectValue(value) {
+    selectedValue = value;
+    input.value = value;
+    closeMenu();
+    onSelect(value);
+  }
+
+  function commitInputValue(showErrorMessage = false) {
+    const value = input.value.trim();
+    if (options.includes(value)) {
+      if (value !== selectedValue) {
+        selectedValue = value;
+        onSelect(value);
+      }
+      return true;
+    }
+    input.value = selectedValue || getFallbackValue() || '';
+    if (showErrorMessage && value) showToast('请选择现有的人格', 'error');
+    return false;
+  }
+
+  function openMenu() {
+    if (blurTimer) {
+      clearTimeout(blurTimer);
+      blurTimer = null;
+    }
+    renderMenu(input.value.trim() === selectedValue ? '' : input.value);
+  }
+
+  input.addEventListener('focus', openMenu);
+  input.addEventListener('click', openMenu);
+  input.addEventListener('input', () => renderMenu(input.value));
+  input.addEventListener('blur', () => {
+    blurTimer = setTimeout(() => {
+      closeMenu();
+      commitInputValue(false);
+    }, 100);
+  });
+  input.addEventListener('keydown', event => {
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      if (menu.hidden) openMenu();
+      updateActiveOption(nextPersonaIndex(
+        activeIndex,
+        event.key === 'ArrowDown' ? 1 : -1,
+        visibleOptions.length,
+      ));
+      return;
+    }
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      if (!menu.hidden && activeIndex >= 0) {
+        selectValue(visibleOptions[activeIndex]);
+        return;
+      }
+      const exact = options.find(option => option === input.value.trim());
+      if (exact) selectValue(exact);
+      else commitInputValue(true);
+      return;
+    }
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      closeMenu();
+      input.value = selectedValue || getFallbackValue() || '';
+    }
+  });
+
+  return {
+    setOptions(nextOptions) {
+      options = [...nextOptions];
+      closeMenu();
+    },
+    setValue(value) {
+      selectedValue = value || '';
+      input.value = selectedValue;
+      closeMenu();
+    },
+    close() {
+      if (blurTimer) clearTimeout(blurTimer);
+      closeMenu();
+    },
+  };
+}
+
+function setupPersonaComboboxes() {
+  topPersonaCombobox = createSearchCombobox(
+    'persona-select',
+    'persona-menu',
+    async personaId => {
+      if (personaId === state.currentPersona) return;
+      state.currentPersona = personaId;
+      state.page = 1;
+      storeSelectedPersona(personaId);
+      await loadRecords();
+    },
+    () => state.currentPersona,
+  );
+  createPersonaCombobox = createSearchCombobox(
+    'create-persona',
+    'create-persona-menu',
+    () => {
+      if (!createCtx?.updateRelationship) return;
+      const favour = parseInt(document.getElementById('create-favour').value, 10);
+      if (!Number.isNaN(favour)) createCtx.updateRelationship(favour);
+    },
+    () => state.currentPersona,
+  );
+}
+
 let toastTimer = null;
+let toastHideTimer = null;
 function showToast(msg, type = 'info') {
   const el = document.getElementById('toast');
+  if (toastTimer) clearTimeout(toastTimer);
+  if (toastHideTimer) clearTimeout(toastHideTimer);
+  el.hidden = false;
   el.textContent = msg;
   el.className = 'toast show ' + (type === 'error' ? 'error' : type === 'success' ? 'success' : '');
-  if (toastTimer) clearTimeout(toastTimer);
   toastTimer = setTimeout(() => {
     el.className = 'toast';
+    toastHideTimer = setTimeout(() => { el.hidden = true; }, 250);
   }, 2400);
 }
 
@@ -128,6 +322,55 @@ function rangeText(range) {
   return range && range.length === 2 ? `[${range[0]}, ${range[1]}]` : '';
 }
 
+function formatBytes(value) {
+  const bytes = Number(value) || 0;
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function setBackupResult(message = '', type = 'info') {
+  const result = document.getElementById('backup-result');
+  result.textContent = message;
+  result.className = `backup-result ${type}`;
+  result.hidden = !message;
+}
+
+function resolveConfirmation(value) {
+  const resolver = confirmResolver;
+  confirmResolver = null;
+  const dialog = document.getElementById('confirm-dialog');
+  if (dialog.open) dialog.close();
+  if (resolver) resolver(Boolean(value));
+}
+
+function requestConfirmation({
+  title = '确认操作',
+  message = '',
+  confirmText = '确认',
+  danger = false,
+}) {
+  if (confirmResolver) resolveConfirmation(false);
+
+  const dialog = document.getElementById('confirm-dialog');
+  const submit = document.getElementById('confirm-submit');
+  document.getElementById('confirm-title').textContent = title;
+  document.getElementById('confirm-message').textContent = message;
+  submit.textContent = confirmText;
+  submit.className = `btn ${danger ? 'btn-danger' : 'btn-success'} btn-sm`;
+
+  return new Promise(resolve => {
+    confirmResolver = resolve;
+    try {
+      dialog.showModal();
+    } catch (e) {
+      confirmResolver = null;
+      resolve(false);
+      showToast('无法打开确认窗口：' + (e?.message || e), 'error');
+    }
+  });
+}
+
 // ==================== [4] 列表渲染 ====================
 
 async function init() {
@@ -137,6 +380,7 @@ async function init() {
     if (about.success) {
       document.getElementById('version-tag').textContent = about.version || '';
     }
+    setupPersonaComboboxes();
     await loadPersonas();
     setupEventListeners();
     setupDialogs();
@@ -153,8 +397,6 @@ async function loadPersonas() {
   }
   state.personas = resp.personas || [];
   const switcher = document.getElementById('persona-switcher');
-  const input = document.getElementById('persona-select');
-  const options = document.getElementById('persona-options');
 
   if (state.personas.length === 0) {
     switcher.hidden = true;
@@ -162,16 +404,20 @@ async function loadPersonas() {
     return;
   }
 
-  // currentPersona 不在 personas 列表里（首次进入 / 切换后失效）→ 重置到第一个
+  // 首选当前已选人格，其次记住上次选择；首次进入稳定落在 default。
   if (!state.currentPersona || !state.personas.includes(state.currentPersona)) {
-    state.currentPersona = state.personas[0];
+    state.currentPersona = chooseInitialPersona(
+      state.personas,
+      state.currentPersona,
+      readStoredPersona(),
+    );
     state.page = 1;
   }
 
-  options.innerHTML = state.personas.map(p =>
-    `<option value="${escapeHtml(p)}"></option>`
-  ).join('');
-  input.value = state.currentPersona;
+  storeSelectedPersona(state.currentPersona);
+  topPersonaCombobox.setOptions(state.personas);
+  topPersonaCombobox.setValue(state.currentPersona);
+  createPersonaCombobox.setOptions(state.personas);
   switcher.hidden = state.personas.length <= 1;
 
   await loadRecords();
@@ -473,9 +719,15 @@ function openEditDialog(userId) {
   dialog.showModal();
 }
 
-function closeEditDialog(force = false) {
-  if (!force && isEditDirty() && !window.confirm('存在未保存的修改，确定放弃吗？')) {
-    return false;
+async function closeEditDialog(force = false) {
+  if (!force && isEditDirty()) {
+    const confirmed = await requestConfirmation({
+      title: '放弃未保存的修改？',
+      message: '当前编辑内容尚未保存，关闭后这些修改将丢失。',
+      confirmText: '放弃修改',
+      danger: true,
+    });
+    if (!confirmed) return false;
   }
   const dialog = document.getElementById('edit-dialog');
   if (dialog.open) dialog.close();
@@ -549,12 +801,8 @@ async function onEditConfirm() {
 function openCreateDialog() {
   const dialog = document.getElementById('create-dialog');
   const personaInput = document.getElementById('create-persona');
-  const personaOptions = document.getElementById('create-persona-options');
-
-  personaOptions.innerHTML = state.personas.map(p =>
-    `<option value="${escapeHtml(p)}"></option>`
-  ).join('');
-  personaInput.value = state.currentPersona;
+  createPersonaCombobox.setOptions(state.personas);
+  createPersonaCombobox.setValue(state.currentPersona);
 
   document.getElementById('create-user-id').value = '';
   const favourInput = document.getElementById('create-favour');
@@ -596,12 +844,13 @@ function openCreateDialog() {
   // 初始 favour=0 的关系名也拉一下
   updateRelationship(0);
 
-  createCtx = {};
+  createCtx = { updateRelationship };
   dialog.showModal();
 }
 
 function closeCreateDialog() {
   const dialog = document.getElementById('create-dialog');
+  createPersonaCombobox.close();
   if (dialog.open) dialog.close();
   createCtx = null;
 }
@@ -667,22 +916,206 @@ async function onCreateSubmit() {
   }
 }
 
-// ==================== [7] 顶栏 + Dialog 全局事件 ====================
+// ==================== [7] 备份与恢复 ====================
 
-function setupEventListeners() {
-  // persona 切换
-  document.getElementById('persona-select').addEventListener('change', async (e) => {
-    const personaId = e.target.value.trim();
-    if (!state.personas.includes(personaId)) {
-      e.target.value = state.currentPersona;
-      showToast('请选择现有的人格', 'error');
+async function openBackupDialog() {
+  if (!state.currentPersona) {
+    showToast('当前没有可用人格', 'error');
+    return;
+  }
+  document.getElementById('backup-persona').textContent = state.currentPersona;
+  document.getElementById('backup-summary').textContent = '正在读取当前人格数据...';
+  document.getElementById('backup-create').disabled = true;
+  setBackupResult('正在加载备份记录...');
+  const dialog = document.getElementById('backup-dialog');
+  if (!dialog.open) dialog.showModal();
+  await loadBackups();
+}
+
+function closeBackupDialog() {
+  const dialog = document.getElementById('backup-dialog');
+  if (dialog.open) dialog.close();
+}
+
+async function loadBackups() {
+  const list = document.getElementById('backup-list');
+  list.innerHTML = '<div class="loading-wrap"><span class="spinner"></span> 加载中...</div>';
+  try {
+    const resp = await api.getBackups(state.currentPersona);
+    if (!resp.success) {
+      list.innerHTML = `<div class="backup-empty">${escapeHtml(resp.error || '加载备份失败')}</div>`;
       return;
     }
-    state.currentPersona = personaId;
-    state.page = 1;
-    await loadRecords();
-  });
+    const recordCount = Number(resp.record_count) || 0;
+    document.getElementById('backup-summary').textContent = `当前人格共 ${recordCount} 条印象记录`;
+    document.getElementById('backup-create').disabled = recordCount === 0;
+    renderBackups(resp.backups || []);
+    if (document.getElementById('backup-result').textContent === '正在加载备份记录...') {
+      setBackupResult();
+    }
+  } catch (e) {
+    const message = e?.message || String(e);
+    list.innerHTML = `<div class="backup-empty">${escapeHtml(message)}</div>`;
+    setBackupResult('加载失败：' + message, 'error');
+  }
+}
 
+function renderBackups(backups) {
+  const list = document.getElementById('backup-list');
+  if (backups.length === 0) {
+    list.innerHTML = '<div class="backup-empty">当前人格暂无可恢复备份</div>';
+    return;
+  }
+  list.innerHTML = '';
+  backups.forEach(item => {
+    let previewHtml = '';
+    if (item.preview) {
+      const emotions = item.preview.emotions || {};
+      const displayNames = state.meta?.emotion_display_names || {};
+      const emotionText = Object.keys(DIM_TO_GROUP).map(dim =>
+        `${escapeHtml(displayNames[dim] || dim)} ${Number(emotions[dim]) || 0}`
+      ).join(' · ');
+      previewHtml = `
+        <div class="backup-preview">
+          <span>用户 <code>${escapeHtml(item.preview.user_id || '—')}</code></span>
+          <span>好感度 <strong>${Number(item.preview.favour) || 0}</strong></span>
+          <div>${emotionText}</div>
+        </div>
+      `;
+    }
+    const row = document.createElement('div');
+    row.className = 'backup-row';
+    row.innerHTML = `
+      <div class="backup-info">
+        <strong>${escapeHtml(item.kind || '数据备份')}</strong>
+        <span>${escapeHtml(item.created_at || '—')} · ${item.record_count || 0} 条 · ${formatBytes(item.size_bytes)}</span>
+        <code title="${escapeHtml(item.filename)}">${escapeHtml(item.filename)}</code>
+        ${previewHtml}
+      </div>
+      <div class="backup-actions">
+        <button class="btn btn-secondary btn-sm backup-restore" type="button">恢复</button>
+        <button class="btn btn-danger btn-sm backup-delete" type="button">删除</button>
+      </div>
+    `;
+    row.querySelector('.backup-restore').addEventListener('click', () => {
+      restoreBackupItem(item);
+    });
+    row.querySelector('.backup-delete').addEventListener('click', () => {
+      deleteBackupItem(item);
+    });
+    list.appendChild(row);
+  });
+}
+
+async function createBackupNow() {
+  const button = document.getElementById('backup-create');
+  button.disabled = true;
+  button.textContent = '备份中...';
+  setBackupResult(`正在备份人格「${state.currentPersona}」...`);
+  try {
+    const resp = await api.createBackup(state.currentPersona);
+    if (!resp.success) {
+      showToast(resp.error || '备份失败', 'error');
+      setBackupResult('备份失败：' + (resp.error || '未知错误'), 'error');
+      return;
+    }
+    showToast(`已备份 ${resp.record_count || 0} 条记录`, 'success');
+    setBackupResult(
+      `备份完成：已保存 ${resp.record_count || 0} 条记录，文件 ${resp.filename || '—'}`,
+      'success',
+    );
+  } catch (e) {
+    showToast('备份异常：' + (e?.message || e), 'error');
+    setBackupResult('备份异常：' + (e?.message || e), 'error');
+  } finally {
+    button.textContent = '创建备份';
+    await loadBackups();
+  }
+}
+
+async function restoreBackupItem(item) {
+  const confirmed = await requestConfirmation({
+    title: '确认恢复备份',
+    message:
+      `恢复人格「${state.currentPersona}」的 ${item.record_count || 0} 条记录？\n` +
+      '同名用户将恢复为备份值，其他现有记录不会删除。',
+    confirmText: '恢复',
+  });
+  if (!confirmed) return;
+
+  const buttons = document.querySelectorAll('.backup-restore, .backup-delete, #backup-create');
+  buttons.forEach(button => { button.disabled = true; });
+  setBackupResult(`正在恢复 ${item.filename} ...`);
+  try {
+    const resp = await api.restoreBackup(state.currentPersona, item.filename);
+    if (!resp.success) {
+      showToast(resp.error || '恢复失败', 'error');
+      setBackupResult('恢复失败：' + (resp.error || '未知错误'), 'error');
+      return;
+    }
+    state.page = 1;
+    state.userIdSearch = '';
+    document.getElementById('user-search').value = '';
+    document.getElementById('clear-search').hidden = true;
+    await loadPersonas();
+    showToast(`已恢复 ${resp.restored_count || 0} 条记录`, 'success');
+    setBackupResult(
+      `恢复完成：已恢复 ${resp.restored_count || 0} 条记录。`,
+      'success',
+    );
+  } catch (e) {
+    showToast('恢复异常：' + (e?.message || e), 'error');
+    setBackupResult('恢复异常：' + (e?.message || e), 'error');
+  } finally {
+    await loadBackups();
+  }
+}
+
+async function deleteBackupItem(item) {
+  const deletedPersona = state.currentPersona;
+  let deleted = false;
+  const confirmed = await requestConfirmation({
+    title: '确认删除备份',
+    message: `删除备份文件 ${item.filename}？\n此操作不会删除当前好感数据。`,
+    confirmText: '删除',
+    danger: true,
+  });
+  if (!confirmed) return;
+  document.querySelectorAll('.backup-restore, .backup-delete, #backup-create').forEach(button => {
+    button.disabled = true;
+  });
+  setBackupResult(`正在删除备份 ${item.filename} ...`);
+  try {
+    const resp = await api.deleteBackup(state.currentPersona, item.filename);
+    if (!resp.success) {
+      showToast(resp.error || '删除备份失败', 'error');
+      setBackupResult('删除失败：' + (resp.error || '未知错误'), 'error');
+      return;
+    }
+    deleted = true;
+    showToast('备份文件已删除', 'success');
+    setBackupResult(`已删除备份文件 ${item.filename}`, 'success');
+  } catch (e) {
+    showToast('删除异常：' + (e?.message || e), 'error');
+    setBackupResult('删除异常：' + (e?.message || e), 'error');
+  } finally {
+    if (deleted) {
+      await loadPersonas();
+      if (state.currentPersona !== deletedPersona) {
+        closeBackupDialog();
+        showToast(`备份已删除，已切换到人格「${state.currentPersona}」`, 'success');
+      } else {
+        await loadBackups();
+      }
+    } else {
+      await loadBackups();
+    }
+  }
+}
+
+// ==================== [8] 顶栏 + Dialog 全局事件 ====================
+
+function setupEventListeners() {
   const userSearch = document.getElementById('user-search');
   const runUserSearch = debounce(async () => {
     state.userIdSearch = userSearch.value.trim();
@@ -721,6 +1154,7 @@ function setupEventListeners() {
   document.getElementById('create-btn').addEventListener('click', () => {
     openCreateDialog();
   });
+  document.getElementById('backup-btn').addEventListener('click', openBackupDialog);
 
   // 排序 chips
   document.querySelectorAll('.sort-chip').forEach(chip => {
@@ -803,9 +1237,40 @@ function setupDialogs() {
   createDialog.addEventListener('click', (e) => {
     if (e.target === createDialog) closeCreateDialog();
   });
+
+  // ===== 备份与恢复 =====
+  const backupDialog = document.getElementById('backup-dialog');
+  document.getElementById('backup-create').addEventListener('click', createBackupNow);
+  document.getElementById('backup-close').addEventListener('click', closeBackupDialog);
+  document.getElementById('backup-done').addEventListener('click', closeBackupDialog);
+  backupDialog.addEventListener('click', (e) => {
+    if (e.target === backupDialog) closeBackupDialog();
+  });
+
+  // ===== 页面内确认 =====
+  const confirmDialog = document.getElementById('confirm-dialog');
+  document.getElementById('confirm-submit').addEventListener('click', () => {
+    resolveConfirmation(true);
+  });
+  document.getElementById('confirm-cancel').addEventListener('click', () => {
+    resolveConfirmation(false);
+  });
+  confirmDialog.addEventListener('cancel', (e) => {
+    e.preventDefault();
+    resolveConfirmation(false);
+  });
+  confirmDialog.addEventListener('click', (e) => {
+    if (e.target === confirmDialog) resolveConfirmation(false);
+  });
+  confirmDialog.addEventListener('close', () => {
+    if (!confirmResolver) return;
+    const resolver = confirmResolver;
+    confirmResolver = null;
+    resolver(false);
+  });
 }
 
-// ==================== [8] 状态显示 ====================
+// ==================== [9] 状态显示 ====================
 
 function showLoading() {
   document.getElementById('records-list').innerHTML =
@@ -848,7 +1313,7 @@ function showError(msg) {
   document.getElementById('pager').hidden = true;
 }
 
-// ==================== [9] 启动 ====================
+// ==================== [10] 启动 ====================
 
 document.addEventListener('DOMContentLoaded', init);
 window.addEventListener('beforeunload', (e) => {

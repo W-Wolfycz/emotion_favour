@@ -249,6 +249,12 @@
         "default": 50,
         "hint": "好感度向此值回归。只有高于锚点的部分会衰减；≤ 锚点的好感度不衰减（负面印象不会被时间冲淡）。范围跟随 min/max_favour_value。"
       },
+      "backup_retention_days": {
+        "description": "JSON 备份保留天数",
+        "type": "int",
+        "default": 0,
+        "hint": "0 表示永久保留；设置为正整数时，插件初始化和新建备份后会清理超过天数的有效 JSON 业务备份。数据库迁移生成的 SQLite .db 安全备份不自动删除。"
+      },
       "settlement_max_concurrency": {
         "description": "后台裁决最大并发数",
         "type": "int",

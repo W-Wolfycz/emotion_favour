@@ -8,6 +8,7 @@ class TestPluginSettings(unittest.TestCase):
         settings = PluginSettings.from_mapping({})
         self.assertEqual(settings.favour_mode, "normal")
         self.assertEqual(settings.settlement_max_concurrency, 3)
+        self.assertEqual(settings.backup_retention_days, 0)
 
     def test_ids_and_ranges_are_normalized(self):
         settings = PluginSettings.from_mapping({
@@ -23,6 +24,13 @@ class TestPluginSettings(unittest.TestCase):
         self.assertEqual(settings.favour_envoys, frozenset({"10001", "10002"}))
         self.assertEqual((settings.favour_change_min, settings.favour_change_max), (-5, 5))
         self.assertTrue(settings.warnings)
+
+    def test_backup_retention_accepts_large_values(self):
+        retention_days = 10 ** 100
+        settings = PluginSettings.from_mapping({
+            "advanced_config": {"backup_retention_days": retention_days},
+        })
+        self.assertEqual(settings.backup_retention_days, retention_days)
 
 
 class TestAdvanceTierValidation(unittest.TestCase):

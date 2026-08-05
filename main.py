@@ -19,8 +19,18 @@ from astrbot.core.utils.session_waiter import session_waiter, SessionController,
 
 from .log import logger, configure as configure_log
 from .config import PluginSettings, validate_advance_tiers
-from .runtime import KeyedLockPool, TaskSupervisor
+from .runtime import (
+    KeyedLockPool,
+    MutationEpochTracker,
+    PersonaMutationGate,
+    TaskSupervisor,
+)
 from .playwright_support import install_chromium, is_missing_chromium_error
+from .prompt_injection import (
+    SYSTEM_PROMPT_MARKER,
+    append_system_prompt_once,
+    inject_runtime_prompt,
+)
 from .storage import FavourDBManager, FavourRecord
 from .domain import (
     EMOTION_DIMENSIONS,
@@ -33,6 +43,7 @@ from .domain import (
     diminish_delta,
     apply_emotion_decay,
     compute_favour_decay,
+    record_fields_changed,
 )
 from .utils import (
     get_target_uid,
@@ -107,13 +118,15 @@ class EmotionFavourPlugin(Star):
             self.min_favour_value,
             self.max_favour_value,
             local_timezone=timezone_name,
+            backup_retention_days=self.backup_retention_days,
         )
 
         # 运行期并发与生命周期
         self._state = "CREATED"
         self._tasks = TaskSupervisor(logger)
         self._record_locks = KeyedLockPool()
-        self._blocked_personas: set[str] = set()
+        self._record_epochs = MutationEpochTracker()
+        self._persona_mutations = PersonaMutationGate()
         self._blocked_records: set[tuple[str, str, str]] = set()
         self._llm_semaphore = asyncio.Semaphore(self.settlement_max_concurrency)
         self._browser_lock = asyncio.Lock()
@@ -141,6 +154,11 @@ class EmotionFavourPlugin(Star):
         from .web_api import register_web_apis
         try:
             await self.db.init_db()
+            removed_backups = await self.db.cleanup_expired_backups()
+            if removed_backups:
+                logger.info(
+                    f"[EmotionFavour] 已清理 {removed_backups} 个过期 JSON 备份"
+                )
             await self._ensure_local_scripts()
             try:
                 await self._ensure_browser(auto_install=False)
@@ -246,17 +264,43 @@ class EmotionFavourPlugin(Star):
         emotions_absolute: Optional[dict] = None,
     ) -> bool:
         key = self._record_key(persona_id, user_id)
-        if persona_id in self._blocked_personas or key in self._blocked_records:
+        record_epoch = self._record_epochs.snapshot(key)
+        if key in self._blocked_records:
+            return False
+        mutation_epoch = await self._persona_mutations.try_epoch(persona_id)
+        if mutation_epoch is None:
             return False
         async with self._record_locks.hold(key):
-            if persona_id in self._blocked_personas or key in self._blocked_records:
+            if (
+                key in self._blocked_records
+                or not self._record_epochs.is_current(key, record_epoch)
+            ):
                 return False
-            return await self.db.set_record_fields(
-                persona_id,
-                user_id,
-                favour=favour,
-                emotions_absolute=emotions_absolute,
-            )
+            async with self._persona_mutations.write(
+                persona_id, expected_epoch=mutation_epoch
+            ) as admitted:
+                if not admitted:
+                    return False
+                current = await self.db.get_favour(persona_id, user_id)
+                if current is not None:
+                    if not record_fields_changed(
+                        current,
+                        favour=favour,
+                        emotions_absolute=emotions_absolute,
+                    ):
+                        return True
+                    backup_path = await self.db.backup_data(
+                        [current],
+                        f"pre_edit_user_{user_id}",
+                    )
+                    if not backup_path:
+                        raise RuntimeError("编辑前备份失败，已取消保存")
+                return await self.db.set_record_fields(
+                    persona_id,
+                    user_id,
+                    favour=favour,
+                    emotions_absolute=emotions_absolute,
+                )
 
     async def create_record(
         self,
@@ -267,17 +311,29 @@ class EmotionFavourPlugin(Star):
         emotions_absolute: Optional[dict] = None,
     ) -> bool:
         key = self._record_key(persona_id, user_id)
-        if persona_id in self._blocked_personas or key in self._blocked_records:
+        record_epoch = self._record_epochs.snapshot(key)
+        if key in self._blocked_records:
+            return False
+        mutation_epoch = await self._persona_mutations.try_epoch(persona_id)
+        if mutation_epoch is None:
             return False
         async with self._record_locks.hold(key):
-            if persona_id in self._blocked_personas or key in self._blocked_records:
+            if (
+                key in self._blocked_records
+                or not self._record_epochs.is_current(key, record_epoch)
+            ):
                 return False
-            return await self.db.create_record(
-                persona_id,
-                user_id,
-                favour=favour,
-                emotions_absolute=emotions_absolute,
-            )
+            async with self._persona_mutations.write(
+                persona_id, expected_epoch=mutation_epoch
+            ) as admitted:
+                if not admitted:
+                    return False
+                return await self.db.create_record(
+                    persona_id,
+                    user_id,
+                    favour=favour,
+                    emotions_absolute=emotions_absolute,
+                )
 
     async def update_record(
         self,
@@ -288,22 +344,115 @@ class EmotionFavourPlugin(Star):
         emotion_updates: Optional[dict] = None,
     ) -> bool:
         key = self._record_key(persona_id, user_id)
-        if persona_id in self._blocked_personas or key in self._blocked_records:
+        record_epoch = self._record_epochs.snapshot(key)
+        if key in self._blocked_records:
+            return False
+        mutation_epoch = await self._persona_mutations.try_epoch(persona_id)
+        if mutation_epoch is None:
             return False
         async with self._record_locks.hold(key):
-            if persona_id in self._blocked_personas or key in self._blocked_records:
+            if (
+                key in self._blocked_records
+                or not self._record_epochs.is_current(key, record_epoch)
+            ):
                 return False
-            return await self.db.update_favour(
-                persona_id,
-                user_id,
-                favour=favour,
-                emotion_updates=emotion_updates,
-            )
+            async with self._persona_mutations.write(
+                persona_id, expected_epoch=mutation_epoch
+            ) as admitted:
+                if not admitted:
+                    return False
+                return await self.db.update_favour(
+                    persona_id,
+                    user_id,
+                    favour=favour,
+                    emotion_updates=emotion_updates,
+                )
 
     async def delete_record(self, persona_id: str, user_id: str):
         key = self._record_key(persona_id, user_id)
-        async with self._record_locks.hold(key):
-            return await self.db.delete_favour(persona_id, user_id)
+        self._blocked_records.add(key)
+        try:
+            mutation_epoch = await self._persona_mutations.try_epoch(persona_id)
+            if mutation_epoch is None:
+                return False, "当前人格正在执行其他管理操作"
+            async with self._record_locks.hold(key):
+                async with self._persona_mutations.write(
+                    persona_id, expected_epoch=mutation_epoch
+                ) as admitted:
+                    if not admitted:
+                        return False, "当前人格数据已发生管理变更"
+                    result = await self.db.delete_favour(persona_id, user_id)
+                    if result[0]:
+                        self._record_epochs.invalidate(key)
+                    return result
+        finally:
+            self._blocked_records.discard(key)
+
+    async def create_persona_backup(
+        self,
+        persona_id: str,
+        *,
+        prefix: str = "manual_persona",
+    ) -> tuple[str, int]:
+        """创建指定人格的数据备份；返回文件名和记录数。"""
+        async with self._persona_mutations.exclusive(persona_id):
+            records = await self.db.get_global_records(persona_id)
+            if not records:
+                raise ValueError("当前人格没有可备份的印象数据")
+            backup_path = await self.db.backup_data(records, prefix)
+            if not backup_path:
+                raise RuntimeError("备份创建失败，已保留原数据")
+            return Path(backup_path).name, len(records)
+
+    async def restore_persona_backup(
+        self,
+        persona_id: str,
+        filename: str,
+    ) -> tuple[int, Optional[str]]:
+        """合并恢复人格备份；恢复前自动保护当前数据。"""
+        async with self._persona_mutations.exclusive(persona_id, invalidate=True):
+            async with self.db.protect_backup(filename):
+                target_user_ids = await self.db.get_backup_user_ids(
+                    filename, persona_id
+                )
+                current_records = await self.db.get_existing_records(
+                    persona_id, target_user_ids
+                )
+                pre_restore_name = None
+                if current_records:
+                    pre_restore_path = await self.db.backup_data(
+                        current_records, "pre_restore_users"
+                    )
+                    if not pre_restore_path:
+                        raise RuntimeError("恢复前备份失败，已取消恢复")
+                    pre_restore_name = Path(pre_restore_path).name
+                restored = await self.db.restore_backup(filename, persona_id)
+                return restored, pre_restore_name
+
+    async def delete_persona_backup(self, persona_id: str, filename: str) -> None:
+        """串行删除当前人格的备份文件。"""
+        async with self._persona_mutations.exclusive(persona_id):
+            await self.db.delete_backup(filename, persona_id)
+
+    async def clear_persona_with_backup(self, persona_id: str) -> tuple[int, str]:
+        """备份成功后清空指定人格；备份失败时不执行删除。"""
+        async with self._persona_mutations.exclusive(persona_id, invalidate=True):
+            records = await self.db.get_global_records(persona_id)
+            if not records:
+                return 0, ""
+            backup_path = await self.db.backup_data(
+                records, "backup_all_database"
+            )
+            if not backup_path:
+                raise RuntimeError("自动备份失败，已取消清空")
+            if not await self.db.clear_persona(persona_id):
+                raise RuntimeError("数据库清空失败，请检查日志")
+            return len(records), Path(backup_path).name
+
+    async def reset_persona_emotions(self, persona_id: str) -> int:
+        """与人格管理操作串行地重置全部情感维度。"""
+        async with self._persona_mutations.exclusive(persona_id, invalidate=True):
+            return await self.db.reset_all_emotions_by_persona(persona_id)
 
     # ================= 对话历史提取 =================
 
@@ -668,7 +817,7 @@ class EmotionFavourPlugin(Star):
         base = self.admin_default_favour if is_envoy else self.default_favour
         return max(self.min_favour_value, min(self.max_favour_value, base))
 
-    def _decay_favour_value(self, record) -> int:
+    def _decay_favour_value(self, record, *, now: Optional[datetime] = None) -> int:
         """对 record.favour 应用 lazy 衰减，返回 transient 数值（不写库）。
         若衰减关闭或 record 为 None，直接返回原值。"""
         if not record:
@@ -678,6 +827,7 @@ class EmotionFavourPlugin(Star):
         return compute_favour_decay(
             record.favour, record.updated_at,
             anchor=self.favour_decay_anchor,
+            now=now,
         )
 
     # ================= 排序 & T2I =================
@@ -922,7 +1072,7 @@ class EmotionFavourPlugin(Star):
                 relationship_mode=self.relationship_mode,
             )
             if sys_extra:
-                req.system_prompt = (req.system_prompt or "") + "\n\n" + sys_extra
+                append_system_prompt_once(req, sys_extra, SYSTEM_PROMPT_MARKER)
 
             # User append 通道：当前档位的动态状态（好感度数值、12 维情感、当前 boundary、进度）
             prompt_final = build_injection_prompt(
@@ -933,7 +1083,7 @@ class EmotionFavourPlugin(Star):
                 tier_extras=tier_extras,
             )
 
-            req.extra_user_content_parts.append(TextPart(text=prompt_final).mark_as_temp())
+            inject_runtime_prompt(req, prompt_final, TextPart)
             logger.debug(f"{self._tag(event)} 注入的印象上下文:\n{prompt_final}")
         except Exception as e:
             logger.error(f"{self._tag(event)} 注入印象上下文失败: {str(e)}\n{traceback.format_exc()}")
@@ -966,16 +1116,51 @@ class EmotionFavourPlugin(Star):
         user_id = str(event.get_sender_id() or "")
         persona_id = await self._get_persona_id(event)
         record_key = self._record_key(persona_id, user_id)
-        if persona_id in self._blocked_personas or record_key in self._blocked_records:
+        record_epoch = self._record_epochs.snapshot(record_key)
+        if record_key in self._blocked_records:
+            return
+        mutation_epoch = await self._persona_mutations.try_epoch(persona_id)
+        if mutation_epoch is None:
             return
         async with self._record_locks.hold(record_key):
-            if persona_id in self._blocked_personas or record_key in self._blocked_records:
+            if (
+                record_key in self._blocked_records
+                or not self._record_epochs.is_current(record_key, record_epoch)
+            ):
                 return
             await self._calculate_favour_bg(
                 event,
                 user_text,
                 bot_reply,
                 persona_id=persona_id,
+                mutation_epoch=mutation_epoch,
+            )
+
+    async def _update_settlement_record(
+        self,
+        persona_id: str,
+        user_id: str,
+        mutation_epoch: int,
+        *,
+        favour: Optional[int] = None,
+        emotion_updates: Optional[dict] = None,
+    ) -> bool:
+        """仅当结算启动后的 persona epoch 未变化时写入结果。"""
+        async with self._persona_mutations.write(
+            persona_id,
+            expected_epoch=mutation_epoch,
+        ) as admitted:
+            if not admitted:
+                logger.info(
+                    f"[EmotionFavour] 丢弃已过期的后台结算写入: "
+                    f"persona={persona_id} user={user_id}"
+                )
+                return False
+            return await self.db.update_favour(
+                persona_id,
+                user_id,
+                favour=favour,
+                emotion_updates=emotion_updates,
             )
 
     @filter.on_decorating_result(priority=15)
@@ -988,19 +1173,7 @@ class EmotionFavourPlugin(Star):
 
         try:
             persona_id = await self._get_persona_id(event)
-            records = await self.db.get_global_records(persona_id)
-            zero_emotions = {dim: 0 for dim in EMOTION_DIMENSIONS}
-            count = 0
-            for record in records:
-                async with self._record_locks.hold(
-                    self._record_key(persona_id, record.user_id)
-                ):
-                    if await self.db.set_record_fields(
-                        persona_id,
-                        record.user_id,
-                        emotions_absolute=zero_emotions,
-                    ):
-                        count += 1
+            count = await self.reset_persona_emotions(persona_id)
             if count > 0:
                 logger.info(f"{self._tag(event)} 检测到会话重置/新建，已重置人格 {persona_id} 下 {count} 位用户的情感维度")
         except Exception as e:
@@ -1013,11 +1186,16 @@ class EmotionFavourPlugin(Star):
         bot_reply: str,
         *,
         persona_id: Optional[str] = None,
+        mutation_epoch: Optional[int] = None,
     ):
         try:
             user_id = event.get_sender_id()
             umo = event.unified_msg_origin
             persona_id = persona_id or await self._get_persona_id(event)
+            if mutation_epoch is None:
+                mutation_epoch = await self._persona_mutations.try_epoch(persona_id)
+                if mutation_epoch is None:
+                    return
 
             # 提前获取裁决模型（供人设摘要提取和裁决共用）
             if self.judge_provider:
@@ -1081,7 +1259,13 @@ class EmotionFavourPlugin(Star):
                     )
                     if decayed:
                         decay_deltas = {dim: nv - getattr(record, dim) for dim, nv in decayed.items()}
-                        await self.db.update_favour(persona_id, user_id, emotion_updates=decay_deltas)
+                        if not await self._update_settlement_record(
+                            persona_id,
+                            user_id,
+                            mutation_epoch,
+                            emotion_updates=decay_deltas,
+                        ):
+                            return
                         record = await self.db.get_favour(persona_id, user_id)
                         logger.info(f"{self._tag(event)} 情感衰减: 用户 {user_id}, {elapsed_hours:.1f}h, {list(decayed.keys())}")
                 current_favour = self._decay_favour_value(record)
@@ -1183,7 +1367,13 @@ class EmotionFavourPlugin(Star):
                 if record and self.favour_decay_enabled:
                     decayed_fav = self._decay_favour_value(record)
                     if decayed_fav != record.favour:
-                        await self.db.update_favour(persona_id, user_id, favour=decayed_fav)
+                        if not await self._update_settlement_record(
+                            persona_id,
+                            user_id,
+                            mutation_epoch,
+                            favour=decayed_fav,
+                        ):
+                            return
                         logger.info(f"{self._tag(event)} 印象结算无变化，刷新衰减基线 user={user_id} {record.favour}->{decayed_fav}")
                 logger.debug(f"{self._tag(event)} 印象结算无变化 user={user_id}")
                 return
@@ -1210,7 +1400,14 @@ class EmotionFavourPlugin(Star):
                         current_val = getattr(record, dim, 0)
                         clamped_emotions[dim] = diminish_delta(current_val, clamped_emotions[dim])
 
-            await self.db.update_favour(persona_id, user_id, favour=new_fav, emotion_updates=clamped_emotions if clamped_emotions else None)
+            if not await self._update_settlement_record(
+                persona_id,
+                user_id,
+                mutation_epoch,
+                favour=new_fav,
+                emotion_updates=clamped_emotions if clamped_emotions else None,
+            ):
+                return
             logger.info(f"{self._tag(event)} 用户 {user_id} 结算: 好感值 {old_fav}->{new_fav} (Δ{delta}){', 情感: ' + str(clamped_emotions) if clamped_emotions else ''}")
         except Exception as e:
             logger.error(f"{self._tag(event)} 印象后台结算出错: {str(e)}\n{traceback.format_exc()}")
@@ -1519,15 +1716,34 @@ class EmotionFavourPlugin(Star):
                 record_key = self._record_key(persona_id, uid)
                 self._blocked_records.add(record_key)
                 try:
+                    mutation_epoch = await self._persona_mutations.try_epoch(persona_id)
+                    if mutation_epoch is None:
+                        await evt.send(evt.plain_result("当前人格正在执行其他管理操作，请稍后重试。"))
+                        controller.stop()
+                        return
                     async with self._record_locks.hold(record_key):
-                        record = await self.db.get_favour(persona_id, uid)
-                        if record:
-                            backup_file = await self.db.backup_data([record], f"backup_user_{uid}")
-                            await self.db.delete_favour(persona_id, uid)
-                            await evt.send(evt.plain_result(f"✅ 已清空用户 {uid} 的印象数据。"))
-                            logger.info(f"{self._tag(event)} 管理员 {evt.get_sender_id()} 清空了用户 {uid} 的印象数据\n备份: {backup_file}")
-                        else:
-                            await evt.send(evt.plain_result("该用户无印象记录。"))
+                        async with self._persona_mutations.write(
+                            persona_id, expected_epoch=mutation_epoch
+                        ) as admitted:
+                            if not admitted:
+                                await evt.send(evt.plain_result("当前人格数据已发生管理变更，请重新操作。"))
+                                controller.stop()
+                                return
+                            record = await self.db.get_favour(persona_id, uid)
+                            if record:
+                                backup_file = await self.db.backup_data([record], f"backup_user_{uid}")
+                                if not backup_file:
+                                    await evt.send(evt.plain_result("自动备份失败，已取消清空。"))
+                                    controller.stop()
+                                    return
+                                deleted, message = await self.db.delete_favour(persona_id, uid)
+                                if not deleted:
+                                    raise RuntimeError(message)
+                                self._record_epochs.invalidate(record_key)
+                                await evt.send(evt.plain_result(f"✅ 已清空用户 {uid} 的印象数据。"))
+                                logger.info(f"{self._tag(event)} 管理员 {evt.get_sender_id()} 清空了用户 {uid} 的印象数据\n备份: {backup_file}")
+                            else:
+                                await evt.send(evt.plain_result("该用户无印象记录。"))
                 finally:
                     self._blocked_records.discard(record_key)
             else:
@@ -1548,33 +1764,35 @@ class EmotionFavourPlugin(Star):
             yield event.plain_result("权限不足！你无法使用此命令。")
             return
         persona_id = await self._get_persona_id(event)
-        yield event.plain_result("🚨 极度危险：即将清空当前人格下【所有】印象数据！\n请在 30 秒内回复「确认清空所有数据」以继续，回复其他内容取消。")
+        yield event.plain_result(
+            f"🚨 极度危险：即将清空人格「{persona_id}」下【所有】印象数据！\n"
+            "请在 30 秒内准确回复「Accpet.」以继续，回复其他内容取消。"
+        )
 
         @session_waiter(timeout=30, record_history_chains=False)
         async def confirm_waiter(controller: SessionController, evt: AstrMessageEvent):
             msg = (evt.message_str or "").strip()
             if not msg:
                 return
-            if msg == "确认清空所有数据":
-                self._blocked_personas.add(persona_id)
+            if msg == "Accpet.":
                 try:
-                    records = await self.db.get_global_records(persona_id)
-                    if records:
-                        backup_file = await self.db.backup_data(records, "backup_all_database")
-                        # 按固定顺序等待已在执行的单用户结算退出，再逐条删除。
-                        for record in sorted(records, key=lambda item: item.user_id):
-                            async with self._record_locks.hold(
-                                self._record_key(persona_id, record.user_id)
-                            ):
-                                await self.db.delete_favour(persona_id, record.user_id)
-                        await evt.send(evt.plain_result("✅ 已清空当前人格下所有印象数据。"))
+                    count, backup_file = await self.clear_persona_with_backup(persona_id)
+                    if count:
+                        await evt.send(evt.plain_result(
+                            f"✅ 已清空人格「{persona_id}」下全部 {count} 条印象数据。"
+                        ))
                         logger.warning(f"{self._tag(event)} Bot管理员 {evt.get_sender_id()} 清空了人格 {persona_id} 的所有印象数据\n备份: {backup_file}")
                     else:
-                        await evt.send(evt.plain_result("数据库中无印象记录。"))
-                finally:
-                    self._blocked_personas.discard(persona_id)
+                        await evt.send(evt.plain_result(
+                            f"人格「{persona_id}」下没有印象记录。"
+                        ))
+                except Exception as e:
+                    logger.error(f"{self._tag(event)} 清空人格 {persona_id} 失败: {e}")
+                    await evt.send(evt.plain_result(f"清空人格「{persona_id}」失败：{e}"))
             else:
-                await evt.send(evt.plain_result("已取消清空操作。"))
+                await evt.send(evt.plain_result(
+                    f"已取消清空人格「{persona_id}」的操作。"
+                ))
             controller.stop()
 
         try:

@@ -24,6 +24,25 @@ EMOTION_GROUPS = {
     "sticky": ["trust", "sadness", "guilt", "shame", "pride", "envy"],
 }
 
+
+def record_fields_changed(
+    record,
+    *,
+    favour: Optional[int] = None,
+    emotions_absolute: Optional[dict] = None,
+) -> bool:
+    """判断管理台提交是否会改变现有记录，用于避免空编辑备份。"""
+    if record is None:
+        return True
+    if favour is not None and int(getattr(record, "favour", 0)) != int(favour):
+        return True
+    return any(
+        int(getattr(record, dim, 0)) != int(value)
+        for dim, value in (emotions_absolute or {}).items()
+        if dim in EMOTION_DIMENSIONS
+    )
+
+
 EMOTION_DISPLAY_NAMES = {
     "joy": "喜悦", "trust": "信任", "fear": "恐惧", "surprise": "惊讶",
     "sadness": "悲伤", "disgust": "厌恶", "anger": "愤怒", "anticipation": "期待",

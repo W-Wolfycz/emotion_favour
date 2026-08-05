@@ -3,6 +3,7 @@ import json
 import string
 import asyncio
 import sqlite3
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import List, Optional, Tuple
 from datetime import datetime, timezone
@@ -33,28 +34,48 @@ from .domain import (
     utc_now,
 )
 from .log import logger
+from .db_migrations import (
+    SQLiteMigration,
+    SQLiteMigrationRunner,
+    add_emotion_columns,
+    normalize_utc_timestamps,
+    validate_favour_schema,
+)
 
 
 _METADATA_FIELDS = frozenset({
     'id', 'persona_id', 'user_id', 'favour', 'created_at', 'updated_at',
 })
+_BACKUP_FORMAT = "emotion_favour_backup_v2"
+_TIMESTAMP_STORAGE_UTC = "utc_naive_v1"
+_TIMESTAMP_STORAGE_LEGACY_LOCAL = "legacy_local_naive"
 
 
-def _parse_db_datetime(value) -> Optional[datetime]:
+def _parse_db_datetime(value, *, naive_timezone=None) -> Optional[datetime]:
     if value is None:
         return None
     if isinstance(value, datetime):
-        return value.replace(tzinfo=None)
-    raw = str(value).strip()
-    if not raw:
-        return None
-    try:
-        return datetime.fromisoformat(raw.replace("Z", "+00:00")).replace(tzinfo=None)
-    except ValueError:
-        try:
-            return datetime.strptime(raw[:19], "%Y-%m-%d %H:%M:%S")
-        except ValueError:
+        parsed = value
+    else:
+        raw = str(value).strip()
+        if not raw:
             return None
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            try:
+                parsed = datetime.strptime(raw[:19], "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                return None
+    if parsed.tzinfo is not None:
+        return parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    if naive_timezone is not None:
+        return (
+            parsed.replace(tzinfo=naive_timezone)
+            .astimezone(timezone.utc)
+            .replace(tzinfo=None)
+        )
+    return parsed
 
 def _is_valid_userid(userid: str) -> bool:
     if not userid or len(userid.strip()) == 0:
@@ -123,6 +144,7 @@ class FavourDBManager:
         max_val: int = 100,
         *,
         local_timezone: str = "Asia/Shanghai",
+        backup_retention_days: int = 0,
     ):
         self.data_dir = data_dir
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -130,6 +152,11 @@ class FavourDBManager:
         self.db_url = f"sqlite+aiosqlite:///{self.db_path}"
         self.min_val = min_val
         self.max_val = max_val
+        try:
+            retention_days = int(backup_retention_days)
+        except (TypeError, ValueError):
+            retention_days = 0
+        self.backup_retention_days = max(0, retention_days)
         try:
             self.local_tz = ZoneInfo(local_timezone)
         except Exception:
@@ -150,82 +177,24 @@ class FavourDBManager:
         )
         self._initialized = False
         self._init_lock = asyncio.Lock()
-
-    # 旧表升级：补齐缺失的情感列
-    _EMOTION_COLUMNS = [
-        ("joy", "INTEGER DEFAULT 0"),
-        ("trust", "INTEGER DEFAULT 0"),
-        ("fear", "INTEGER DEFAULT 0"),
-        ("surprise", "INTEGER DEFAULT 0"),
-        ("sadness", "INTEGER DEFAULT 0"),
-        ("disgust", "INTEGER DEFAULT 0"),
-        ("anger", "INTEGER DEFAULT 0"),
-        ("anticipation", "INTEGER DEFAULT 0"),
-        ("pride", "INTEGER DEFAULT 0"),
-        ("guilt", "INTEGER DEFAULT 0"),
-        ("shame", "INTEGER DEFAULT 0"),
-        ("envy", "INTEGER DEFAULT 0"),
-    ]
-
-    async def _backup_sqlite(self, prefix: str) -> Optional[Path]:
-        """使用 SQLite backup API 创建一致性数据库备份。"""
-        if not self.db_path.exists() or self.db_path.stat().st_size == 0:
-            return None
-        backup_dir = self.data_dir / "backups"
-        backup_dir.mkdir(parents=True, exist_ok=True)
-        stamp = utc_now().strftime("%Y%m%d_%H%M%S_UTC")
-        target = backup_dir / f"{prefix}_{stamp}.db"
-
-        def _copy() -> None:
-            source_conn = sqlite3.connect(self.db_path)
-            target_conn = sqlite3.connect(target)
-            try:
-                source_conn.backup(target_conn)
-            finally:
-                target_conn.close()
-                source_conn.close()
-
-        await asyncio.to_thread(_copy)
-        return target
-
-    async def _migrate_timestamps_to_utc(self, conn) -> int:
-        """把旧版按服务器本地时间写入的 naive 时间转换成 UTC naive。"""
-        converted = 0
-        table_columns = {
-            "favour_records": ("created_at", "updated_at"),
-            "persona_summaries": ("updated_at",),
-        }
-        for table_name, columns in table_columns.items():
-            exists = await conn.execute(
-                text("SELECT name FROM sqlite_master WHERE type='table' AND name=:name"),
-                {"name": table_name},
-            )
-            if exists.fetchone() is None:
-                continue
-            selected = ", ".join(("id", *columns))
-            rows = (await conn.execute(text(f"SELECT {selected} FROM {table_name}"))).fetchall()
-            for row in rows:
-                updates = {}
-                for index, column in enumerate(columns, start=1):
-                    old = _parse_db_datetime(row[index])
-                    if old is None:
-                        continue
-                    utc_value = (
-                        old.replace(tzinfo=self.local_tz)
-                        .astimezone(timezone.utc)
-                        .replace(tzinfo=None)
-                    )
-                    updates[column] = utc_value
-                if not updates:
-                    continue
-                assignments = ", ".join(f"{column}=:{column}" for column in updates)
-                updates["row_id"] = row[0]
-                await conn.execute(
-                    text(f"UPDATE {table_name} SET {assignments} WHERE id=:row_id"),
-                    updates,
-                )
-                converted += 1
-        return converted
+        self._backup_lock = asyncio.Lock()
+        self._protected_backup_files: dict[str, int] = {}
+        self._migration_runner = SQLiteMigrationRunner(
+            self.db_path,
+            self.data_dir / "backups",
+            (
+                SQLiteMigration("add_emotion_columns_v1", add_emotion_columns),
+                SQLiteMigration(
+                    "normalize_utc_timestamps_v1",
+                    lambda connection: normalize_utc_timestamps(
+                        connection,
+                        self.local_tz,
+                        self.data_dir / ".timestamps_utc_v1",
+                    ),
+                ),
+            ),
+            final_validator=validate_favour_schema,
+        )
 
     async def init_db(self):
         if self._initialized:
@@ -235,14 +204,10 @@ class FavourDBManager:
             if self._initialized:
                 return
 
-            migration_marker = self.data_dir / ".timestamps_utc_v1"
-            preexisting = self.db_path.exists() and self.db_path.stat().st_size > 0
-            if preexisting and not migration_marker.exists():
-                backup_path = await self._backup_sqlite("pre_utc_migration")
-                if backup_path:
-                    logger.info(f"UTC 时间迁移前数据库备份完成: {backup_path}")
-
             try:
+                migration_result = await asyncio.to_thread(self._migration_runner.run)
+                if migration_result.backup_path:
+                    logger.info(f"数据库迁移前备份完成: {migration_result.backup_path}")
                 async with self.engine.begin() as conn:
                     # 检查表是否已存在
                     result = await conn.execute(
@@ -282,20 +247,6 @@ class FavourDBManager:
                         await conn.execute(text(
                             "CREATE INDEX IF NOT EXISTS ix_favour_records_user_id ON favour_records (user_id)"
                         ))
-                    else:
-                        # 旧表升级：获取已有列，补齐缺失的情感列
-                        col_result = await conn.execute(
-                            text("PRAGMA table_info(favour_records)")
-                        )
-                        existing_cols = {row[1] for row in col_result.fetchall()}
-
-                        for col_name, col_type in self._EMOTION_COLUMNS:
-                            if col_name not in existing_cols:
-                                await conn.execute(
-                                    text(f"ALTER TABLE favour_records ADD COLUMN {col_name} {col_type}")
-                                )
-                                logger.info(f"数据库迁移：已添加列 {col_name}")
-
                     # 人设摘要表
                     await conn.execute(text("""
                         CREATE TABLE IF NOT EXISTS persona_summaries (
@@ -311,33 +262,22 @@ class FavourDBManager:
                         "CREATE INDEX IF NOT EXISTS ix_persona_summaries_pid ON persona_summaries (persona_id)"
                     ))
 
-                    await conn.execute(text("""
-                        CREATE TABLE IF NOT EXISTS emotion_favour_meta (
-                            key TEXT PRIMARY KEY,
-                            value TEXT NOT NULL DEFAULT ''
-                        )
-                    """))
-                    storage_row = await conn.execute(text(
-                        "SELECT value FROM emotion_favour_meta WHERE key='timestamp_storage'"
+                    await conn.execute(text(
+                        "CREATE TABLE IF NOT EXISTS emotion_favour_meta ("
+                        "key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '')"
                     ))
-                    timestamp_storage = storage_row.scalar_one_or_none()
-                    if table_exists and timestamp_storage != "utc_naive_v1":
-                        converted = await self._migrate_timestamps_to_utc(conn)
-                        logger.info(
-                            f"数据库时间迁移完成: local naive -> UTC naive, rows={converted}"
-                        )
-                    await conn.execute(text("""
-                        INSERT INTO emotion_favour_meta(key, value)
-                        VALUES ('timestamp_storage', 'utc_naive_v1')
-                        ON CONFLICT(key) DO UPDATE SET value=excluded.value
-                    """))
 
+                await asyncio.to_thread(self._validate_schema)
                 self._initialized = True
-                migration_marker.write_text("utc_naive_v1\n", encoding="utf-8")
                 logger.info(f"印象数据库已初始化: {self.db_path}")
             except Exception as e:
+                self._initialized = False
                 logger.error(f"数据库初始化失败: {e}")
                 raise
+
+    def _validate_schema(self) -> None:
+        with sqlite3.connect(self.db_path) as connection:
+            validate_favour_schema(connection)
 
     async def close(self) -> None:
         await self.engine.dispose()
@@ -355,25 +295,372 @@ class FavourDBManager:
     async def backup_data(self, records: List[FavourRecord], prefix: str) -> Optional[str]:
         if not records:
             return None
+        async with self._backup_lock:
+            temporary = None
+            try:
+                backup_dir = self.data_dir / "backups"
+                backup_dir.mkdir(parents=True, exist_ok=True)
+                safe_prefix = "".join(
+                    char if char.isascii() and (char.isalnum() or char in "_-") else "_"
+                    for char in str(prefix)
+                ).strip("_") or "backup"
+                timestamp = utc_now().strftime("%Y%m%d_%H%M%S_%f_UTC")
+                filename = backup_dir / f"{safe_prefix}_{timestamp}.json"
+                temporary = filename.with_suffix(".json.tmp")
+
+                data_to_save = []
+                for r in records:
+                    d = r.model_dump() if hasattr(r, "model_dump") else r.dict()
+                    d['created_at'] = d['created_at'].isoformat() if d.get('created_at') else None
+                    d['updated_at'] = d['updated_at'].isoformat() if d.get('updated_at') else None
+                    data_to_save.append(d)
+
+                payload = {
+                    "format": _BACKUP_FORMAT,
+                    "timestamp_storage": _TIMESTAMP_STORAGE_UTC,
+                    "records": data_to_save,
+                }
+                async with aio_open(temporary, "w", encoding="utf-8") as f:
+                    await f.write(json.dumps(payload, ensure_ascii=False, indent=2))
+                await asyncio.to_thread(temporary.replace, filename)
+                protected = frozenset(self._protected_backup_files)
+                removed = await asyncio.to_thread(
+                    self._cleanup_expired_backups, protected
+                )
+                if removed:
+                    logger.info(f"已清理 {removed} 个过期 JSON 备份")
+                return str(filename)
+            except Exception as e:
+                if temporary is not None:
+                    try:
+                        temporary.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                logger.error(f"备份数据失败: {e}")
+                return None
+
+    def _cleanup_expired_backups(
+        self,
+        protected_files: frozenset[str] = frozenset(),
+    ) -> int:
+        """删除超过保留期的有效 JSON 业务备份；未知或损坏文件保持不动。"""
+        if self.backup_retention_days <= 0:
+            return 0
+        backup_dir = self.data_dir / "backups"
+        if not backup_dir.exists():
+            return 0
+        now_timestamp = datetime.now(timezone.utc).timestamp()
+        retention_seconds = self.backup_retention_days * 86400
+        removed = 0
         try:
-            backup_dir = self.data_dir / "backups"
-            backup_dir.mkdir(exist_ok=True)
-            timestamp = utc_now().strftime("%Y%m%d_%H%M%S_UTC")
-            filename = backup_dir / f"{prefix}_{timestamp}.json"
+            paths = list(backup_dir.glob("*.json"))
+        except OSError:
+            return 0
+        for path in paths:
+            try:
+                if path.name in protected_files:
+                    continue
+                age_seconds = max(0.0, now_timestamp - path.stat().st_mtime)
+                if age_seconds <= retention_seconds:
+                    continue
+                self._load_backup_payload(path.name)
+                path.unlink()
+                removed += 1
+            except (OSError, ValueError):
+                continue
+        return removed
 
-            data_to_save = []
-            for r in records:
-                d = r.dict()
-                d['created_at'] = d['created_at'].isoformat() if d.get('created_at') else None
-                d['updated_at'] = d['updated_at'].isoformat() if d.get('updated_at') else None
-                data_to_save.append(d)
+    async def cleanup_expired_backups(self) -> int:
+        async with self._backup_lock:
+            return await asyncio.to_thread(
+                self._cleanup_expired_backups,
+                frozenset(self._protected_backup_files),
+            )
 
-            async with aio_open(filename, "w", encoding="utf-8") as f:
-                await f.write(json.dumps(data_to_save, ensure_ascii=False, indent=2))
-            return str(filename)
-        except Exception as e:
-            logger.error(f"备份数据失败: {e}")
-            return None
+    @asynccontextmanager
+    async def protect_backup(self, filename: str):
+        """在恢复流程期间阻止保留期清理或手动删除目标备份。"""
+        name = str(filename or "").strip()
+        if not name or Path(name).name != name or not name.endswith(".json"):
+            raise ValueError("备份文件名无效")
+        async with self._backup_lock:
+            self._protected_backup_files[name] = (
+                self._protected_backup_files.get(name, 0) + 1
+            )
+        try:
+            yield
+        finally:
+            async with self._backup_lock:
+                users = self._protected_backup_files.get(name, 0) - 1
+                if users > 0:
+                    self._protected_backup_files[name] = users
+                else:
+                    self._protected_backup_files.pop(name, None)
+
+    def _resolve_backup_path(self, filename: str) -> Path:
+        name = str(filename or "").strip()
+        if not name or Path(name).name != name or not name.endswith(".json"):
+            raise ValueError("备份文件名无效")
+        backup_dir = (self.data_dir / "backups").resolve()
+        path = (backup_dir / name).resolve()
+        if path.parent != backup_dir:
+            raise ValueError("备份文件路径无效")
+        if not path.is_file():
+            raise ValueError("备份文件不存在")
+        if path.stat().st_size > 64 * 1024 * 1024:
+            raise ValueError("备份文件过大")
+        return path
+
+    def _load_backup_payload(self, filename: str) -> tuple[Path, list[dict], str]:
+        path = self._resolve_backup_path(filename)
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError("备份文件损坏或无法读取") from exc
+
+        if isinstance(payload, dict):
+            if payload.get("format") != _BACKUP_FORMAT:
+                raise ValueError("不支持的备份格式")
+            timestamp_storage = str(payload.get("timestamp_storage", ""))
+            if timestamp_storage != _TIMESTAMP_STORAGE_UTC:
+                raise ValueError("不支持的备份时间格式")
+            records_payload = payload.get("records")
+        elif isinstance(payload, list):
+            records_payload = payload
+            timestamp_storage = (
+                _TIMESTAMP_STORAGE_UTC
+                if path.stem.endswith("_UTC")
+                else _TIMESTAMP_STORAGE_LEGACY_LOCAL
+            )
+        else:
+            raise ValueError("不支持的备份格式")
+        if not isinstance(records_payload, list):
+            raise ValueError("备份文件缺少记录列表")
+        records = [item for item in records_payload if isinstance(item, dict)]
+        if len(records) != len(records_payload):
+            raise ValueError("备份文件包含无效记录")
+        return path, records, timestamp_storage
+
+    def _backup_kind(self, filename: str) -> str:
+        if filename.startswith("pre_restore_"):
+            return "恢复前自动备份"
+        if filename.startswith("pre_edit_"):
+            return "编辑前自动备份"
+        if filename.startswith("manual_persona_"):
+            return "手动备份"
+        if filename.startswith("backup_user_"):
+            return "单用户清空备份"
+        if filename.startswith("backup_all_database_"):
+            return "整个人格清空备份"
+        return "数据备份"
+
+    def _scan_backups(self, persona_id: str) -> list[dict]:
+        backup_dir = self.data_dir / "backups"
+        if not backup_dir.exists():
+            return []
+        items = []
+        for path in backup_dir.glob("*.json"):
+            try:
+                _, payload, _ = self._load_backup_payload(path.name)
+                matched = [
+                    item for item in payload
+                    if str(item.get("persona_id", "")) == persona_id
+                ]
+                if not matched:
+                    continue
+                modified = datetime.fromtimestamp(
+                    path.stat().st_mtime, tz=timezone.utc
+                ).astimezone(self.local_tz)
+                preview = None
+                if len(matched) == 1:
+                    record = matched[0]
+                    try:
+                        favour = int(record.get("favour", 0))
+                    except (TypeError, ValueError):
+                        favour = 0
+                    emotions = {}
+                    for dim in EMOTION_DIMENSIONS:
+                        try:
+                            emotions[dim] = int(record.get(dim, 0))
+                        except (TypeError, ValueError):
+                            emotions[dim] = 0
+                    preview = {
+                        "user_id": str(record.get("user_id", "")),
+                        "favour": favour,
+                        "emotions": emotions,
+                    }
+                items.append({
+                    "filename": path.name,
+                    "kind": self._backup_kind(path.name),
+                    "created_at": modified.strftime("%Y-%m-%d %H:%M:%S"),
+                    "record_count": len(matched),
+                    "size_bytes": path.stat().st_size,
+                    "preview": preview,
+                    "_modified": path.stat().st_mtime,
+                })
+            except (OSError, ValueError):
+                continue
+        items.sort(key=lambda item: item["_modified"], reverse=True)
+        for item in items:
+            item.pop("_modified", None)
+        return items[:100]
+
+    def _scan_backup_personas(self) -> list[str]:
+        """返回有效 JSON 备份中出现过的人格，供清空后的恢复入口使用。"""
+        backup_dir = self.data_dir / "backups"
+        if not backup_dir.exists():
+            return []
+        personas: set[str] = set()
+        for path in backup_dir.glob("*.json"):
+            try:
+                _, payload, _ = self._load_backup_payload(path.name)
+            except (OSError, ValueError):
+                continue
+            for item in payload:
+                raw_persona_id = str(item.get("persona_id", ""))
+                persona_id = raw_persona_id.strip()
+                if persona_id == raw_persona_id and 0 < len(persona_id) <= 64:
+                    personas.add(persona_id)
+        return sorted(personas)
+
+    async def list_backups(self, persona_id: str) -> list[dict]:
+        """列出包含指定人格记录的 JSON 备份，不向调用方暴露绝对路径。"""
+        if not persona_id:
+            return []
+        async with self._backup_lock:
+            return await asyncio.to_thread(self._scan_backups, persona_id)
+
+    async def get_backup_personas(self) -> list[str]:
+        """返回备份中仍可恢复的人格，即使其数据库记录已全部清空。"""
+        async with self._backup_lock:
+            return await asyncio.to_thread(self._scan_backup_personas)
+
+    def _select_backup_records(
+        self,
+        payload: list[dict],
+        persona_id: str,
+    ) -> tuple[list[dict], tuple[str, ...]]:
+        selected = [
+            item for item in payload
+            if str(item.get("persona_id", "")) == persona_id
+        ]
+        if not selected:
+            raise ValueError("该备份不包含当前人格的数据")
+        user_ids: list[str] = []
+        seen_users: set[str] = set()
+        for item in selected:
+            user_id = str(item.get("user_id", "")).strip()
+            if not _is_valid_userid(user_id):
+                raise ValueError("备份中存在无效 user_id")
+            if user_id in seen_users:
+                raise ValueError("备份中存在重复用户记录")
+            seen_users.add(user_id)
+            user_ids.append(user_id)
+        return selected, tuple(user_ids)
+
+    async def get_backup_user_ids(
+        self,
+        filename: str,
+        persona_id: str,
+    ) -> tuple[str, ...]:
+        """返回备份中指定人格会被合并恢复的用户 ID。"""
+        if not persona_id or len(persona_id) > 64:
+            raise ValueError("persona_id 无效")
+        async with self._backup_lock:
+            _, payload, _ = await asyncio.to_thread(
+                self._load_backup_payload, filename
+            )
+        _, user_ids = self._select_backup_records(payload, persona_id)
+        return user_ids
+
+    async def restore_backup(self, filename: str, persona_id: str) -> int:
+        """把备份中指定人格的记录合并恢复，已存在记录按备份值覆盖。"""
+        await self.init_db()
+        if not persona_id or len(persona_id) > 64:
+            raise ValueError("persona_id 无效")
+        async with self._backup_lock:
+            _, payload, timestamp_storage = await asyncio.to_thread(
+                self._load_backup_payload, filename
+            )
+        selected, _ = self._select_backup_records(payload, persona_id)
+
+        now = utc_now()
+        clean_rows: list[dict] = []
+        for item in selected:
+            user_id = str(item.get("user_id", "")).strip()
+            try:
+                favour = max(self.min_val, min(self.max_val, int(item.get("favour", 0))))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("备份中存在无效好感度") from exc
+            row = {
+                "persona_id": persona_id,
+                "user_id": user_id,
+                "favour": favour,
+                "created_at": _parse_db_datetime(
+                    item.get("created_at"),
+                    naive_timezone=(
+                        self.local_tz
+                        if timestamp_storage == _TIMESTAMP_STORAGE_LEGACY_LOCAL
+                        else None
+                    ),
+                ) or now,
+                "updated_at": _parse_db_datetime(
+                    item.get("updated_at"),
+                    naive_timezone=(
+                        self.local_tz
+                        if timestamp_storage == _TIMESTAMP_STORAGE_LEGACY_LOCAL
+                        else None
+                    ),
+                ) or now,
+            }
+            for dim in EMOTION_DIMENSIONS:
+                try:
+                    row[dim] = max(0, min(100, int(item.get(dim, 0))))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"备份中存在无效情感维度: {dim}") from exc
+            clean_rows.append(row)
+
+        async with self.async_session() as session:
+            try:
+                for row in clean_rows:
+                    stmt = sqlite_insert(FavourRecord).values(**row)
+                    stmt = stmt.on_conflict_do_update(
+                        index_elements=["persona_id", "user_id"],
+                        set_={
+                            key: value for key, value in row.items()
+                            if key not in {"persona_id", "user_id"}
+                        },
+                    )
+                    await session.execute(stmt)
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                raise
+        return len(clean_rows)
+
+    async def delete_backup(self, filename: str, persona_id: str) -> None:
+        """删除当前人格专属 JSON 备份；混合人格备份拒绝从 UI 删除。"""
+        if not persona_id:
+            raise ValueError("persona_id 无效")
+        name = str(filename or "").strip()
+        async with self._backup_lock:
+            if self._protected_backup_files.get(name, 0) > 0:
+                raise RuntimeError("该备份正在恢复，暂时不能删除")
+            path, payload, _ = await asyncio.to_thread(
+                self._load_backup_payload, name
+            )
+            personas = {
+                str(item.get("persona_id", ""))
+                for item in payload
+            }
+            if persona_id not in personas:
+                raise ValueError("该备份不属于当前人格")
+            if personas != {persona_id}:
+                raise ValueError("混合人格备份不能在管理台删除")
+            try:
+                await asyncio.to_thread(path.unlink)
+            except OSError as exc:
+                raise RuntimeError("删除备份文件失败") from exc
 
     async def get_favour(self, persona_id: str, user_id: str) -> Optional[FavourRecord]:
         await self.init_db()
@@ -384,6 +671,27 @@ class FavourDBManager:
             )
             result = await session.execute(stmt)
             return result.scalars().first()
+
+    async def get_existing_records(
+        self,
+        persona_id: str,
+        user_ids: tuple[str, ...],
+    ) -> List[FavourRecord]:
+        """返回指定用户中当前已存在的记录，供局部恢复前保护。"""
+        await self.init_db()
+        if not user_ids:
+            return []
+        records: list[FavourRecord] = []
+        async with self.async_session() as session:
+            for start in range(0, len(user_ids), 500):
+                chunk = user_ids[start:start + 500]
+                stmt = select(FavourRecord).where(
+                    FavourRecord.persona_id == persona_id,
+                    FavourRecord.user_id.in_(chunk),
+                ).order_by(FavourRecord.id.asc())
+                result = await session.execute(stmt)
+                records.extend(result.scalars().all())
+        return records
 
     async def update_favour(self, persona_id: str, user_id: str, favour: Optional[int] = None, emotion_updates: Optional[dict] = None) -> bool:
         """原子 UPSERT：favour 为绝对值，emotion_updates 为增量。"""
@@ -566,6 +874,22 @@ class FavourDBManager:
             stmt = select(func.count(FavourRecord.id)).where(*conditions)
             result = await session.execute(stmt)
             return int(result.scalar_one() or 0)
+
+    async def get_records_for_effective_sort(
+        self,
+        persona_id: str,
+        *,
+        user_id_search: str = "",
+    ) -> List[FavourRecord]:
+        """返回用于 transient 好感排序的候选记录，由调用方计算衰减后再分页。"""
+        await self.init_db()
+        conditions = [FavourRecord.persona_id == persona_id]
+        if user_id_search:
+            conditions.append(FavourRecord.user_id.contains(user_id_search))
+        async with self.async_session() as session:
+            stmt = select(FavourRecord).where(*conditions).order_by(FavourRecord.id.asc())
+            result = await session.execute(stmt)
+            return list(result.scalars().all())
 
     async def list_records(
         self,

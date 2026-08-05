@@ -1,76 +1,75 @@
-# emotion_favour 单元测试
+# emotion_favour 代码逻辑测试
 
-当前源码版本：3.4.1。
+当前源码版本：3.4.3。
 
-## 运行
+## 定位与边界
+
+`tests/` 只用于验证函数、配置、数据库迁移等可重复的代码逻辑。
+测试套件由远端测试环境执行；部署端负责真实 AstrBot 集成和用户体验验收。
+
+自动化测试允许使用临时 SQLite、mock 和源码片段提取，但不得依赖或修改真实
+插件数据，也不得执行以下操作：
+
+- 启动、停止或重载真实 AstrBot
+- 调用真实 LLM / Provider 或发送平台消息
+- 下载 Playwright Chromium 或访问外部网络
+- 驱动真实 WebUI、浏览器或 Plugin Page Bridge
+- 把真实账号、群组、Persona 或消息内容写入夹具
+
+`test_storage_db.py` 使用临时目录和临时 SQLite 验证持久化逻辑；这属于代码逻辑测试，
+不等同于部署端数据库迁移或运行时验收。远端必须安装插件运行依赖；依赖缺失或源码
+导入失败应直接让测试失败，不能伪装成 skipped。
+
+## 远端执行
+
+在 `emotion_favour` 根目录下执行：
 
 ```bash
-# 单个文件
-python3 tests/test_migrate.py
-python3 tests/test_storage_injection.py
-python3 tests/test_tier_extras.py
+# 全部测试
+python -m unittest discover -s tests -v
 
-# 全部（在 emotion_favour 根目录下）
-python3 -m unittest discover -s tests -v
+# 单个模块
+python -m unittest tests.test_migrate -v
 
-# 仅跑某个 TestCase
-python3 -m unittest tests.test_migrate.TestMigrateV0ToV1 -v
+# 单个 TestCase
+python -m unittest tests.test_migrate.TestMigrateV0ToV1 -v
+
+# WebUI 纯逻辑
+node --test tests/test_persona_logic.js
 ```
 
-## 测试策略
+## 测试模块
 
-按 plugin_local_testing 记忆，AstrBot 插件代码本地测试**不走 import**（依赖链 sqlmodel/sqlalchemy/aiofiles 等未装）。三个测试文件分别采用不同策略：
+| 文件 | 验证内容 | 隔离方式 |
+|------|----------|----------|
+| `test_config.py` | 配置默认值、规范化和关系档位校验 | 直接导入纯配置模块 |
+| `test_migrate.py` | 配置迁移、坏数据处理和幂等性 | 直接导入标准库模块 |
+| `test_permission_policy.py` | 固定权限策略和显式特殊用户规则 | 源码逻辑测试 |
+| `test_playwright_support.py` | Chromium 缺失识别、安装命令和失败处理 | mock 子进程，不下载浏览器 |
+| `test_prompt_injection.py` | Prompt marker、幂等注入和 system fallback | 轻量假请求对象 |
+| `test_admin_backup_logic.py` | 管理台编辑变更检测，避免无变化时生成备份 | 直接导入纯领域函数 |
+| `test_runtime.py` | `TaskSupervisor`、`KeyedLockPool`、人格写入屏障和记录 epoch 逻辑 | asyncio 与同步纯逻辑测试 |
+| `test_storage_injection.py` | 情感面板、关系边界和提示词构造 | 从 `domain.py` 提取纯函数 |
+| `test_tier_extras.py` | 关系档位、特殊用户覆盖和范围解析 | 从 `main.py` 提取目标方法 |
+| `test_storage_db.py` | 临时库 CRUD、并发、局部备份恢复、保留期清理、清空后人格发现、UTC 迁移、热重载、migration runner、完整性检查和 schema validator | 临时目录与临时 SQLite |
+| `test_persona_logic.js` | 初始人格选择、搜索过滤和键盘索引 | Node 内置测试运行器 |
 
-| 文件 | 策略 | 原因 |
-|------|------|------|
-| `test_migrate.py` | 直接 import | migrate.py 只依赖标准库（json/logging/typing） |
-| `test_storage_injection.py` | 字符串 exec 提取函数 | domain.py 纯函数可独立验证，避免引入数据库 |
-| `test_tier_extras.py` | 字符串 exec 提取类方法 | main.py 顶部 import astrbot，按记忆绕开 |
-| `test_architecture.py` | AST/文本/JSON 静态检查 | 验证 Hook、生命周期、Bridge、DTO 与 schema 约束 |
+## 部署端验收
 
-字符串提取细节：
+以下行为不放进本目录的自动化测试，由部署端 Beta/体验测试确认：
 
-- **`test_storage_injection.py`**：`_extract_fn` 扫描 domain.py 源码，找到 `def fn_name(` 起到下一个顶层 def（行首无缩进）止，把这段源码作为字符串 `exec` 到独立命名空间。
-- **`test_tier_extras.py`**：`_extract_method` 扫描 main.py 源码，找到类内 `    def method(` 起到下一个同缩进 def 或类外结构止，`textwrap.dedent` 去掉类缩进后 `exec`。所有方法共享命名空间（含 `json` / `logger` stub）。Stub 用 `types.SimpleNamespace` 构造，提供 `admin_default_relationship` / `_special_user_ids` / `relationship_advance_raw` 等字段，方法绑定到 stub 上。
-
-## 覆盖范围
-
-### test_permission_policy.py
-
-- 普通成员与 Bot 管理员的固定命令权限
-- 已删除的权限配置不参与运行时
-- 只有显式特殊用户 ID 获得特殊初始好感
-
-### test_migrate.py（10 个测试）
-
-- v0→v1 老配置迁移：JSON 字符串 → list，原字段保留 + `__template_key=custom` 注入
-- v1 已迁移：no-op（字节级相同）
-- JSON 损坏：不 bump 版本号，下次启动可重试
-- 缺 config_version：视为 v0
-- 非 dict 输入：安全返回
-- 已是 list：不强制加 `__template_key`
-- relationship_config 缺失：视为符合新版本
-- 框架健康度：版本号与注册表一致、每版有迁移函数、CURRENT 版本幂等
-
-### test_storage_injection.py（17 个测试）
-
-- 进度计算：4 档分段（< 20 / 20-80 / 80-95 / ≥ 95）+ 退化区间 + clamp
-- boundary 注入：simple 模式跳过 / 非空注入 / 空跳过
-- preview 触发：80% 阈值 / preview 空 / next_describe 空 / 最高等级不触发
-- 最高等级：进度行附加「已达最高等级」
-- 机制脱敏：关键词出现在禁止行
-- XML 标签完整性
-
-### test_tier_extras.py（19 个测试）
-
-- `_get_max_tier`：取 min_value 最高的等级 / 空配置返回 None / 打乱顺序不影响
-- `_get_tier_extras` 特殊用户覆盖：boundary/rule/preview 用最高等级 / is_max_tier=True / next_describe="" / 非特殊用户走原 _find_tier 逻辑 / 双条件（admin_default_relationship 非空 + uid 在显式列表）缺一不可 / 空配置兜底
-- `_get_relationship_range` 特殊用户覆盖：advance 模式返回最高等级 (x, y) / favour 高低不影响 / simple 模式仍返回 None / 空配置返回 None
-- `_is_special_override`：显式 ID 列表判定
+- 插件真实加载、初始化、卸载和热重载
+- 既有运行数据库的备份、迁移和数据保全
+- 真实 Provider 响应、后台裁决及平台消息链路
+- Playwright Chromium 安装、HTML 渲染和错误提示
+- Plugin Page Bridge、WebUI 操作流程和视觉体验
+- 与 ChatMemory 的真实插件发现、历史查询及降级行为
 
 ## 维护守则
 
-- 新加迁移版本（v2、v3...）时，必须在 test_migrate.py 加对应 TestCase
-- 改 build_injection_prompt 的注入分支时，必须更新 test_storage_injection.py 的对应测试
-- 改 main.py 的 _get_max_tier / _get_tier_extras / _get_relationship_range / _is_special_override 时，必须更新 test_tier_extras.py 的对应测试
-- 测试**不依赖** AstrBot 环境，纯本地可跑——若发现测试需要 stub 整个 astrbot 生态才能 import，违反 plugin_local_testing 策略，应改用字符串 exec 方案
+- 新增或修改领域规则时，优先为纯函数补充用例。
+- 新增数据库迁移时，必须覆盖成功、幂等、失败回滚、备份与 schema 校验。
+- 修改 Prompt 注入、权限或关系档位时，更新对应行为测试。
+- 外部依赖统一使用 mock；不得把下载、联网或真实平台副作用引入测试。
+- 只能在临时目录创建数据库和文件，禁止读取或写入部署端 `plugin_data`。
+- 自动化测试通过只说明代码逻辑符合预期，不代表已完成 AstrBot 集成或用户体验验收。
