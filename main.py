@@ -12,12 +12,12 @@ from astrbot.api.star import Star, Context, StarTools
 from astrbot.api import AstrBotConfig
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.event import filter
-from astrbot.core.message.components import Plain
+from astrbot.core.message.components import Image, Plain
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
 from astrbot.core.agent.message import TextPart
 from astrbot.core.utils.session_waiter import session_waiter, SessionController, SessionFilter
 
-from .log import logger, configure as configure_log
+from .log import logger
 from .config import PluginSettings, validate_advance_tiers
 from .runtime import (
     KeyedLockPool,
@@ -37,6 +37,7 @@ from .domain import (
     EMOTION_DISPLAY_NAMES,
     build_emotion_panel,
     build_injection_prompt,
+    build_interaction_section,
     build_system_prompt_extra,
     format_emotion_detail,
     get_dominant_emotions,
@@ -46,6 +47,7 @@ from .domain import (
     record_fields_changed,
 )
 from .utils import (
+    cleanup_old_files,
     get_target_uid,
     escape_markdown,
     get_user_display_name,
@@ -90,7 +92,6 @@ class EmotionFavourPlugin(Star):
                 )
 
         self.settings = PluginSettings.from_mapping(config)
-        configure_log(self.settings.debug_to_info)
         for warning in self.settings.warnings:
             logger.warning(f"[EmotionFavour] 配置校验: {warning}")
 
@@ -128,7 +129,6 @@ class EmotionFavourPlugin(Star):
         self._record_epochs = MutationEpochTracker()
         self._persona_mutations = PersonaMutationGate()
         self._blocked_records: set[tuple[str, str, str]] = set()
-        self._llm_semaphore = asyncio.Semaphore(self.settlement_max_concurrency)
         self._browser_lock = asyncio.Lock()
 
         # Playwright T2I
@@ -160,6 +160,17 @@ class EmotionFavourPlugin(Star):
                     f"[EmotionFavour] 已清理 {removed_backups} 个过期 JSON 备份"
                 )
             await self._ensure_local_scripts()
+            # T2I 渲染缓存清理：删除超过 7 天的 PNG，防止无限累积
+            try:
+                removed_t2i = cleanup_old_files(
+                    self._t2i_output_dir, suffix=".png", max_age_days=7
+                )
+                if removed_t2i:
+                    logger.info(
+                        f"[EmotionFavour] 已清理 {removed_t2i} 个过期 T2I 渲染缓存"
+                    )
+            except Exception as e:
+                logger.warning(f"[EmotionFavour] T2I 渲染缓存清理失败: {e}")
             try:
                 await self._ensure_browser(auto_install=False)
                 logger.info("[EmotionFavour] Playwright 浏览器预热完成")
@@ -244,16 +255,23 @@ class EmotionFavourPlugin(Star):
         prompt: str,
         timeout: Optional[float] = None,
     ):
-        """统一限制后台裁决 LLM 并发并施加超时。"""
+        """后台裁决 LLM 调用统一出口：施加超时并透传重试次数。
+
+        不再做全局并发闸（后台结算任务本就稀少；同一 persona/user 的串行
+        由记录锁保证）。重试次数按 `judge_request_max_retries` 配置透传给
+        Provider：插件路径不自动继承 AstrBot 的
+        provider_settings.request_max_retries，不传参会回落到上游硬编码的
+        5 次重试。
+        """
         effective_timeout = timeout or self.settlement_timeout_seconds
-        async with self._llm_semaphore:
-            return await asyncio.wait_for(
-                self.context.llm_generate(
-                    chat_provider_id=provider_id,
-                    prompt=prompt,
-                ),
-                timeout=effective_timeout,
-            )
+        return await asyncio.wait_for(
+            self.context.llm_generate(
+                chat_provider_id=provider_id,
+                prompt=prompt,
+                request_max_retries=self.judge_request_max_retries,
+            ),
+            timeout=effective_timeout,
+        )
 
     async def set_record_fields(
         self,
@@ -367,26 +385,6 @@ class EmotionFavourPlugin(Star):
                     favour=favour,
                     emotion_updates=emotion_updates,
                 )
-
-    async def delete_record(self, persona_id: str, user_id: str):
-        key = self._record_key(persona_id, user_id)
-        self._blocked_records.add(key)
-        try:
-            mutation_epoch = await self._persona_mutations.try_epoch(persona_id)
-            if mutation_epoch is None:
-                return False, "当前人格正在执行其他管理操作"
-            async with self._record_locks.hold(key):
-                async with self._persona_mutations.write(
-                    persona_id, expected_epoch=mutation_epoch
-                ) as admitted:
-                    if not admitted:
-                        return False, "当前人格数据已发生管理变更"
-                    result = await self.db.delete_favour(persona_id, user_id)
-                    if result[0]:
-                        self._record_epochs.invalidate(key)
-                    return result
-        finally:
-            self._blocked_records.discard(key)
 
     async def create_persona_backup(
         self,
@@ -522,23 +520,32 @@ class EmotionFavourPlugin(Star):
         if not records:
             return ""
 
-        # 去重：若末尾 assistant 等于当前 bot_reply，丢弃最后一对（避免当前轮次重复）
-        if current_bot_reply and len(records) >= 2 and records[-1].get("role") == "assistant":
+        # 去重：若末尾 assistant 等于当前 bot_reply，丢弃当前轮（避免重复）
+        if current_bot_reply and records and records[-1].get("role") == "assistant":
             if records[-1].get("content", "").strip() == current_bot_reply.strip():
-                records = records[:-2]
+                records = records[:-1]
+                if records and records[-1].get("role") == "user":
+                    records = records[:-1]
 
-        # 只保留最近 N 轮
+        # 只保留最近 2N 条消息（约 N 轮）
         records = records[-(rounds * 2):]
 
+        # 按 role 组装，不假设 user/assistant 严格交替
         lines = []
-        for i in range(0, len(records) - 1, 2):
-            idx = i // 2 + 1
-            user_ts = self._ts_tag(records[i])
-            bot_ts = self._ts_tag(records[i + 1])
-            user_prefix = f"  [{idx}] {user_ts} 用户" if user_ts else f"  [{idx}] 用户"
-            bot_prefix = f"  [{idx}] {bot_ts} 角色" if bot_ts else f"  [{idx}] 角色"
-            lines.append(f"{user_prefix}: {records[i].get('content', '')}")
-            lines.append(f"{bot_prefix}: {records[i + 1].get('content', '')}")
+        round_idx = 0
+        for msg in records:
+            role = msg.get("role")
+            if role == "user":
+                round_idx += 1
+                ts = self._ts_tag(msg)
+                prefix = (
+                    f"  [{round_idx}] {ts} 用户" if ts else f"  [{round_idx}] 用户"
+                )
+                lines.append(f"{prefix}: {msg.get('content', '')}")
+            elif role == "assistant":
+                ts = self._ts_tag(msg)
+                prefix = f"  [{round_idx}] {ts} 角色" if ts else f"  [{round_idx}] 角色"
+                lines.append(f"{prefix}: {msg.get('content', '')}")
         return "\n".join(lines)
 
     async def _read_astrbot_history(self, umo: str, conversation_id: str) -> list[dict]:
@@ -600,7 +607,9 @@ class EmotionFavourPlugin(Star):
                 return resolved
             return "default"
         except Exception as e:
-            logger.debug(f"[EmotionFavour] resolve_selected_persona 失败，回退 default: {e}")
+            logger.warning(
+                f"[EmotionFavour] resolve_selected_persona 失败，回退 default: {e}"
+            )
             return "default"
 
     _PUBLIC_COMMANDS = frozenset({"me", "help"})
@@ -1016,6 +1025,43 @@ class EmotionFavourPlugin(Star):
         re.IGNORECASE | re.MULTILINE,
     )
 
+    @staticmethod
+    def _clean_history_contexts(contexts: list, clean_pattern: "re.Pattern") -> list:
+        """清洗历史上下文中的旧注入标记，并保持 tool 调用结构配对完整。
+
+        清洗后为空的普通消息会被丢弃（这些消息只剩旧的注入标记）；
+        但携带 tool_calls 的 assistant 消息与 role=tool 的输出必须保留，
+        否则上游格式转换会生成失去配对的 function_call_output（孤儿），
+        被 OpenAI Responses / opencode 一类上游以 400 拒绝。
+        """
+        cleaned = []
+        for ctx in contexts:
+            if isinstance(ctx, dict) and "content" in ctx:
+                content = ctx["content"]
+                # 仅字符串内容需要清洗；多模态 list / None 原样保留，
+                # 避免 str() 破坏消息结构。
+                if isinstance(content, str):
+                    cleaned_content = clean_pattern.sub("", content).strip()
+                else:
+                    cleaned_content = content
+                # tool_calls 非空时，即使正文被清洗为空也必须保留该消息，
+                # 让后续 role=tool 输出的 call_id 能找到对应的 function_call。
+                if (
+                    cleaned_content
+                    or ctx.get("tool_calls")
+                    or ctx.get("role") == "tool"
+                ):
+                    new_ctx = ctx.copy()
+                    new_ctx["content"] = cleaned_content
+                    cleaned.append(new_ctx)
+            elif isinstance(ctx, str):
+                cleaned_str = clean_pattern.sub("", ctx).strip()
+                if cleaned_str:
+                    cleaned.append(cleaned_str)
+            else:
+                cleaned.append(ctx)
+        return cleaned
+
     @filter.on_llm_request()
     async def inject_favour_prompt(self, event: AstrMessageEvent, req: ProviderRequest):
         """LLM请求前注入好感度面板与情感状态，并清洗历史上下文中的旧注入标记"""
@@ -1024,22 +1070,9 @@ class EmotionFavourPlugin(Star):
 
         # 1. 清洗历史上下文：移除旧的 <情感好感> 注入和 <thought> 块
         if hasattr(req, "contexts") and isinstance(req.contexts, list):
-            cleaned = []
-            for ctx in req.contexts:
-                if isinstance(ctx, dict) and "content" in ctx:
-                    content = str(ctx["content"])
-                    cleaned_content = self._CTX_CLEAN_PATTERN.sub("", content).strip()
-                    if cleaned_content:
-                        new_ctx = ctx.copy()
-                        new_ctx["content"] = cleaned_content
-                        cleaned.append(new_ctx)
-                elif isinstance(ctx, str):
-                    cleaned_str = self._CTX_CLEAN_PATTERN.sub("", ctx).strip()
-                    if cleaned_str:
-                        cleaned.append(cleaned_str)
-                else:
-                    cleaned.append(ctx)
-            req.contexts = cleaned
+            req.contexts = self._clean_history_contexts(
+                req.contexts, self._CTX_CLEAN_PATTERN
+            )
 
         # 2. 注入最新情感好感状态
         try:
@@ -1099,7 +1132,15 @@ class EmotionFavourPlugin(Star):
         if res is None or not res.is_llm_result():
             return
         user_text = event.message_str
-        bot_reply = "".join(comp.text for comp in res.chain if isinstance(comp, Plain))
+        # 文本拼 Plain；图片等媒体组件用占位符，避免纯图片/图文混合回复
+        # 的轮次被静默跳过结算。
+        parts = []
+        for comp in res.chain:
+            if isinstance(comp, Plain):
+                parts.append(comp.text)
+            elif isinstance(comp, Image):
+                parts.append("[图片]")
+        bot_reply = "".join(parts)
         if not bot_reply.strip() or not user_text.strip():
             return
         self._tasks.spawn(
@@ -1145,7 +1186,11 @@ class EmotionFavourPlugin(Star):
         favour: Optional[int] = None,
         emotion_updates: Optional[dict] = None,
     ) -> bool:
-        """仅当结算启动后的 persona epoch 未变化时写入结果。"""
+        """仅当结算启动后的 persona epoch 未变化时写入结果。
+
+        返回 False 仅表示人格状态已变化（写入被拒绝）；
+        数据库写入失败会抛异常并记录完整 traceback。
+        """
         async with self._persona_mutations.write(
             persona_id,
             expected_epoch=mutation_epoch,
@@ -1156,12 +1201,17 @@ class EmotionFavourPlugin(Star):
                     f"persona={persona_id} user={user_id}"
                 )
                 return False
-            return await self.db.update_favour(
+            if not await self.db.update_favour(
                 persona_id,
                 user_id,
                 favour=favour,
                 emotion_updates=emotion_updates,
-            )
+            ):
+                raise RuntimeError(
+                    f"update_favour 写入失败: persona={persona_id} "
+                    f"user={user_id}"
+                )
+            return True
 
     @filter.on_decorating_result(priority=15)
     async def _on_session_reset(self, event: AstrMessageEvent):
@@ -1179,6 +1229,8 @@ class EmotionFavourPlugin(Star):
         except Exception as e:
             logger.warning(f"{self._tag(event)} 会话重置情感批量重置失败: {e}")
 
+    # ================= 后台结算 =================
+
     async def _calculate_favour_bg(
         self,
         event: AstrMessageEvent,
@@ -1191,6 +1243,8 @@ class EmotionFavourPlugin(Star):
         try:
             user_id = event.get_sender_id()
             umo = event.unified_msg_origin
+            tag = self._tag(event)
+            transient_favour: Optional[int] = None
             persona_id = persona_id or await self._get_persona_id(event)
             if mutation_epoch is None:
                 mutation_epoch = await self._persona_mutations.try_epoch(persona_id)
@@ -1203,7 +1257,7 @@ class EmotionFavourPlugin(Star):
             else:
                 provider_id = await self.context.get_current_chat_provider_id(umo=umo)
             if not provider_id:
-                logger.warning(f"{self._tag(event)} 未找到可用的 LLM Provider 进行印象结算")
+                logger.warning(f"{tag} 未找到可用的 LLM Provider 进行印象结算")
                 return
 
             # 获取人设性格摘要
@@ -1248,6 +1302,9 @@ class EmotionFavourPlugin(Star):
 
             record = await self.db.get_favour(persona_id, user_id)
             if record:
+                # 好感 transient 值必须先于任何写库计算：情感衰减落盘会刷新
+                # updated_at，之后再算 Δt≈0，会吞掉好感时间衰减。
+                transient_favour = self._decay_favour_value(record)
                 # 情感时间衰减
                 if self.emotion_decay_enabled:
                     decayed, elapsed_hours = apply_emotion_decay(
@@ -1267,8 +1324,11 @@ class EmotionFavourPlugin(Star):
                         ):
                             return
                         record = await self.db.get_favour(persona_id, user_id)
-                        logger.info(f"{self._tag(event)} 情感衰减: 用户 {user_id}, {elapsed_hours:.1f}h, {list(decayed.keys())}")
-                current_favour = self._decay_favour_value(record)
+                        logger.info(
+                            f"{tag} 情感衰减: 用户 {user_id}, "
+                            f"{elapsed_hours:.1f}h, {list(decayed.keys())}"
+                        )
+                current_favour = transient_favour
                 emotion_panel = build_emotion_panel(record)
             else:
                 current_favour = await self._get_initial_favour(event)
@@ -1305,7 +1365,7 @@ class EmotionFavourPlugin(Star):
                 f"【当前状态】好感度:{current_favour} 情感:{emotion_panel}\n"
                 f"{current_rule}"
                 f"{history_section}"
-                f"【互动】\n用户: {user_text}\n角色: {bot_reply}\n\n"
+                f"{build_interaction_section(user_text, bot_reply)}"
                 f"{mode_rule}\n\n"
                 "<rule>\n"
                 f"好感度: {self.favour_change_min}~+{self.favour_change_max}，善意互动为正、冒犯为负、普通为0\n"
@@ -1324,7 +1384,7 @@ class EmotionFavourPlugin(Star):
                 "XML："
             )
 
-            logger.debug(f"{self._tag(event)} 印象结算上下文:\n{eval_prompt}")
+            logger.debug(f"{tag} 印象结算上下文:\n{eval_prompt}")
 
             resp = await self._judge_generate(
                 provider_id=provider_id,
@@ -1336,7 +1396,9 @@ class EmotionFavourPlugin(Star):
             result_cleaned = re.sub(r'```(?:xml)?\s*', '', result_text).strip()
             xml_match = re.search(r'<result>.*?</result>', result_cleaned, re.DOTALL)
             if not xml_match:
-                logger.warning(f"{self._tag(event)} 印象结算未在模型回复中找到 XML: {result_text}")
+                logger.warning(
+                    f"{tag} 印象结算未在模型回复中找到 XML: {result_text}"
+                )
                 return
             try:
                 import xml.etree.ElementTree as ET
@@ -1351,35 +1413,47 @@ class EmotionFavourPlugin(Star):
                     for child in emotions_elem:
                         data["emotions"][child.tag.lower()] = (child.text or "0").strip()
             except Exception as e:
-                logger.warning(f"{self._tag(event)} 印象结算 XML 解析失败: {result_text} ({e})")
+                logger.warning(
+                    f"{tag} 印象结算 XML 解析失败: {result_text} ({e})"
+                )
                 return
 
             delta = int(round(float(data.get("change", 0))))
+            # clamp 到配置的单轮变化范围，防止模型幻觉输出大幅跳变
+            delta = max(
+                self.favour_change_min,
+                min(self.favour_change_max, delta),
+            )
             raw_emotions = data.get("emotions", {})
             reasoning = data.get("reasoning", "")
             if reasoning:
-                logger.debug(f"{self._tag(event)} 印象结算推理: {reasoning}")
+                logger.debug(f"{tag} 印象结算推理: {reasoning}")
 
             if delta == 0 and not raw_emotions:
                 # 即使裁决无变化，也要把当前衰减后的值落盘并刷新 updated_at，
                 # 否则下次读取仍从旧 updated_at 起算 Δt，衰减会重复累积。
                 record = await self.db.get_favour(persona_id, user_id)
                 if record and self.favour_decay_enabled:
-                    decayed_fav = self._decay_favour_value(record)
-                    if decayed_fav != record.favour:
+                    if transient_favour is not None and transient_favour != record.favour:
                         if not await self._update_settlement_record(
                             persona_id,
                             user_id,
                             mutation_epoch,
-                            favour=decayed_fav,
+                            favour=transient_favour,
                         ):
                             return
-                        logger.info(f"{self._tag(event)} 印象结算无变化，刷新衰减基线 user={user_id} {record.favour}->{decayed_fav}")
-                logger.debug(f"{self._tag(event)} 印象结算无变化 user={user_id}")
+                        logger.info(
+                            f"{tag} 印象结算无变化，刷新衰减基线 user={user_id} "
+                            f"{record.favour}->{transient_favour}"
+                        )
+                logger.debug(f"{tag} 印象结算无变化 user={user_id}")
                 return
 
             record = await self.db.get_favour(persona_id, user_id)
-            old_fav = self._decay_favour_value(record) if record else await self._get_initial_favour(event)
+            if record:
+                old_fav = transient_favour if transient_favour is not None else record.favour
+            else:
+                old_fav = await self._get_initial_favour(event)
 
             new_fav = max(self.min_favour_value, min(self.max_favour_value, old_fav + delta))
 
@@ -1408,9 +1482,17 @@ class EmotionFavourPlugin(Star):
                 emotion_updates=clamped_emotions if clamped_emotions else None,
             ):
                 return
-            logger.info(f"{self._tag(event)} 用户 {user_id} 结算: 好感值 {old_fav}->{new_fav} (Δ{delta}){', 情感: ' + str(clamped_emotions) if clamped_emotions else ''}")
+            logger.info(
+                f"{tag} 用户 {user_id} 结算: 好感值 {old_fav}->{new_fav} "
+                f"(Δ{delta})"
+                f"{', 情感: ' + str(clamped_emotions) if clamped_emotions else ''}"
+            )
         except Exception as e:
-            logger.error(f"{self._tag(event)} 印象后台结算出错: {str(e)}\n{traceback.format_exc()}")
+            tag_fallback = locals().get("tag") or "[EmotionFavour]"
+            logger.error(
+                f"{tag_fallback} 印象后台结算出错: {str(e)}\n"
+                f"{traceback.format_exc()}"
+            )
 
     # ================= 人设摘要 =================
 
@@ -1479,8 +1561,8 @@ class EmotionFavourPlugin(Star):
         if record:
             fav = self._decay_favour_value(record)
         else:
-            sender_id = str(event.get_sender_id())
-            fav = await self._get_initial_favour(event) if target_uid == sender_id else 0
+            # 无记录目标按初始值展示（特殊用户 50 等），与落库起算值一致
+            fav = await self._get_initial_favour_for(event, target_uid)
             record = FavourRecord(persona_id=persona_id, user_id=target_uid, favour=fav)
 
         name = await get_user_display_name(event, target_uid)

@@ -33,17 +33,17 @@ class TestMigrateV0ToV1(unittest.TestCase):
             }
         }
         migrate(cfg)
-        self.assertEqual(cfg["config_version"], 1)
+        self.assertEqual(cfg["config_version"], CURRENT_CONFIG_VERSION)
         ac = cfg["relationship_config"]["advance_config"]
         self.assertIsInstance(ac, list)
         self.assertEqual(ac[0]["__template_key"], "custom")
         self.assertEqual(ac[0]["describe"], "失望")
         self.assertEqual(ac[1]["rule"], "...")
 
-    def test_v1_already_migrated_noop(self):
-        """已是 v1 配置应保持完全不变（字节级）"""
+    def test_current_version_noop(self):
+        """已是当前版本配置应保持完全不变（字节级）"""
         cfg = {
-            "config_version": 1,
+            "config_version": CURRENT_CONFIG_VERSION,
             "relationship_config": {"mode": "advance", "advance_config": [{"describe": "X"}]},
         }
         before = json.dumps(cfg, sort_keys=True)
@@ -64,7 +64,7 @@ class TestMigrateV0ToV1(unittest.TestCase):
         """缺 config_version 字段视为 v0"""
         cfg = {"relationship_config": {"mode": "advance", "advance_config": "[]"}}
         migrate(cfg)
-        self.assertEqual(cfg["config_version"], 1)
+        self.assertEqual(cfg["config_version"], CURRENT_CONFIG_VERSION)
         self.assertEqual(cfg["relationship_config"]["advance_config"], [])
 
     def test_non_dict_safe(self):
@@ -83,14 +83,14 @@ class TestMigrateV0ToV1(unittest.TestCase):
             },
         }
         migrate(cfg)
-        self.assertEqual(cfg["config_version"], 1)
+        self.assertEqual(cfg["config_version"], CURRENT_CONFIG_VERSION)
         self.assertNotIn("__template_key", cfg["relationship_config"]["advance_config"][0])
 
     def test_missing_relationship_config(self):
         """relationship_config 整节缺失视为符合新版本"""
         cfg = {"config_version": 0, "favour_mode": "normal"}
         migrate(cfg)
-        self.assertEqual(cfg["config_version"], 1)
+        self.assertEqual(cfg["config_version"], CURRENT_CONFIG_VERSION)
 
 
 class TestMigrateFramework(unittest.TestCase):

@@ -7,8 +7,46 @@ class TestPluginSettings(unittest.TestCase):
     def test_runtime_default_matches_schema(self):
         settings = PluginSettings.from_mapping({})
         self.assertEqual(settings.favour_mode, "normal")
-        self.assertEqual(settings.settlement_max_concurrency, 3)
         self.assertEqual(settings.backup_retention_days, 0)
+        self.assertEqual(settings.judge_request_max_retries, 5)
+
+    def test_judge_retries_clamped_to_valid_range(self):
+        settings = PluginSettings.from_mapping({
+            "advanced_config": {
+                "judge_request_max_retries": 0,
+            },
+        })
+        self.assertEqual(settings.judge_request_max_retries, 1)
+        settings = PluginSettings.from_mapping({
+            "advanced_config": {
+                "judge_request_max_retries": 99,
+            },
+        })
+        self.assertEqual(settings.judge_request_max_retries, 10)
+        settings = PluginSettings.from_mapping({
+            "advanced_config": {
+                "judge_request_max_retries": "abc",
+            },
+        })
+        self.assertEqual(settings.judge_request_max_retries, 5)
+
+    def test_judge_retries_accept_positive_values(self):
+        settings = PluginSettings.from_mapping({
+            "advanced_config": {
+                "judge_request_max_retries": 3,
+            },
+        })
+        self.assertEqual(settings.judge_request_max_retries, 3)
+
+    def test_log_with_bot_id_reads_top_level(self):
+        self.assertFalse(PluginSettings.from_mapping({}).log_with_bot_id)
+        settings = PluginSettings.from_mapping({"log_with_bot_id": True})
+        self.assertTrue(settings.log_with_bot_id)
+        # 旧 log_config 组不再被读取（一次性迁移已废弃，升级后需手动配置）
+        settings = PluginSettings.from_mapping({
+            "log_config": {"log_with_bot_id": True},
+        })
+        self.assertFalse(settings.log_with_bot_id)
 
     def test_ids_and_ranges_are_normalized(self):
         settings = PluginSettings.from_mapping({

@@ -1,4 +1,10 @@
 {
+  "log_with_bot_id": {
+    "description": "日志区分机器人实例",
+    "type": "bool",
+    "default": false,
+    "hint": "启用后日志前缀附加平台实例标识（模块名始终保留），便于多 Bot 实例环境定位问题。日志等级请在 WebUI 插件详情页按插件调整（运行期生效，无需重启）。"
+  },
   "favour_mode": {
     "description": "好感度判定模式",
     "type": "string",
@@ -255,42 +261,23 @@
         "default": 0,
         "hint": "0 表示永久保留；设置为正整数时，插件初始化和新建备份后会清理超过天数的有效 JSON 业务备份。数据库迁移生成的 SQLite .db 安全备份不自动删除。"
       },
-      "settlement_max_concurrency": {
-        "description": "后台裁决最大并发数",
+      "judge_request_max_retries": {
+        "description": "裁决 LLM 请求最大尝试次数",
         "type": "int",
-        "default": 3,
-        "hint": "好感结算和人设摘要共用的后台 LLM 并发上限。值过大会增加 Provider 压力；同一 persona/user 始终串行结算。"
+        "default": 5,
+        "hint": "好感结算与人设摘要 LLM 调用的最大尝试次数（含首次请求），范围 1-10。默认 5；设为 1 表示失败不重试。"
       },
       "settlement_timeout_seconds": {
         "description": "后台裁决超时/秒",
         "type": "float",
         "default": 60.0,
-        "hint": "单次好感结算或人设摘要 LLM 调用的最长等待时间，范围运行时钳制为 5-300 秒。"
+        "hint": "单次好感结算或人设摘要 LLM 调用的整体超时上限（含 Provider 内部重试），范围运行时钳制为 5-300 秒。"
       },
       "terminate_flush_timeout_seconds": {
         "description": "插件终止任务收尾时间/秒",
         "type": "float",
         "default": 8.0,
         "hint": "插件禁用或热重载时，允许正在进行的短期数据库/裁决任务完成的最长时间；超时后取消。"
-      }
-    }
-  },
-  "log_config": {
-    "description": "日志配置",
-    "type": "object",
-    "hint": "控制日志前缀格式与调试级别。",
-    "items": {
-      "log_with_bot_id": {
-        "description": "日志区分机器人实例",
-        "type": "bool",
-        "default": false,
-        "hint": "启用后，日志前缀从 [EmotionFavour] 变为 [EmotionFavour:机器人ID]，便于多 Bot 实例环境下定位问题。"
-      },
-      "debug_to_info": {
-        "description": "调试日志提级",
-        "type": "bool",
-        "default": false,
-        "hint": "启用后，所有 debug 级别日志以 info 级别输出，无需调整后端日志级别即可查看详细运行信息。插件热重载即可生效。"
       }
     }
   }

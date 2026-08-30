@@ -1,6 +1,9 @@
 # utils.py
 # 通用工具函数
 import string
+import time
+from pathlib import Path
+from typing import Optional
 
 from astrbot.core.message.components import At
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
@@ -47,6 +50,31 @@ def escape_markdown(text: str) -> str:
     for char, entity in mapping.items():
         text = text.replace(char, entity)
     return text
+
+
+def cleanup_old_files(
+    directory: Path,
+    *,
+    suffix: str,
+    max_age_days: int = 7,
+    now: Optional[float] = None,
+) -> int:
+    """删除目录中修改时间早于 max_age_days 天的匹配文件，返回删除数。
+
+    用于 T2I 渲染缓存等持续累积的临时产物；单个文件删除失败静默跳过。
+    """
+    if not directory.is_dir():
+        return 0
+    cutoff = (now if now is not None else time.time()) - max_age_days * 86400
+    removed = 0
+    for path in directory.glob(f"*{suffix}"):
+        try:
+            if path.is_file() and path.stat().st_mtime < cutoff:
+                path.unlink()
+                removed += 1
+        except OSError:
+            continue
+    return removed
 
 
 async def get_user_display_name(event: AstrMessageEvent, user_id: str) -> str:

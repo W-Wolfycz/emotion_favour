@@ -405,6 +405,8 @@ class FavourDBManager:
         path = (backup_dir / name).resolve()
         if path.parent != backup_dir:
             raise ValueError("备份文件路径无效")
+        if path.is_symlink():
+            raise ValueError("备份文件路径无效")
         if not path.is_file():
             raise ValueError("备份文件不存在")
         if path.stat().st_size > 64 * 1024 * 1024:

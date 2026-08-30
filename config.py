@@ -61,12 +61,11 @@ class PluginSettings:
     favour_decay_anchor: int
     backup_retention_days: int
 
-    settlement_max_concurrency: int
     settlement_timeout_seconds: float
     terminate_flush_timeout_seconds: float
+    judge_request_max_retries: int
 
     log_with_bot_id: bool
-    debug_to_info: bool
 
     warnings: tuple[str, ...]
 
@@ -130,10 +129,6 @@ class PluginSettings:
             standard = _clamp(_as_float(adv.get("emotion_decay_rate_standard"), 0.85), 0.0, 1.0)
             sticky = _clamp(_as_float(adv.get("emotion_decay_rate_sticky"), 0.93), 0.0, 1.0)
 
-        log_conf = config.get("log_config", {}) or {}
-        if not isinstance(log_conf, Mapping):
-            log_conf = {}
-
         default_favour = _clamp(
             _as_int(config.get("default_favour"), 0), min_favour, max_favour,
         )
@@ -176,11 +171,12 @@ class PluginSettings:
             backup_retention_days=max(
                 0, _as_int(adv.get("backup_retention_days"), 0),
             ),
-            settlement_max_concurrency=_clamp(_as_int(adv.get("settlement_max_concurrency"), 3), 1, 32),
             settlement_timeout_seconds=_clamp(_as_float(adv.get("settlement_timeout_seconds"), 60.0), 5.0, 300.0),
             terminate_flush_timeout_seconds=_clamp(_as_float(adv.get("terminate_flush_timeout_seconds"), 8.0), 1.0, 60.0),
-            log_with_bot_id=bool(log_conf.get("log_with_bot_id", False)),
-            debug_to_info=bool(log_conf.get("debug_to_info", False)),
+            judge_request_max_retries=_clamp(
+                _as_int(adv.get("judge_request_max_retries"), 5), 1, 10,
+            ),
+            log_with_bot_id=bool(config.get("log_with_bot_id", False)),
             warnings=tuple(warnings),
         )
 

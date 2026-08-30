@@ -66,6 +66,9 @@ TONE_INSTRUCTIONS = {
 
 TICK_SECONDS = 180
 
+# 结算提示词中单条互动文本的最大字符数，防止超长消息撑爆上下文
+MAX_INTERACTION_CHARS = 2000
+
 
 class EmotionRecord(Protocol):
     favour: int
@@ -346,4 +349,23 @@ def format_emotion_detail(
         f"🎭 主导情感：{dominant}\n\n"
         f"【情感维度详情】\n\n"
         f'<div style="font-family:Consolas,monospace;white-space:pre;color:#2c3e50;line-height:1.8;">{dimensions}</div>'
+    )
+
+
+def build_interaction_section(user_text: str, bot_reply: str) -> str:
+    """构造结算提示词中的「【互动】」段落。
+
+    单段互动格式；文本截断到 MAX_INTERACTION_CHARS，防止超长消息撑爆上下文。
+    """
+
+    def _clip(text) -> str:
+        text = str(text or "")
+        if len(text) <= MAX_INTERACTION_CHARS:
+            return text
+        return text[:MAX_INTERACTION_CHARS] + "…(截断)"
+
+    return (
+        "【互动】\n"
+        f"用户: {_clip(user_text)}\n"
+        f"角色: {_clip(bot_reply)}\n\n"
     )

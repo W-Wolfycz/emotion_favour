@@ -31,9 +31,9 @@ emotion_favour/
 ├── storage.py           # 数据库模型与管理（SQLModel + aiosqlite，兼容导出 domain 函数）
 ├── config.py            # 类型化配置读取与运行时校验
 ├── runtime.py           # 后台任务监督器与 keyed lock
-├── migrate.py           # 配置版本链式迁移（v0→v1→...）
+├── migrate.py           # 配置版本链式迁移
 ├── utils.py             # 工具函数
-├── log.py               # 日志器与 debug_to_info 适配
+├── log.py               # 包内日志出口（跟随 AstrBot 核心插件 logger）
 ├── _conf_schema.json    # 配置项定义
 ├── custom_t2i.html      # T2I 图片渲染模板
 ├── pages/webui/         # AstrBot Plugin Page 管理台
@@ -88,18 +88,20 @@ emotion_favour/
 | `favour_decay_enabled` | 启用好感度时间衰减（与情感衰减独立，lazy 求值） | true |
 | `favour_decay_anchor` | 好感度衰减锚点（高于锚点部分向其回归，≤ 锚点不衰减） | 50 |
 | `backup_retention_days` | JSON 业务备份保留天数；0 为永久保留，迁移 `.db` 不自动删除 | 0 |
-| `settlement_max_concurrency` | 后台裁决 LLM 最大并发数 | 3 |
+| `judge_request_max_retries` | 裁决 LLM 请求最大尝试次数（含首次，1-10；默认 5，设为 1 表示失败不重试） | 5 |
 | `settlement_timeout_seconds` | 好感度结算与人设摘要共用的裁决超时（秒） | 60 |
 | `terminate_flush_timeout_seconds` | 终止时等待短任务完成的最长时间（秒） | 8 |
 | `admin_default_favour` | 特殊用户初始好感度 | 50 |
 | `favour_envoys` | 特殊关系用户 ID 列表 | [] |
 
-### 日志配置（log_config）
+### 日志配置
 
 | 配置项 | 说明 | 默认值 |
 |--------|------|--------|
-| `log_with_bot_id` | 日志前缀附加机器人实例 ID | false |
-| `debug_to_info` | debug 日志提级为 info 输出（含查询诊断） | false |
+| `log_with_bot_id` | 日志前缀附加机器人实例 ID（多 Bot 环境便于定位） | false |
+
+日志等级不再由插件配置控制：请到 WebUI 插件详情页调整本插件的日志等级，
+运行期生效、无需重启（AstrBot 4.27+ 支持按插件独立设置）。
 
 ### 名字解析规则
 

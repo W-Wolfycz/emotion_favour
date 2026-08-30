@@ -1,5 +1,29 @@
 # 更新日志
 
+## 3.4.4 — 2026-08-30
+
+### 修复
+
+- **tool 调用配对清洗**：`on_llm_request` 清洗历史上下文时，携带 `tool_calls` 的 assistant 消息即使正文清洗后为空也保留，`role=tool` 输出不再因清洗为空被丢弃，避免生成失去配对的 function_call_output 导致上游（OpenAI Responses / opencode 等）以 400 拒绝请求。
+- **双衰减同轮互斥**：情感衰减先落盘会刷新 `updated_at`，导致同轮好感时间衰减 Δt 恒为 0 被系统性吞掉；改为先按旧时间戳计算好感 transient 值，与情感衰减共用基线。
+- **裁决变化量钳制**：LLM 输出的 `change` 钳制到 `favour_change_min/max`，与 12 维情感 clamp 规则一致；`update_favour` 写入失败改为抛异常记录完整 traceback，只有人格变更导致的写入被拒才静默返回。
+- **历史按 role 组装**：原生历史不再按索引奇偶配对 user/assistant，非交替历史（`/reset` 后、bot 主动消息）不再错位。
+- **多模态内容保护**：清洗历史仅处理字符串 content，list/None 内容原样保留。
+- **纯图片回复结算**：回复链中的图片组件以 `[图片]` 占位参与结算，不再静默跳过该轮；互动文本截断到 2000 字符防止超长消息撑爆上下文。
+
+### 新增
+
+- **裁决 LLM 重试次数配置**：新增 `advanced_config.judge_request_max_retries`（默认 5，范围 1-10），透传给 Provider 的 `request_max_retries`；设为 1 表示失败不重试。
+
+### 变更
+
+- **并发配置移除**：删除 `advanced_config.settlement_max_concurrency` 与后台裁决全局并发闸；同一 persona/user 的串行仍由记录锁保证。
+- **T2I 渲染缓存清理**：初始化时删除 `t2i_output/` 中超过 7 天的 PNG 渲染缓存，防止无限累积。
+- **日志配置组扁平化**：`log_config` 组改为顶层 `log_with_bot_id`，移除 `debug_to_info` 提级开关，日志等级改由 WebUI 插件详情页按插件调整（运行期生效）；旧组值不自动迁移，升级后需手动配置。
+- **测试套件精简**：删除依赖真实 `astrbot.core` 与 sqlmodel/aiofiles 的 `test_storage_db.py`，数据库持久化与迁移行为由部署端验收。
+
+测试：96 项 Python 单元测试 + 3 项 Node 前端逻辑测试。
+
 ## 3.4.3
 2026-08-06
 
