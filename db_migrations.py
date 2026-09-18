@@ -218,16 +218,51 @@ FAVOUR_COLUMNS = (
     "anticipation", "pride", "guilt", "shame", "envy",
 )
 PERSONA_SUMMARY_COLUMNS = ("id", "persona_id", "summary", "persona_hash", "updated_at")
+TIER_SCRIPT_COLUMNS = (
+    "id", "persona_id", "tier_key", "tier_label", "script", "persona_hash", "updated_at",
+)
 
 
 def validate_favour_schema(connection: sqlite3.Connection) -> None:
     """验证当前 ORM 依赖的表、列和唯一约束；允许保留未知旧列。"""
     require_columns(connection, "favour_records", FAVOUR_COLUMNS)
     require_columns(connection, "persona_summaries", PERSONA_SUMMARY_COLUMNS)
+    require_columns(connection, "persona_tier_scripts", TIER_SCRIPT_COLUMNS)
     if ("persona_id", "user_id") not in unique_index_columns(connection, "favour_records"):
         raise MigrationError("favour_records 缺少 (persona_id, user_id) 唯一约束")
     if ("persona_id",) not in unique_index_columns(connection, "persona_summaries"):
         raise MigrationError("persona_summaries 缺少 persona_id 唯一约束")
+    if ("persona_id", "tier_key") not in unique_index_columns(
+        connection, "persona_tier_scripts"
+    ):
+        raise MigrationError("persona_tier_scripts 缺少 (persona_id, tier_key) 唯一约束")
+
+
+TIER_SCRIPT_DDL = """
+    CREATE TABLE IF NOT EXISTS persona_tier_scripts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        persona_id TEXT NOT NULL DEFAULT '',
+        tier_key TEXT NOT NULL DEFAULT '',
+        tier_label TEXT NOT NULL DEFAULT '',
+        script TEXT NOT NULL DEFAULT '',
+        persona_hash TEXT NOT NULL DEFAULT '',
+        updated_at DATETIME,
+        CONSTRAINT uq_persona_tier_script UNIQUE (persona_id, tier_key)
+    )
+"""
+
+
+def ensure_tier_scripts_table(connection: sqlite3.Connection) -> None:
+    """建立档位描述表（幂等）。
+
+    必须走迁移链：final_validator 在 runner 内部执行，若建表留在 runner 之后，
+    存量库升级时会先因「缺少数据库表: persona_tier_scripts」判失败。
+    """
+    connection.execute(TIER_SCRIPT_DDL)
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS ix_persona_tier_scripts_pid "
+        "ON persona_tier_scripts (persona_id)"
+    )
 
 
 def add_emotion_columns(connection: sqlite3.Connection) -> None:

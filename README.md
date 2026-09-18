@@ -8,10 +8,10 @@
 - **12维情感模型**：喜悦、信任、恐惧、惊讶、悲伤、厌恶、愤怒、期待、得意、内疚、害羞、嫉妒
 - **情感代谢**：负面消解（愤怒/悲伤等随善意互动消退）+ 激情冷却（惊讶/害羞等瞬时情绪回落）
 - **情感时间衰减**：长时间未互动的用户情感自然回归 baseline，防止情绪永久累积
-- **好感度时间衰减**：与情感衰减独立，采用 lazy 求值（读时计算、不跑定时任务），偏离锚点越远衰减越快；仅在裁决模型结算时落盘新值与时间戳
+- **好感度时间衰减**：与情感衰减独立，采用 lazy 求值（读时计算、不跑定时任务），偏离锚点越远衰减越快；仅在后台任务模型结算时落盘新值与时间戳
 - **关系区间进度**：对话注入会告诉 AI 当前好感在所处关系区间内的积累百分比（刚进入/稳定/接近下一阶段/巅峰），对冲衰减带来的挫败感，让"刷好感"有可见的进度反馈
 - **互动边界与过渡预告**：advance 模式下每个关系等级可配置 `boundary`（允许/回避的身体接触动作清单，注入对话）、`preview`（高进度时预告下一等级的入门动作）、`rule`（此等级的加分/扣分判定规则，后台结算用）——三者解耦对话行为与数值结算
-- **人设性格摘要**：AI 自动从人设文本提取性格特征摘要，辅助裁决模型判断
+- **人设性格摘要**：AI 自动从人设文本提取性格特征摘要，辅助后台任务模型判断
 - **人格隔离**：不同人格拥有独立的好感度记录
 - **对话上下文集成**：可选集成 chat_memory 插件，按用户 ID 隔离读取对话历史
 - **备份与恢复**：管理台可创建、查看、恢复并删除当前人格备份；清空和恢复操作自动保留保护备份
@@ -31,17 +31,17 @@ emotion_favour/
 ├── storage.py           # 数据库模型与管理（SQLModel + aiosqlite，兼容导出 domain 函数）
 ├── config.py            # 类型化配置读取与运行时校验
 ├── runtime.py           # 后台任务监督器与 keyed lock
-├── migrate.py           # 配置版本链式迁移
 ├── utils.py             # 工具函数
 ├── log.py               # 包内日志出口（跟随 AstrBot 核心插件 logger）
 ├── _conf_schema.json    # 配置项定义
-├── custom_t2i.html      # T2I 图片渲染模板
+├── custom_t2i.html      # T2I 图片渲染模板（纸笺样式）
+├── fonts/               # 出图自带手写体（站酷小薇 / 站酷快乐体 / 马善政毛笔楷书）
 ├── pages/webui/         # AstrBot Plugin Page 管理台
 ├── tests/               # 无 AstrBot 环境可运行的回归测试
 ├── docs/                # 版本改造与架构说明
 ├── metadata.yaml
 ├── requirements.txt
-└── LOGO.png
+└── logo.png
 ```
 
 ## 配置项
@@ -53,9 +53,8 @@ emotion_favour/
 | `favour_mode` | 好感度判定模式（galgame / normal / realistic） | normal |
 | `min_favour_value` / `max_favour_value` | 好感度范围 | -100 / 100 |
 | `default_favour` | 新用户初始好感度 | 0 |
-| `judge_provider` | 裁决模型（留空跟随当前对话模型） | — |
+| `llm_provider` | 后台任务模型（好感结算 / 人设摘要 / 档位描述生成；留空跟随当前会话的对话模型） | — |
 | `relationship_config` | 关系映射（simple 列表 / advance 自定义区间） | simple |
-| `config_version` | 配置版本号（**自动管理**，插件启动时链式迁移旧配置） | 0 |
 
 ### 关系映射配置（relationship_config）
 
@@ -69,7 +68,7 @@ emotion_favour/
 | `describe` / `min_value` / `max_value` | 关系名 + 区间匹配 | 等级名称；好感度落在 [min, max] 内则匹配此等级 |
 | `boundary` | 对话 `<情感好感>` 标签 | 允许/回避的身体接触动作，决定 LLM 在当前好感度下的接触尺度 |
 | `preview` | 对话（高进度时） | 本区间积累到 80% 以上时额外注入下一等级的入门动作预告 |
-| `rule` | 后台裁决 prompt | 此等级下什么样的互动会扣分/加分，只影响数值结算 |
+| `rule` | 后台 LLM 任务 prompt | 此等级下什么样的互动会扣分/加分，只影响数值结算 |
 
 > ⚠️ 区间不可重叠——建议等级间留 1 间隙（A=0-30、B=31-60、C=61-100）。老版 JSON 字符串配置会在启动时自动迁移到 template_list 格式。
 
@@ -79,7 +78,7 @@ emotion_favour/
 |--------|------|--------|
 | `favour_change_min` / `favour_change_max` | 好感度单次变化范围 | -5 / 5 |
 | `emotion_change_min` / `emotion_change_max` | 情感维度单次变化范围 | -10 / 5 |
-| `history_rounds` | 裁决模型参考的近期对话轮数（0-10） | 0 |
+| `history_rounds` | 后台任务模型参考的近期对话轮数（0-10） | 0 |
 | `use_chat_memory` | 启用 chat_memory 插件提供按用户隔离的对话上下文 | false |
 | `emotion_decay_enabled` | 启用情感时间衰减 | true |
 | `emotion_decay_rate_volatile` | 挥发组衰减率（surprise/anticipation） | 0.7 |
@@ -88,8 +87,9 @@ emotion_favour/
 | `favour_decay_enabled` | 启用好感度时间衰减（与情感衰减独立，lazy 求值） | true |
 | `favour_decay_anchor` | 好感度衰减锚点（高于锚点部分向其回归，≤ 锚点不衰减） | 50 |
 | `backup_retention_days` | JSON 业务备份保留天数；0 为永久保留，迁移 `.db` 不自动删除 | 0 |
-| `judge_request_max_retries` | 裁决 LLM 请求最大尝试次数（含首次，1-10；默认 5，设为 1 表示失败不重试） | 5 |
-| `settlement_timeout_seconds` | 好感度结算与人设摘要共用的裁决超时（秒） | 60 |
+| `llm_request_max_retries` | 后台 LLM 请求最大尝试次数（含首次，1-10；默认 5，设为 1 表示失败不重试） | 5 |
+| `tier_script_enabled` | `/emotion me` 出图底部是否显示当前档位的角色自述（启动后自动补齐，关闭则完全不生成） | true |
+| `settlement_timeout_seconds` | 好感度结算与人设摘要共用的后台调用超时（秒） | 60 |
 | `terminate_flush_timeout_seconds` | 终止时等待短任务完成的最长时间（秒） | 8 |
 | `admin_default_favour` | 特殊用户初始好感度 | 50 |
 | `favour_envoys` | 特殊关系用户 ID 列表 | [] |
@@ -109,7 +109,7 @@ emotion_favour/
 
 - **群聊**：当前群名片（card）> 平台昵称（nickname）> 用户 ID
 - **私聊**：平台昵称（nickname）> 用户 ID
-- `/emotion list` 每页最多即时查询 20 位用户；查询失败时名称列留空，ID 列仍正常显示
+- `/emotion list` 每页最多即时查询 8 位用户；昵称查询失败时名称列回落显示 ID
 
 ## 命令
 
@@ -125,6 +125,7 @@ emotion_favour/
 | `/emotion clear-all` | Bot管理员 | 清空当前人格所有数据（二次确认+自动备份） |
 | `/emotion persona` | Bot管理员 | 查看当前人格的 AI 性格摘要 |
 | `/emotion persona-clear` | Bot管理员 | 清除性格摘要缓存 |
+| `/emotion regenerate` | Bot管理员 | 按当前人格重新生成各关系档位的描述 |
 | `/emotion help` | 所有成员 | 按当前权限显示指令帮助 |
 
 权限固定为两层：所有成员可以查询自己的印象和查看帮助；查询他人、全局查询、修改、清空以及人设摘要管理仅允许 AstrBot `admins_id` 中的 Bot 管理员。插件不再提供高等级群员阈值、群管理员/群主命令列表或“允许查看他人印象的最低等级”等配置。
@@ -145,7 +146,7 @@ Plugin Page 顶栏的备份按钮管理当前选中人格的数据：
 - **删除备份**：可删除当前人格专属的 JSON 备份文件，不影响当前数据库记录。
 - **操作确认**：恢复和删除均在 Plugin Page 内二次确认；确认后才会发送对应请求，取消、Esc 或点击遮罩不会执行操作。
 - **时间兼容**：新备份包含 UTC 时间存储标记；旧版 JSON 备份恢复时会按其生成格式解释历史时间，避免时间偏移影响好感度衰减。
-- **并发保护**：备份会等待已进入数据库的短写入完成；清空、恢复和情感重置会提升人格 epoch，单用户清空会提升记录 epoch。操作开始前已排队或仍在裁决中的旧写入会被丢弃，不会在管理操作后覆盖或重新创建数据。
+- **并发保护**：备份会等待已进入数据库的短写入完成；清空、恢复和情感重置会提升人格 epoch，单用户清空会提升记录 epoch。操作开始前已排队或仍在结算中的旧写入会被丢弃，不会在管理操作后覆盖或重新创建数据。
 - **保留期限**：`backup_retention_days=0` 时永久保留；设为正数后，插件初始化和新建备份时清理过期的有效 JSON 业务备份。正在恢复的文件受保护，SQLite 迁移备份和未知/损坏 JSON 不会自动删除。
 
 迁移前生成的完整 SQLite `.db` 备份不在管理台列表中，仍只用于数据库迁移故障恢复。
@@ -158,8 +159,8 @@ Plugin Page 顶栏的备份按钮管理当前选中人格的数据：
 
 好感度数值随时间向**锚点**回归，与 12 维情感衰减完全独立。
 
-- **lazy 求值**：所有读位点（LLM 注入、个人查询、`/emotion list`、裁决结算）调用纯函数实时计算衰减值，不写库——避免无意义的 UPDATE
-- **唯一落盘点**：裁决模型结算应用 delta 时，通过 `update_favour` 自然刷新 `updated_at`，下一轮读取从此时间戳起算 Δt
+- **lazy 求值**：所有读位点（LLM 注入、个人查询、`/emotion list`、后台结算）调用纯函数实时计算衰减值，不写库——避免无意义的 UPDATE
+- **唯一落盘点**：后台任务模型结算应用 delta 时，通过 `update_favour` 自然刷新 `updated_at`，下一轮读取从此时间戳起算 Δt
 - **σ 简化**：只在 `favour > anchor` 时衰减（高好感会被时间冲淡）；≤ 锚点的好感度（含负面印象）不被拉抬
 - **非线性 ODE**：`γ(x) = γ₀·(1 + u/S)`，偏离锚点越远衰减率越高；封闭解 `x₁ = E + K·S/(1−K)`，`K = a·e^{−γ₀·Δt}`
 - **内置参数**：γ₀=0.005/tick（1 tick=3 min，向下取整）、S=50；锚点 `favour_decay_anchor` 用户可配置
@@ -175,6 +176,17 @@ Plugin Page 顶栏的备份按钮管理当前选中人格的数据：
 - **特殊场景**：特殊用户覆盖关系不注入进度行；挚爱区间（y==x）直接显示 100% 巅峰
 - **与衰减协同**：进度跟着衰减后的 transient 值走，长期不互动 → 进度掉 → AI 表现冷淡，形成"需要维护关系"的自然反馈循环
 
+## 出图样式
+
+所有命令输出走插件自带的 Playwright 模板（`custom_t2i.html`，纸笺风格），宽度统一 800px：
+
+- **字体**：标题、关系名与分组名用站酷小薇（楷），正文与主调名用站酷快乐体，
+  描述与提示（档位描述、进度提示、小标签）用马善政毛笔楷书，数字与西文统一 Georgia；
+  三款字体打包在 `fonts/` 随插件分发（均为 SIL OFL 1.1，来源与许可见 `fonts/README.md`），
+  不依赖用户系统字体。
+- **色调**：正向苔绿、负向陶土、波动麦黄、自我鸢尾紫；12 维面板里主调/副调/余韵只按底色宽度 100% / 68% / 42% 分层，不使用加粗——手写体叠加字重会触发合成加粗并糊掉笔画。
+- **档位描述**：`/emotion me` 底部显示当前档位的一句角色自述，由该人格设定按全部档位一次性生成；插件启动后会自动为已有记录的人格补齐，未配置「后台任务模型」时改为首次查询时生成。`/emotion query` 与 `/emotion list` 不显示。
+
 ## 特殊关系用户
 
 `admin_default_relationship` 非空时，仅 `favour_envoys` 列表中明确填写的用户走特殊关系路径；Bot 管理员、群主和群管理员不会自动加入：
@@ -189,14 +201,14 @@ Plugin Page 顶栏的备份按钮管理当前选中人格的数据：
 
 ## 对话上下文
 
-裁决模型参考的对话历史支持两种来源：
+后台任务模型参考的对话历史支持两种来源：
 
 - **AstrBot 自带上下文**（默认）：从 `conv.history` 读取，群聊场景下所有用户共享上下文
 - **chat_memory 插件**（需安装）：按 `UMO + conversation_id + user_id` 隔离读取，群内每个用户独立历史
 
 > 启用 chat_memory 前需安装其正式版 **≥ 1.0.0**（<https://github.com/W-Wolfycz/chat_memory>）。插件会按当前 resolved persona ID 读取严格配对的 LLM 历史；未安装、版本不兼容或查询失败时，本轮自动回退到 AstrBot 自带上下文。
 
-> 回退路径仅保证裁决仍有历史可用；AstrBot 原生历史不提供与 ChatMemory 等价的 persona 隔离，群聊中也可能包含共享上下文。
+> 回退路径仅保证结算仍有历史可用；AstrBot 原生历史不提供与 ChatMemory 等价的 persona 隔离，群聊中也可能包含共享上下文。
 
 ## 依赖
 

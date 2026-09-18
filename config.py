@@ -36,7 +36,7 @@ class PluginSettings:
     min_favour_value: int
     max_favour_value: int
     default_favour: int
-    judge_provider: str
+    llm_provider: str
 
     relationship_mode: str
     relationship_simple_list: list[str]
@@ -63,7 +63,8 @@ class PluginSettings:
 
     settlement_timeout_seconds: float
     terminate_flush_timeout_seconds: float
-    judge_request_max_retries: int
+    llm_request_max_retries: int
+    tier_script_enabled: bool
 
     log_with_bot_id: bool
 
@@ -121,13 +122,11 @@ class PluginSettings:
             warnings.append("emotion_change_min 大于 emotion_change_max，已交换两者")
             emotion_min, emotion_max = emotion_max, emotion_min
 
-        legacy_rate = adv.get("emotion_decay_rate")
-        if legacy_rate is not None and "emotion_decay_rate_volatile" not in adv:
-            volatile = standard = sticky = _clamp(_as_float(legacy_rate, 0.85), 0.0, 1.0)
-        else:
-            volatile = _clamp(_as_float(adv.get("emotion_decay_rate_volatile"), 0.7), 0.0, 1.0)
-            standard = _clamp(_as_float(adv.get("emotion_decay_rate_standard"), 0.85), 0.0, 1.0)
-            sticky = _clamp(_as_float(adv.get("emotion_decay_rate_sticky"), 0.93), 0.0, 1.0)
+        # 旧单值键 emotion_decay_rate 的兼容分支已删：AstrBot 构造插件配置时会按 schema
+        # 递归补默认值并丢弃 schema 之外的旧键，插件拿到 conf 时它必然不存在。
+        volatile = _clamp(_as_float(adv.get("emotion_decay_rate_volatile"), 0.7), 0.0, 1.0)
+        standard = _clamp(_as_float(adv.get("emotion_decay_rate_standard"), 0.85), 0.0, 1.0)
+        sticky = _clamp(_as_float(adv.get("emotion_decay_rate_sticky"), 0.93), 0.0, 1.0)
 
         default_favour = _clamp(
             _as_int(config.get("default_favour"), 0), min_favour, max_favour,
@@ -142,7 +141,7 @@ class PluginSettings:
             min_favour_value=min_favour,
             max_favour_value=max_favour,
             default_favour=default_favour,
-            judge_provider=str(config.get("judge_provider", "") or "").strip(),
+            llm_provider=str(config.get("llm_provider", "") or "").strip(),
             relationship_mode=relationship_mode,
             relationship_simple_list=simple_list,
             relationship_advance_raw=rel_conf.get("advance_config", []),
@@ -173,9 +172,10 @@ class PluginSettings:
             ),
             settlement_timeout_seconds=_clamp(_as_float(adv.get("settlement_timeout_seconds"), 60.0), 5.0, 300.0),
             terminate_flush_timeout_seconds=_clamp(_as_float(adv.get("terminate_flush_timeout_seconds"), 8.0), 1.0, 60.0),
-            judge_request_max_retries=_clamp(
-                _as_int(adv.get("judge_request_max_retries"), 5), 1, 10,
+            llm_request_max_retries=_clamp(
+                _as_int(adv.get("llm_request_max_retries"), 5), 1, 10,
             ),
+            tier_script_enabled=bool(adv.get("tier_script_enabled", True)),
             log_with_bot_id=bool(config.get("log_with_bot_id", False)),
             warnings=tuple(warnings),
         )

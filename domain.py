@@ -7,7 +7,10 @@
 
 from __future__ import annotations
 
+import html
+import json
 import math
+import re
 from datetime import datetime, timezone
 from typing import Optional, Protocol, Tuple
 
@@ -378,3 +381,315 @@ def build_interaction_section(user_text: str, bot_reply: str) -> str:
         f"角色: {_clip(bot_reply)}\n\n"
     )
 
+
+# ===================== 出图 HTML（paper 纸笺样式） =====================
+# 这些片段由 main.py 拼进 markdown 文本，浏览器端 marked 会原样透传块级 HTML，
+# 再由 custom_t2i.html 的样式渲染。类名与结构契约见模板内注释。
+
+EMOTION_GROUPS_DISPLAY = [
+    ("positive", "正向", ("joy", "trust", "anticipation")),
+    ("negative", "负向", ("sadness", "disgust", "anger")),
+    ("swing", "波动", ("fear", "surprise", "guilt")),
+    ("self", "自我", ("pride", "shame", "envy")),
+]
+
+EMOTION_DISPLAY_GROUP = {
+    dimension: key
+    for key, _label, dimensions in EMOTION_GROUPS_DISPLAY
+    for dimension in dimensions
+}
+
+LEAD_LABELS = ("主调", "副调", "余韵")
+
+EMOTION_HINT = "浓淡起落，皆是心绪的潮汐"
+
+
+def _esc(value) -> str:
+    return html.escape(str("" if value is None else value))
+
+
+def _num(value: float) -> str:
+    """进度类数字：保留一位小数但去掉多余的 .0（44.7 / 100）。"""
+    return f"{value:.1f}".rstrip("0").rstrip(".")
+
+
+def compute_tier_progress(
+    favour: int,
+    *,
+    tier_min: int,
+    tier_max: int,
+    max_favour_value: int,
+    next_tier_min: Optional[int],
+) -> tuple[float, str]:
+    """档位内进度百分比与「距下一级」提示。
+
+    最高档没有下一级，右边界改用 max_favour_value；提示固定为「已满级」。
+    """
+    is_max_tier = next_tier_min is None
+    right = max_favour_value if is_max_tier else tier_max
+    span = right - tier_min
+    if span <= 0:
+        percent = 100.0
+    else:
+        percent = max(0.0, min(100.0, (favour - tier_min) / span * 100))
+    hint = "已满级" if is_max_tier else f"距下一级还需 {max(0, int(next_tier_min) - favour)} 点"
+    return round(percent, 1), hint
+
+
+def build_hero_html(
+    *,
+    favour: int,
+    max_favour: int,
+    relationship: str,
+    who: str,
+    percent: float,
+    hint: str,
+) -> str:
+    shown_percent = _num(percent)
+    return (
+        '<section class="ef-hero">\n'
+        '  <div class="ef-hero-main"><span class="ef-hero-label">好感度</span>'
+        f'<span class="ef-hero-value">{_esc(favour)}</span>'
+        f'<span class="ef-hero-max">/ {_esc(max_favour)}</span></div>\n'
+        f'  <div class="ef-hero-side"><span class="ef-rel">{_esc(relationship)}</span>'
+        f'<span class="ef-who">{_esc(who)}</span></div>\n'
+        f'  <div class="ef-meter" style="--v:{shown_percent}"><i></i></div>\n'
+        f'  <div class="ef-hero-note"><span class="ef-hero-next">{_esc(hint)}</span>'
+        f'<span class="ef-hero-pct">{shown_percent}%</span></div>\n'
+        '</section>'
+    )
+
+
+def _leadbox_html(record: EmotionRecord, top: list) -> list[str]:
+    if not top:
+        return []
+    main_dim, main_value = top[0]
+    lead_group = EMOTION_DISPLAY_GROUP.get(main_dim, "positive")
+    lines = [
+        f'  <div class="ef-leadbox" data-group="{lead_group}">',
+        '    <div class="ef-leadline"><span class="ef-leadline-k">主调</span>'
+        f'<span class="ef-leadline-name">{EMOTION_DISPLAY_NAMES[main_dim]}</span>'
+        f'<span class="ef-leadline-val">{int(main_value)}</span></div>',
+    ]
+    mixes = []
+    for label, (dim, value) in zip(LEAD_LABELS[1:], top[1:]):
+        group = EMOTION_DISPLAY_GROUP.get(dim, "positive")
+        mixes.append(
+            f'<span class="ef-mk" data-group="{group}">{label}</span>'
+            f'<span class="ef-mv">{EMOTION_DISPLAY_NAMES[dim]}</span>'
+            f'<span class="ef-mn">{int(value)}</span>'
+        )
+    if mixes:
+        joined = '<span class="ef-sep"></span>'.join(mixes)
+        lines.append(f'    <div class="ef-mixline ef-mix-a">{joined}</div>')
+    lines.append('  </div>')
+    return lines
+
+
+def _grid_html(record: EmotionRecord, top: list) -> list[str]:
+    rank_of = {dim: index for index, (dim, _value) in enumerate(top)}
+    lines = ['  <div class="ef-grid">']
+    for key, label, dimensions in EMOTION_GROUPS_DISPLAY:
+        lines.append(f'    <div class="ef-group" data-group="{key}">')
+        lines.append(f'      <div class="ef-group-name">{label}</div>')
+        for dimension in dimensions:
+            value = int(getattr(record, dimension, 0) or 0)
+            rank = rank_of.get(dimension)
+            rank_attr = f' data-rank="{rank + 1}"' if rank is not None else ""
+            chip_attr = f' data-lead="{LEAD_LABELS[rank]}"' if rank is not None else ""
+            lines.append(
+                f'      <div class="ef-dim"{rank_attr} style="--v:{value}">'
+                f'<span class="ef-dim-name"{chip_attr}>{EMOTION_DISPLAY_NAMES[dimension]}</span>'
+                f'<span class="ef-dim-val">{value}</span>'
+                '<span class="ef-dim-bar"><i></i></span></div>'
+            )
+        lines.append('    </div>')
+    lines.append('  </div>')
+    return lines
+
+
+def build_emotions_html(record: EmotionRecord) -> str:
+    """主导情感区 + 12 维面板。"""
+    top = get_dominant_emotions(record, 3)
+    lines = [
+        '<div class="ef-emotions">',
+        '  <div class="ef-emotions-head"><span class="ef-emotions-title">情感维度</span>'
+        f'<span class="ef-emotions-hint">{EMOTION_HINT}</span></div>',
+    ]
+    lines.extend(_leadbox_html(record, top))
+    lines.append('  <div class="ef-note-rule"></div>')
+    lines.extend(_grid_html(record, top))
+    lines.append('</div>')
+    return "\n".join(lines)
+
+
+def build_report_html(
+    record: EmotionRecord,
+    *,
+    favour: int,
+    max_favour: int,
+    relationship: str,
+    who: str,
+    percent: float,
+    hint: str,
+    tier_description: str = "",
+) -> str:
+    """`/emotion me` 与 `/emotion query` 的整页内容（档位描述仅自查时传入）。"""
+    blocks = [
+        build_hero_html(
+            favour=favour, max_favour=max_favour, relationship=relationship,
+            who=who, percent=percent, hint=hint,
+        ),
+        build_emotions_html(record),
+    ]
+    if tier_description:
+        blocks.append(f"<blockquote>{_esc(tier_description)}</blockquote>")
+    return "\n\n".join(blocks)
+
+
+def build_list_html(rows: list) -> str:
+    """`/emotion list` 的表体：共用图例 + 每用户两行（数据行 + 柱形/主导情感行）。
+
+    rows 每项为 dict：name / user_id / favour / relationship / record。
+    """
+    lines = ['<div class="ef-bars-legend">']
+    for key, _label, dimensions in EMOTION_GROUPS_DISPLAY:
+        lines.append(f'<div class="ef-bargroup" data-g="{key}">')
+        for dimension in dimensions:
+            lines.append(
+                f'<span class="ef-bar" data-g="{key}"><i></i>'
+                f'<b>{EMOTION_DISPLAY_NAMES[dimension]}</b></span>'
+            )
+        lines.append('</div>')
+    lines.append('<span class="ef-legend-key">柱位对应情绪　·　右侧为三个主导情感</span></div>')
+
+    lines.append('<table>')
+    lines.append('<thead><tr><th>用户</th><th>ID</th><th>好感值</th><th>关系</th></tr></thead>')
+    lines.append('<tbody>')
+    for row in rows:
+        record = row["record"]
+        lines.append(
+            f'<tr><td>{_esc(row["name"])}</td><td>{_esc(row["user_id"])}</td>'
+            f'<td>{_esc(row["favour"])}</td><td>{_esc(row["relationship"])}</td></tr>'
+        )
+        lines.append(
+            '<tr class="ef-subrow"><td colspan="4">'
+            '<div class="ef-subrow-inner"><div class="ef-bars">'
+        )
+        for key, _label, dimensions in EMOTION_GROUPS_DISPLAY:
+            lines.append(f'<div class="ef-bargroup" data-g="{key}">')
+            for dimension in dimensions:
+                value = int(getattr(record, dimension, 0) or 0)
+                lines.append(
+                    f'<span class="ef-bar" data-g="{key}"><i style="--v:{value}"></i></span>'
+                )
+            lines.append('</div>')
+        lines.append('</div>')
+        top = get_dominant_emotions(record, 3)
+        key_text = " · ".join(
+            f"{EMOTION_DISPLAY_NAMES[dim]} ({int(value)})" for dim, value in top
+        ) or "暂无情感记录"
+        lines.append(f'<div class="ef-key">{_esc(key_text)}</div></div></td></tr>')
+    lines.append('</tbody></table>')
+    return "\n".join(lines)
+
+
+# ===================== 档位描述（人设 × 档位） =====================
+
+TIER_SCRIPT_MIN_CHARS = 12
+TIER_SCRIPT_MAX_CHARS = 60
+TIER_SCRIPT_JSON_HINT = '{"tiers": [{"min_value": 0, "script": "…"}]}'
+
+
+def build_tier_script_prompt(persona_prompt: str, tiers: list) -> str:
+    """构造「为每个关系档位写一句角色内心话」的提示词。"""
+    lines = [
+        "你在为一个角色扮演插件撰写「关系档位注解」：同一个角色，面对不同关系距离的用户，"
+        "心里那句没说出口的话。",
+        "",
+        "【角色设定】",
+        (persona_prompt or "（未提供角色设定，按通用人设处理）").strip(),
+        "",
+        "【关系档位】（由低到高）",
+    ]
+    for item in tiers:
+        describe = str(item.get("describe", "") or "").strip()
+        boundary = str(item.get("boundary", "") or "").strip()
+        line = f"- {item.get('min_value', 0)}-{item.get('max_value', 0)}｜{describe}"
+        if boundary:
+            line += f"｜相处边界：{boundary}"
+        lines.append(line)
+    lines.extend([
+        "",
+        "【写作要求】",
+        f"- 每个档位一句，{TIER_SCRIPT_MIN_CHARS}-{TIER_SCRIPT_MAX_CHARS} 字，第一人称，像自言自语",
+        "- 不解释规则、不出现数字与档位名称、不写旁白或动作描写、整句不加引号",
+        "- 档位越低越疏离克制，越高越放松亲近；各档之间要能看出递进，不能只换近义词",
+        "- 贴合角色设定本身的说话习惯与性格，不要写成通用客服话术",
+        "",
+        "【输出】只输出 JSON，不要解释、不要代码块标记：",
+        TIER_SCRIPT_JSON_HINT,
+    ])
+    return "\n".join(lines)
+
+
+def _tier_key(value) -> str:
+    """把档位标识归一成最简数字串：0 / 0.0 / "0" 视为同一档。"""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return str(int(number)) if number.is_integer() else str(number)
+
+
+def parse_tier_script_response(text: str, tiers: list) -> dict:
+    """解析模型输出为 {tier_key: {"label": …, "script": …}}；解析失败返回空 dict。"""
+    if not text:
+        return {}
+    candidate = str(text).strip()
+    fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", candidate)
+    if fence:
+        candidate = fence.group(1).strip()
+    start, end = candidate.find("{"), candidate.rfind("}")
+    if start < 0 or end <= start:
+        return {}
+    try:
+        payload = json.loads(candidate[start:end + 1])
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    raw_items = payload.get("tiers") if isinstance(payload, dict) else None
+    if not isinstance(raw_items, list):
+        return {}
+    known = {_tier_key(item.get("min_value", "")): item for item in tiers}
+    parsed = {}
+    for entry in raw_items:
+        if not isinstance(entry, dict):
+            continue
+        key = _tier_key(entry.get("min_value", ""))
+        if key not in known:
+            continue
+        script = str(entry.get("script", "") or "").strip().strip('"').strip()
+        if not script:
+            continue
+        if len(script) > TIER_SCRIPT_MAX_CHARS:
+            script = script[:TIER_SCRIPT_MAX_CHARS - 1].rstrip() + "…"
+        parsed[key] = {
+            "label": str(known[key].get("describe", "") or "").strip(),
+            "script": script,
+        }
+    return parsed
+
+
+def tier_scripts_fresh(cached: dict, tiers: list, persona_hash: str) -> bool:
+    """缓存是否覆盖全部档位，且档位名与人设指纹都没变。"""
+    if not cached:
+        return False
+    for item in tiers:
+        entry = cached.get(str(item.get("min_value", "")))
+        if not entry or not entry.get("script"):
+            return False
+        if entry.get("hash") != persona_hash:
+            return False
+        if (entry.get("label") or "") != str(item.get("describe", "") or "").strip():
+            return False
+    return True

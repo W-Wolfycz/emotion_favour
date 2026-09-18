@@ -37,7 +37,9 @@ from .log import logger
 from .db_migrations import (
     SQLiteMigration,
     SQLiteMigrationRunner,
+    TIER_SCRIPT_DDL,
     add_emotion_columns,
+    ensure_tier_scripts_table,
     normalize_utc_timestamps,
     validate_favour_schema,
 )
@@ -95,7 +97,7 @@ def _reset_plugin_table_metadata(*table_names: str) -> None:
             SQLModel.metadata.remove(existing)
 
 
-_reset_plugin_table_metadata("favour_records", "persona_summaries")
+_reset_plugin_table_metadata("favour_records", "persona_summaries", "persona_tier_scripts")
 
 
 class FavourRecord(SQLModel, table=True):
@@ -132,6 +134,27 @@ class PersonaSummaryRecord(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     persona_id: str = Field(default="", unique=True, index=True)
     summary: str = Field(default="")
+    persona_hash: str = Field(default="")
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class PersonaTierScriptRecord(SQLModel, table=True):
+    """人格 × 关系档位 的一句话描述（出图时作为档位注解）。
+
+    tier_key 用档位的 min_value 作稳定标识；tier_label 存档位名，档位名改了
+    就视为过期需要重新生成；persona_hash 用于人格设定变更后自动失效。
+    """
+
+    __tablename__ = "persona_tier_scripts"
+    __table_args__ = (
+        UniqueConstraint("persona_id", "tier_key", name="uq_persona_tier_script"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    persona_id: str = Field(default="", index=True)
+    tier_key: str = Field(default="", index=True)
+    tier_label: str = Field(default="")
+    script: str = Field(default="")
     persona_hash: str = Field(default="")
     updated_at: datetime = Field(default_factory=utc_now)
 
@@ -184,6 +207,7 @@ class FavourDBManager:
             self.data_dir / "backups",
             (
                 SQLiteMigration("add_emotion_columns_v1", add_emotion_columns),
+                SQLiteMigration("ensure_tier_scripts_table_v1", ensure_tier_scripts_table),
                 SQLiteMigration(
                     "normalize_utc_timestamps_v1",
                     lambda connection: normalize_utc_timestamps(
@@ -260,6 +284,13 @@ class FavourDBManager:
                     """))
                     await conn.execute(text(
                         "CREATE INDEX IF NOT EXISTS ix_persona_summaries_pid ON persona_summaries (persona_id)"
+                    ))
+
+                    # 档位描述表（迁移链里用同一份 DDL，二者幂等）
+                    await conn.execute(text(TIER_SCRIPT_DDL))
+                    await conn.execute(text(
+                        "CREATE INDEX IF NOT EXISTS ix_persona_tier_scripts_pid "
+                        "ON persona_tier_scripts (persona_id)"
                     ))
 
                     await conn.execute(text(
@@ -960,6 +991,63 @@ class FavourDBManager:
             return False
 
     # ================= 人设摘要 =================
+
+    async def get_tier_scripts(self, persona_id: str) -> dict:
+        """返回 {tier_key: {"label":…, "script":…, "hash":…}}。"""
+        await self.init_db()
+        async with self.async_session() as session:
+            result = await session.execute(
+                select(PersonaTierScriptRecord).where(
+                    PersonaTierScriptRecord.persona_id == persona_id
+                )
+            )
+            return {
+                row.tier_key: {
+                    "label": row.tier_label,
+                    "script": row.script,
+                    "hash": row.persona_hash,
+                }
+                for row in result.scalars().all()
+            }
+
+    async def replace_tier_scripts(
+        self, persona_id: str, scripts: dict, persona_hash: str
+    ) -> None:
+        """整批覆盖某人格的档位描述（键为档位标识）。
+
+        条目可自带 `hash`：部分重生成时，未更新的档位要保留各自的原指纹，
+        否则会被人设指纹「洗白」而不再触发重生成。
+        """
+        await self.init_db()
+        async with self.async_session() as session:
+            await session.execute(
+                delete(PersonaTierScriptRecord).where(
+                    PersonaTierScriptRecord.persona_id == persona_id
+                )
+            )
+            for tier_key, item in scripts.items():
+                session.add(
+                    PersonaTierScriptRecord(
+                        persona_id=persona_id,
+                        tier_key=str(tier_key),
+                        tier_label=str(item.get("label", "")),
+                        script=str(item.get("script", "")),
+                        persona_hash=str(item.get("hash") or persona_hash),
+                    )
+                )
+            await session.commit()
+
+    async def delete_tier_scripts(self, persona_id: str) -> int:
+        """删除某人格的全部档位描述，返回删除行数。"""
+        await self.init_db()
+        async with self.async_session() as session:
+            result = await session.execute(
+                delete(PersonaTierScriptRecord).where(
+                    PersonaTierScriptRecord.persona_id == persona_id
+                )
+            )
+            await session.commit()
+            return int(result.rowcount or 0)
 
     async def get_persona_summary(self, persona_id: str) -> Optional[dict]:
         """获取人设摘要，返回 {summary, hash} 或 None。"""

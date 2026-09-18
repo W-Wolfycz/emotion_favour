@@ -1,5 +1,28 @@
 # 更新日志
 
+## 3.5.0 — 2026-09-19
+
+### 新增
+
+- **出图样式重做**：`custom_t2i.html` 换为纸笺风格——标题与关系名用站酷小薇（楷），正文与主调名用站酷快乐体，描述与提示用马善政毛笔楷书，数字与西文统一 Georgia；三款手写体打包在 `fonts/` 随插件分发，跨设备显示一致。
+- **关系档位描述**：按「人格 × 档位」生成一句角色内心话，`/emotion me` 出图时显示在情感面板下方；人设或档位名变化后自动重新生成，也可用 `/emotion regenerate`（Bot 管理员）手动重生成。
+- **排行榜图表化**：`/emotion list` 每人两行——数据行加十二维情绪柱形与三个主导情感，一页 8 人。
+
+### 变更
+
+- **配置项改名**：`judge_provider` → `llm_provider`、`advanced_config.judge_request_max_retries` → `advanced_config.llm_request_max_retries`（它现在同时服务好感结算、人设摘要与档位描述生成，不再只是好感判定）；不做迁移，升级后需重新选择模型。
+- **移除配置版本迁移机制**：删除 `migrate.py` 与 `config_version` 配置项。该链只有 v0→v1 一步（把 `advance_config` 从 JSON 字符串转成 list），老配置现在需要手动改成 list 格式。
+- **档位描述开关**：新增 `advanced_config.tier_script_enabled`（默认开），控制 `/emotion me` 出图底部是否显示档位自述；关闭时既不显示也不生成。
+- **档位描述启动补齐**：插件加载后自行在后台为已有印象记录的人格生成档位描述，不再要等首次 `/emotion me` 查询才触发（此前第一次出图看不到那句）；未配置「后台任务模型」时跳过，仍由首次查询兜底。
+- **T2I 渲染管线**：模板改用 `page.goto` 加载真实文件并等待 `document.fonts.ready`，Chromium 启动放行 file:// 字体访问；此前 `set_content` 落在 about:blank，自带字体取不到会整体退回系统字体。
+- **`/emotion list` 分页**：每页 20 人改为 8 人，渲染宽度统一 800px；随旧表格一并移除分块发送逻辑。
+
+### 兼容
+
+- 新增 `persona_tier_scripts` 表（存量库启动时先做 SQLite 备份再自动建表，并记入迁移链）；出图失败时仍回退纯文本输出。
+
+测试：按「改错一眼看不出」的标准收敛到 50 项（Python 47 + 前端 3），只保留静默失效点、安全与不变量（含孤儿 tool 配对、regenerate 误报、simple 模式满级口径三条回归）；公共提取工具集中在 `tests/support.py`。
+
 ## 3.4.5 — 2026-08-30
 
 ### 变更

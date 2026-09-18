@@ -1,5 +1,6 @@
 /* emotion_favour WebUI 样式
- * 复用 custom_t2i.html 的视觉基调（紫粉渐变 header、圆角卡片、柔和阴影）
+ * 管理台自有配色（紫粉渐变 header、圆角卡片、柔和阴影）；出图模板 custom_t2i.html
+ * 自 3.5.0 起改为纸笺风格，两者不再共用视觉基调
  * + time_awareness 的 light/dark 主题切换机制
  */
 

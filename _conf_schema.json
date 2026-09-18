@@ -46,18 +46,12 @@
     "default": 0,
     "hint": "新用户首次交互时的初始好感度值。别超出自定义的范围哦！"
   },
-  "judge_provider": {
-    "description": "裁判模型",
+  "llm_provider": {
+    "description": "后台任务模型",
     "type": "string",
     "default": "",
     "_special": "select_provider",
-    "hint": "判断好感度变化的模型，留空则使用当前默认对话模型。"
-  },
-  "config_version": {
-    "description": "配置版本号（自动管理）",
-    "type": "int",
-    "default": 0,
-    "hint": "⚠️ 自动管理字段，请勿手动修改。插件启动时会按版本号链式迁移旧配置；手动改大可能跳过必要迁移，改小会导致重复迁移（迁移逻辑幂等，但会浪费一次启动时间）。"
+    "hint": "用于好感结算、人设摘要、档位描述生成等插件后台 LLM 任务；留空则跟随当前会话的对话模型。"
   },
   "relationship_config": {
     "description": "好感度关系映射配置",
@@ -187,16 +181,22 @@
         "hint": "每个情感维度单次变化的上限（正值）。"
       },
       "history_rounds": {
-        "description": "裁决模型参考的近期对话轮数",
+        "description": "后台任务模型参考的近期对话轮数",
         "type": "int",
         "default": 0,
-        "hint": "0 表示仅参考当前一轮互动（默认行为）。设为 1-10 时，裁决模型将参考最近 N 轮对话来判断好感度变化，需注意 Token 开销。"
+        "hint": "0 表示仅参考当前一轮互动（默认行为）。设为 1-10 时，后台任务模型将参考最近 N 轮对话来判断好感度变化，需注意 Token 开销。"
+      },
+      "tier_script_enabled": {
+        "description": "出图显示档位描述",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后 /emotion me 出图底部会显示当前关系档位的一句角色自述（按人格 × 档位生成，首次查询时后台补齐）。关闭则完全不生成也不显示。"
       },
       "use_chat_memory": {
         "description": "使用 chat_memory 插件提供对话上下文",
         "type": "bool",
         "default": false,
-        "hint": "启用后，裁决模型从 chat_memory 正式版 ≥ 1.0.0 按用户ID和当前人格读取严格配对的 LLM 历史；未启用时使用 AstrBot 自带上下文（群聊场景共享）。未安装、版本不兼容或查询失败时，本轮自动回退到 AstrBot 自带上下文。https://github.com/W-Wolfycz/chat_memory"
+        "hint": "启用后，后台任务模型从 chat_memory 正式版 ≥ 1.0.0 按用户ID和当前人格读取严格配对的 LLM 历史；未启用时使用 AstrBot 自带上下文（群聊场景共享）。未安装、版本不兼容或查询失败时，本轮自动回退到 AstrBot 自带上下文。https://github.com/W-Wolfycz/chat_memory"
       },
       "emotion_decay_enabled": {
         "description": "启用情感时间衰减",
@@ -247,7 +247,7 @@
         "description": "启用好感度时间衰减",
         "type": "bool",
         "default": true,
-        "hint": "开启后，长时间未互动的用户好感度会向锚点自然回归，与情感维度衰减相互独立。仅在裁决模型结算时落盘新值。"
+        "hint": "开启后，长时间未互动的用户好感度会向锚点自然回归，与情感维度衰减相互独立。仅在后台任务模型结算时落盘新值。"
       },
       "favour_decay_anchor": {
         "description": "好感度衰减锚点",
@@ -261,14 +261,8 @@
         "default": 0,
         "hint": "0 表示永久保留；设置为正整数时，插件初始化和新建备份后会清理超过天数的有效 JSON 业务备份。数据库迁移生成的 SQLite .db 安全备份不自动删除。"
       },
-      "judge_request_max_retries": {
-        "description": "裁决 LLM 请求最大尝试次数",
-        "type": "int",
-        "default": 5,
-        "hint": "好感结算与人设摘要 LLM 调用的最大尝试次数（含首次请求），范围 1-10。默认 5；设为 1 表示失败不重试。"
-      },
       "settlement_timeout_seconds": {
-        "description": "后台裁决超时/秒",
+        "description": "后台调用超时/秒",
         "type": "float",
         "default": 60.0,
         "hint": "单次好感结算或人设摘要 LLM 调用的整体超时上限（含 Provider 内部重试），范围运行时钳制为 5-300 秒。"
@@ -277,7 +271,13 @@
         "description": "插件终止任务收尾时间/秒",
         "type": "float",
         "default": 8.0,
-        "hint": "插件禁用或热重载时，允许正在进行的短期数据库/裁决任务完成的最长时间；超时后取消。"
+        "hint": "插件禁用或热重载时，允许正在进行的短期数据库/后台任务完成的最长时间；超时后取消。"
+      },
+      "llm_request_max_retries": {
+        "description": "后台 LLM 请求最大尝试次数",
+        "type": "int",
+        "default": 5,
+        "hint": "好感结算、人设摘要、档位描述生成等后台调用的最大尝试次数（含首次请求），范围 1-10。默认 5；设为 1 表示失败不重试。"
       }
     }
   }

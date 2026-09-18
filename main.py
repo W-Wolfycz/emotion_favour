@@ -38,9 +38,15 @@ from .domain import (
     build_emotion_panel,
     build_injection_prompt,
     build_interaction_section,
+    build_list_html,
+    build_report_html,
     build_system_prompt_extra,
+    build_tier_script_prompt,
+    compute_tier_progress,
     format_emotion_detail,
     get_dominant_emotions,
+    parse_tier_script_response,
+    tier_scripts_fresh,
     diminish_delta,
     apply_emotion_decay,
     compute_favour_decay,
@@ -67,29 +73,6 @@ class SenderSessionFilter(SessionFilter):
 class EmotionFavourPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
-
-        # 配置迁移：把旧版本配置升级到 CURRENT_CONFIG_VERSION
-        # 必须在读取任何配置字段之前完成——原地修改 config dict
-        from .migrate import migrate
-        migrated_version_before = (
-            config.get("config_version", 0) if isinstance(config, dict) else 0
-        )
-        migrate(config)
-        if (
-            isinstance(config, dict)
-            and config.get("config_version", 0) != migrated_version_before
-        ):
-            # 真的发生迁移了 → 持久化到磁盘
-            try:
-                global_config = self._get_context_config()
-                if global_config is not None and hasattr(
-                    global_config, "save_config"
-                ):
-                    global_config.save_config()
-            except Exception as e:
-                logger.warning(
-                    f"[emotion_favour] 迁移后持久化配置失败（内存中已迁移，下次启动会重跑）: {e}"
-                )
 
         self.settings = PluginSettings.from_mapping(config)
         for warning in self.settings.warnings:
@@ -160,10 +143,15 @@ class EmotionFavourPlugin(Star):
                     f"[EmotionFavour] 已清理 {removed_backups} 个过期 JSON 备份"
                 )
             await self._ensure_local_scripts()
-            # T2I 渲染缓存清理：删除超过 7 天的 PNG，防止无限累积
+            # T2I 渲染缓存清理：删除超过 7 天的 PNG 与渲染用的临时 HTML，防止无限累积
             try:
                 removed_t2i = cleanup_old_files(
                     self._t2i_output_dir, suffix=".png", max_age_days=7
+                )
+                # 临时 HTML 正常路径渲染完就删，启动时还留着的必然是崩溃残留
+                # （内容含聊天正文），立即回收而不是等 7 天
+                removed_t2i += cleanup_old_files(
+                    self._t2i_output_dir, suffix=".html", max_age_days=0
                 )
                 if removed_t2i:
                     logger.info(
@@ -183,6 +171,8 @@ class EmotionFavourPlugin(Star):
                 else:
                     logger.warning(f"[EmotionFavour] Playwright 浏览器预热失败，将按需重试: {e}")
             register_web_apis(self.context, self)
+            # 启动后静默补齐档位描述（缺失或人设已变的人格），失败不影响启动
+            self._tasks.spawn(self._warm_tier_scripts(), name="warm_tier_scripts")
             self._state = "READY"
             logger.info("[EmotionFavour] ✅ 初始化完成，Web API 已注册")
         except Exception as e:
@@ -238,27 +228,32 @@ class EmotionFavourPlugin(Star):
         return None
 
     def _tag(self, event=None) -> str:
+        """日志前缀：无 platform 上下文时为 [EmotionFavour]，
+        开启 log_with_bot_id 且能取到 platform_id 时为
+        [EmotionFavour][platform:{platform_id}]（与工作区日志规范一致）。"""
         if self.log_with_bot_id and event is not None:
             try:
-                return f"[EmotionFavour:{event.get_platform_id()}]"
+                platform_id = event.get_platform_id()
             except Exception:
-                pass
+                platform_id = ""
+            if platform_id:
+                return f"[EmotionFavour][platform:{platform_id}]"
         return "[EmotionFavour]"
 
     def _record_key(self, persona_id: str, user_id: str) -> tuple[str, str, str]:
         return ("record", str(persona_id), str(user_id))
 
-    async def _judge_generate(
+    async def _llm_generate(
         self,
         *,
         provider_id: str,
         prompt: str,
         timeout: Optional[float] = None,
     ):
-        """后台裁决 LLM 调用统一出口：施加超时并透传重试次数。
+        """插件后台 LLM 调用统一出口（结算 / 人设摘要 / 档位描述）：施加超时并透传重试次数。
 
         不再做全局并发闸（后台结算任务本就稀少；同一 persona/user 的串行
-        由记录锁保证）。重试次数按 `judge_request_max_retries` 配置透传给
+        由记录锁保证）。重试次数按 `llm_request_max_retries` 配置透传给
         Provider：插件路径不自动继承 AstrBot 的
         provider_settings.request_max_retries，不传参会回落到上游硬编码的
         5 次重试。
@@ -268,7 +263,7 @@ class EmotionFavourPlugin(Star):
             self.context.llm_generate(
                 chat_provider_id=provider_id,
                 prompt=prompt,
-                request_max_retries=self.judge_request_max_retries,
+                request_max_retries=self.llm_request_max_retries,
             ),
             timeout=effective_timeout,
         )
@@ -497,7 +492,7 @@ class EmotionFavourPlugin(Star):
         if chat_memory is not None:
             try:
                 # chat_memory 1.0.0：只取当前人格下走完 LLM 的成功配对，避免切换
-                # persona 后把其他人格的历史交给当前裁决模型。
+                # persona 后把其他人格的历史交给当前后台任务模型。
                 paired = await chat_memory.query_rounds(
                     umo, conversation_id, user_id,
                     limit_rounds=rounds,
@@ -608,7 +603,7 @@ class EmotionFavourPlugin(Star):
             return "default"
         except Exception as e:
             logger.warning(
-                f"[EmotionFavour] resolve_selected_persona 失败，回退 default: {e}"
+                f"{self._tag(event)} resolve_selected_persona 失败，回退 default: {e}"
             )
             return "default"
 
@@ -622,6 +617,7 @@ class EmotionFavourPlugin(Star):
         "clear-all",
         "persona",
         "persona-clear",
+        "regenerate",
     })
 
     def _is_bot_admin(self, event: AstrMessageEvent) -> bool:
@@ -860,6 +856,15 @@ class EmotionFavourPlugin(Star):
         "highlight.min.js": "https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js",
     }
 
+    # 模板 @font-face 用 file:// 绝对路径指向插件 fonts/，Chromium 需显式放行
+    # file:// 页面读取本地文件，否则字体加载失败、整图退回系统字体。
+    # 安全前提：渲染页因此能读本地文件，所有注入正文必须保持转义（domain 的 html.escape
+    # 与 _render_custom_t2i 的 \x3c 替换），新增插值点时不能绕过。
+    _CHROMIUM_ARGS = ["--allow-file-access-from-files"]
+
+    # 启动预热档位描述前的等待秒数（等其它服务就绪；测试里覆盖为 0）
+    _TIER_SCRIPT_WARM_DELAY = 5.0
+
     _CDN_TO_FILE = {
         "https://cdn.jsdelivr.net/npm/marked/marked.min.js": "marked.min.js",
         "https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js": "highlight.min.js",
@@ -917,7 +922,9 @@ class EmotionFavourPlugin(Star):
             await self._pw_instance.stop()
         self._pw_instance = await async_playwright().start()
         try:
-            self._pw_browser = await self._pw_instance.chromium.launch()
+            self._pw_browser = await self._pw_instance.chromium.launch(
+                args=self._CHROMIUM_ARGS
+            )
         except Exception:
             await self._pw_instance.stop()
             self._pw_instance = None
@@ -964,16 +971,37 @@ class EmotionFavourPlugin(Star):
             )
             return await self.text_to_image(md_text, return_url=False)
 
+    def _font_base_url(self) -> str:
+        """模板 @font-face 的字体根 URL（file:// 绝对路径，末尾带斜杠）。"""
+        fonts_dir = Path(__file__).resolve().parent / "fonts"
+        return fonts_dir.as_uri().rstrip("/") + "/"
+
     async def _render_custom_t2i(self, md_text: str, width: int = 800) -> str:
-        """使用插件自定义 Playwright 模板渲染；异常由上层统一回退。"""
+        """使用插件自定义 Playwright 模板渲染；异常由上层统一回退。
+
+        模板的 @font-face 指向插件 fonts/ 下的 file:// 绝对路径，所以必须用
+        page.goto 加载真实文件：set_content 的文档落在 about:blank，取不到本地字体，
+        出图会整体退回系统字体。
+        """
         async with self._browser_lock:
             browser = await self._ensure_browser_locked()
             page = await browser.new_page(viewport={"width": width, "height": 600})
+            temp_html: Optional[Path] = None
             try:
                 html = self._html_template.replace("{{ version }}", self._plugin_version)
-                safe_text = md_text.replace("\\", "\\\\").replace("`", "\\`").replace("${", "\\${")
-                html = html.replace("{{ text | safe }}", safe_text)
+                # 依次转义：反斜杠、反引号、${、以及 <（\x3c 在 JS 串里仍解析为 <，
+                # 不影响 marked 透传 HTML），避免正文里的 </script> 提前闭合脚本块
+                safe_text = (
+                    md_text.replace("\\", "\\\\")
+                    .replace("`", "\\`")
+                    .replace("${", "\\${")
+                    .replace("<", "\\x3c")
+                )
+                # 模板占位符先替换完，正文最后注入：否则正文里出现的 {{ font_base }}
+                # 一类字样会被二次替换，把插件本地路径渲进图里
                 html = html.replace("{{ max_width }}", str(width))
+                html = html.replace("{{ font_base }}", self._font_base_url())
+                html = html.replace("{{ text | safe }}", safe_text)
 
                 # 用本地脚本替换 CDN 引用（fallback: 无本地则保留 CDN 并后台下载）
                 missing_scripts = []
@@ -991,31 +1019,24 @@ class EmotionFavourPlugin(Star):
                         name="download_t2i_scripts",
                     )
 
-                await page.set_content(html, wait_until="load", timeout=15000)
                 digest_input = f"{self._plugin_version}|{width}|{md_text}".encode()
-                filename = hashlib.md5(digest_input).hexdigest()[:12] + ".png"
-                output_path = self._t2i_output_dir / filename
+                digest = hashlib.md5(digest_input).hexdigest()[:12]
+                temp_html = self._t2i_output_dir / f"{digest}.html"
+                temp_html.write_text(html, encoding="utf-8")
+                await page.goto(temp_html.as_uri(), wait_until="load", timeout=15000)
+                # load 事件不等字体：等 document.fonts.ready，否则会截到回退字形。
+                # 加超时兜底——这里持着全局渲染锁，字体 Promise 不 settle 会挂住全部出图
+                await asyncio.wait_for(
+                    page.evaluate("() => document.fonts.ready"), timeout=5
+                )
+                output_path = self._t2i_output_dir / f"{digest}.png"
                 await page.screenshot(path=str(output_path), full_page=True)
                 return str(output_path)
             finally:
+                # 先删临时 HTML（含聊天正文）再关页：close 抛错也不会把它留在磁盘上
+                if temp_html is not None:
+                    temp_html.unlink(missing_ok=True)
                 await page.close()
-
-    async def _send_chunked_t2i(self, event: AstrMessageEvent, title: str, headers: List[str], rows: List[str], chunk_size: int = 200, width: int = 800):
-        total = len(rows)
-        if total == 0:
-            await event.send(event.plain_result(f"{title}\n暂无数据"))
-            return
-        for i in range(0, total, chunk_size):
-            chunk = rows[i:i+chunk_size]
-            page_info = f"({i+1}-{min(i+chunk_size, total)}/{total})" if total > chunk_size else ""
-            md_lines = [f"# {title} {page_info}", ""] + headers + chunk
-            md_text = "\n".join(md_lines)
-            try:
-                img_path = await self._render_t2i(md_text, width=width)
-                await event.send(event.image_result(img_path))
-            except Exception as e:
-                logger.error(f"{self._tag(event)} 生成图片失败 (Page {page_info}): {e}")
-                await event.send(event.plain_result("生成图片失败，请检查日志。"))
 
     # ================= Hook: 注入 =================
 
@@ -1251,9 +1272,9 @@ class EmotionFavourPlugin(Star):
                 if mutation_epoch is None:
                     return
 
-            # 提前获取裁决模型（供人设摘要提取和裁决共用）
-            if self.judge_provider:
-                provider_id = self.judge_provider.strip()
+            # 提前获取后台任务模型（供人设摘要提取和结算共用）
+            if self.llm_provider:
+                provider_id = self.llm_provider.strip()
             else:
                 provider_id = await self.context.get_current_chat_provider_id(umo=umo)
             if not provider_id:
@@ -1386,7 +1407,7 @@ class EmotionFavourPlugin(Star):
 
             logger.debug(f"{tag} 印象结算上下文:\n{eval_prompt}")
 
-            resp = await self._judge_generate(
+            resp = await self._llm_generate(
                 provider_id=provider_id,
                 prompt=eval_prompt,
             )
@@ -1430,7 +1451,7 @@ class EmotionFavourPlugin(Star):
                 logger.debug(f"{tag} 印象结算推理: {reasoning}")
 
             if delta == 0 and not raw_emotions:
-                # 即使裁决无变化，也要把当前衰减后的值落盘并刷新 updated_at，
+                # 即使结算无变化，也要把当前衰减后的值落盘并刷新 updated_at，
                 # 否则下次读取仍从旧 updated_at 起算 Δt，衰减会重复累积。
                 record = await self.db.get_favour(persona_id, user_id)
                 if record and self.favour_decay_enabled:
@@ -1494,6 +1515,211 @@ class EmotionFavourPlugin(Star):
                 f"{traceback.format_exc()}"
             )
 
+    # ================= 关系档位描述 =================
+
+    def _persona_prompt_text(self, persona_id: str) -> str:
+        """取人格设定正文；取不到返回空串。"""
+        try:
+            persona = self.persona_mgr.get_persona_v3_by_id(persona_id)
+            if persona and "prompt" in persona:
+                return (persona["prompt"] or "").strip()
+        except Exception:
+            pass
+        return ""
+
+    @staticmethod
+    def _persona_hash(persona_prompt: str) -> str:
+        if not persona_prompt:
+            return ""
+        return hashlib.sha256(persona_prompt.encode("utf-8")).hexdigest()
+
+    async def _resolve_generation_provider(self, event: Optional[AstrMessageEvent]) -> str:
+        """档位描述走后台任务模型；未配置时回退当前会话模型。"""
+        llm_provider = (self.llm_provider or "").strip()
+        if llm_provider:
+            return llm_provider
+        umo = event.unified_msg_origin if event is not None else ""
+        return await self.context.get_current_chat_provider_id(umo=umo)
+
+    async def _generate_tier_scripts(
+        self, persona_id: str, persona_prompt: str, tiers: list, provider_id: str
+    ) -> dict:
+        """一次 LLM 调用生成该人格全部档位的描述；失败返回空 dict。"""
+        prompt = build_tier_script_prompt(persona_prompt, tiers)
+        try:
+            response = await self._llm_generate(provider_id=provider_id, prompt=prompt)
+        except Exception as e:
+            detail = str(e) or type(e).__name__
+            logger.warning(
+                f"[EmotionFavour] 档位描述生成调用失败: persona_id={persona_id}, "
+                f"provider={provider_id}, {type(e).__name__}: {detail}"
+            )
+            return {}
+        scripts = parse_tier_script_response(
+            getattr(response, "completion_text", "") or "", tiers
+        )
+        if scripts:
+            logger.info(
+                f"[EmotionFavour] 档位描述已生成: persona_id={persona_id}, "
+                f"{len(scripts)}/{len(tiers)} 档"
+            )
+        else:
+            logger.warning(f"[EmotionFavour] 档位描述解析失败: persona_id={persona_id}")
+        return scripts
+
+    async def _ensure_tier_scripts(
+        self, persona_id: str, provider_id: str, *, force: bool = False
+    ) -> dict:
+        """确保当前人格的档位描述可用；force 时无条件重新生成。"""
+        tiers = self._advance_items()
+        if not tiers:
+            return {}
+        persona_prompt = self._persona_prompt_text(persona_id)
+        persona_hash = self._persona_hash(persona_prompt)
+        cached = await self.db.get_tier_scripts(persona_id)
+        if not persona_hash:
+            # 人格设定取不到时绝不生成：兜底人设写出的通用文案会覆盖人格专属描述，
+            # 而且空指纹与后续空指纹互相匹配，会一直命中有害缓存
+            logger.warning(
+                f"[EmotionFavour] 取不到人格设定，跳过档位描述生成: persona_id={persona_id}"
+            )
+            # force（/emotion regenerate）必须如实返回空，否则命令会拿旧缓存报成功
+            return {} if force else cached
+        if not force and tier_scripts_fresh(cached, tiers, persona_hash):
+            return cached
+        async with self._record_locks.hold(("tier_scripts", persona_id)):
+            if not force:
+                cached = await self.db.get_tier_scripts(persona_id)
+                if tier_scripts_fresh(cached, tiers, persona_hash):
+                    return cached
+            scripts = await self._generate_tier_scripts(
+                persona_id, persona_prompt, tiers, provider_id
+            )
+            if not scripts:
+                # force（/emotion regenerate）失败要如实返回空，不能拿旧缓存冒充成功
+                return {} if force else cached
+            if len(scripts) < len(tiers):
+                logger.warning(
+                    f"[EmotionFavour] 档位描述覆盖不全: persona_id={persona_id}, "
+                    f"{len(scripts)}/{len(tiers)} 档，未覆盖档位沿用旧描述"
+                )
+            # 部分解析时保留其余档位的旧描述与它们的旧 hash（hash 不同即视为待重生成）
+            # 已从配置里删掉的档位不该继续留在库里
+            valid_keys = {str(item.get("min_value", "")) for item in tiers}
+            merged = {
+                key: {
+                    "label": entry.get("label", ""),
+                    "script": entry.get("script", ""),
+                    "hash": entry.get("hash", ""),
+                }
+                for key, entry in (cached or {}).items()
+                if key in valid_keys
+            }
+            for key, entry in scripts.items():
+                merged[key] = {
+                    "label": entry.get("label", ""),
+                    "script": entry.get("script", ""),
+                    "hash": persona_hash,
+                }
+            # 未覆盖档位：旧描述仍对应当前档位名时一并打上当前指纹，
+            # 否则「模型漏档位」会让该档每次查询都重复触发一次后台生成；
+            # 档位名变了或本来没有描述的则保留旧指纹，留待下次重试。
+            expected_labels = {
+                str(item.get("min_value", "")): str(item.get("describe", "") or "").strip()
+                for item in tiers
+            }
+            for key, entry in merged.items():
+                if key in scripts:
+                    continue
+                expected = expected_labels.get(key)
+                if expected and entry.get("script") and (entry.get("label") or "") == expected:
+                    entry["hash"] = persona_hash
+            await self.db.replace_tier_scripts(persona_id, merged, persona_hash)
+        return await self.db.get_tier_scripts(persona_id)
+
+    async def _tier_script_for(
+        self, event: AstrMessageEvent, persona_id: str, tier: Optional[dict]
+    ) -> str:
+        """当前档位的描述；缺失或人设变更时后台补生成，本次不显示以免拖慢出图。"""
+        if not tier:
+            return ""
+        persona_hash = self._persona_hash(self._persona_prompt_text(persona_id))
+        if not persona_hash:
+            return ""  # 人格设定取不到：不展示，也不触发无意义的后台生成
+        try:
+            cached = await self.db.get_tier_scripts(persona_id)
+        except Exception as e:
+            logger.warning(f"{self._tag(event)} 读取档位描述失败: {type(e).__name__}: {e}")
+            return ""
+        entry = cached.get(str(tier.get("min_value", "")))
+        if (
+            entry
+            and entry.get("script")
+            and entry.get("hash") == persona_hash
+            and (entry.get("label") or "") == str(tier.get("describe", "") or "").strip()
+        ):
+            return str(entry["script"])
+        self._tasks.spawn(
+            self._refresh_tier_scripts(event, persona_id), name="refresh_tier_scripts"
+        )
+        return ""
+
+    async def _refresh_tier_scripts(self, event: AstrMessageEvent, persona_id: str) -> None:
+        """后台补齐档位描述；失败只记日志，不影响对话与出图。"""
+        try:
+            provider_id = await self._resolve_generation_provider(event)
+            if not provider_id:
+                logger.warning(
+                    f"{self._tag(event)} 缺少可用 Provider，跳过档位描述生成"
+                )
+                return
+            await self._ensure_tier_scripts(persona_id, provider_id)
+        except Exception as e:
+            logger.warning(
+                f"{self._tag(event)} 档位描述后台生成失败: {type(e).__name__}: {e}"
+            )
+
+    async def _warm_tier_scripts(self) -> None:
+        """启动预热：为已有印象记录的人格补齐档位描述。
+
+        只做补齐不做强制重生成——缺描述、档位名变化或人设变更时才生成。
+        没配置后台任务模型时直接跳过：那时连会话模型也拿不到，留给首次查询的
+        懒生成兜底（查询路径手上有 event，能回退到当前会话模型）。
+        """
+        try:
+            if not self.tier_script_enabled or not self._advance_items():
+                return
+            provider_id = (self.llm_provider or "").strip()
+            if not provider_id:
+                logger.debug(
+                    "[EmotionFavour] 未配置后台任务模型，档位描述留待首次查询生成"
+                )
+                return
+            # 启动瞬间其它服务仍在就绪中，稍等再跑，避免与启动流程抢资源
+            if self._TIER_SCRIPT_WARM_DELAY:
+                await asyncio.sleep(self._TIER_SCRIPT_WARM_DELAY)
+            tiers = self._advance_items()
+            generated = 0
+            for persona_id in await self.db.get_distinct_personas():
+                try:
+                    persona_hash = self._persona_hash(self._persona_prompt_text(persona_id))
+                    if not persona_hash:
+                        continue
+                    cached = await self.db.get_tier_scripts(persona_id)
+                    if tier_scripts_fresh(cached, tiers, persona_hash):
+                        continue
+                    await self._ensure_tier_scripts(persona_id, provider_id)
+                    generated += 1
+                except Exception as e:
+                    logger.warning(
+                        f"[EmotionFavour] 启动补齐档位描述失败: persona_id={persona_id}, "
+                        f"{type(e).__name__}: {e}"
+                    )
+            if generated:
+                logger.info(f"[EmotionFavour] 启动补齐档位描述完成: {generated} 个人格")
+        except Exception as e:
+            logger.warning(f"[EmotionFavour] 启动预热档位描述失败: {type(e).__name__}: {e}")
+
     # ================= 人设摘要 =================
 
     async def _get_persona_summary(self, persona_id: str, provider_id: str) -> str:
@@ -1522,7 +1748,7 @@ class EmotionFavourPlugin(Star):
             return summary
 
     async def _extract_persona_summary(self, persona_prompt: str, provider_id: str) -> str:
-        """使用裁决模型从人设文本中提取性格摘要。"""
+        """使用后台任务模型从人设文本中提取性格摘要。"""
         extract_prompt = (
             "从以下角色人设文本中提取性格特征摘要。\n\n"
             "<要求>\n"
@@ -1534,7 +1760,7 @@ class EmotionFavourPlugin(Star):
             f"角色人设：\n{persona_prompt[:8000]}"
         )
         try:
-            resp = await self._judge_generate(
+            resp = await self._llm_generate(
                 provider_id=provider_id,
                 prompt=extract_prompt,
             )
@@ -1554,8 +1780,14 @@ class EmotionFavourPlugin(Star):
         self,
         event: AstrMessageEvent,
         target_uid: str,
+        *,
+        include_tier_script: bool = False,
     ):
-        """查询指定用户；权限由公开入口在调用前处理。"""
+        """查询指定用户；权限由公开入口在调用前处理。
+
+        include_tier_script 仅自查时为真：档位描述是「角色对这段关系的自述」，
+        查他人时不展示。
+        """
         persona_id = await self._get_persona_id(event)
         record = await self.db.get_favour(persona_id, target_uid)
         if record:
@@ -1567,21 +1799,63 @@ class EmotionFavourPlugin(Star):
 
         name = await get_user_display_name(event, target_uid)
         relationship = self._get_relationship(fav, target_uid)
-        detail = format_emotion_detail(record, relationship, effective_favour=fav)
 
-        md_text = f"# 印象查询\n\n**用户**：{escape_markdown(name)}  \n**ID**：{target_uid}\n\n---\n\n{detail}"
+        # 特殊用户按最高档位展示，与对话注入口径一致
+        if self._is_special_override(target_uid):
+            tier, next_tier = self._get_max_tier(), None
+        else:
+            tier, next_tier = self._find_tier(fav), self._find_next_tier(fav)
+        default_min, default_max = self.min_favour_value, self.max_favour_value
+        if tier is not None:
+            tier_min = int(tier.get("min_value", default_min))
+            tier_max = int(tier.get("max_value", default_max))
+            next_tier_min = int(next_tier.get("min_value", 0)) if next_tier else None
+        else:
+            # simple 模式（默认）或未配置 advance：没有档位可比，退回关系区间算进度。
+            # 只有落在最后一档才算满级——否则默认配置下任何好感度都会显示「已满级」，
+            # 与对话注入走 _get_relationship_range 的口径自相矛盾。
+            span = self._get_relationship_range(fav, target_uid)
+            if span:
+                tier_min, tier_max = int(span[0]), int(span[1])
+                next_tier_min = None if tier_max >= default_max else tier_max + 1
+            else:
+                tier_min, tier_max, next_tier_min = default_min, default_max, None
+        percent, hint = compute_tier_progress(
+            fav,
+            tier_min=tier_min,
+            tier_max=tier_max,
+            max_favour_value=self.max_favour_value,
+            next_tier_min=next_tier_min,
+        )
+
+        tier_script = ""
+        if include_tier_script and self.tier_script_enabled:
+            tier_script = await self._tier_script_for(event, persona_id, tier)
+
+        report = build_report_html(
+            record,
+            favour=fav,
+            max_favour=self.max_favour_value,
+            relationship=relationship,
+            who=f"{name} · {target_uid}",
+            percent=percent,
+            hint=hint,
+            tier_description=tier_script,
+        )
+        md_text = f"# 印象查询\n\n{report}"
         try:
             img_path = await self._render_t2i(md_text)
             yield event.image_result(img_path)
         except Exception as e:
             logger.warning(f"{self._tag(event)} 印象查询 T2I 失败，回退纯文本: {e}")
-            yield event.plain_result(f"🔍 用户：{name}\n🆔 ID：{target_uid}\n{detail}")
+            fallback = format_emotion_detail(record, relationship, effective_favour=fav)
+            yield event.plain_result(f"🔍 用户：{name}\n🆔 ID：{target_uid}\n{fallback}")
 
     @emotion_group.command("me")
     async def emotion_me(self, event: AstrMessageEvent):
         """查询自己的好感度与情感状态。"""
         async for result in self._query_favour_impl(
-            event, str(event.get_sender_id()),
+            event, str(event.get_sender_id()), include_tier_script=True,
         ):
             yield result
 
@@ -1589,7 +1863,7 @@ class EmotionFavourPlugin(Star):
     async def legacy_query_self(self, event: AstrMessageEvent):
         """兼容旧入口：仅查询发送者本人。"""
         async for result in self._query_favour_impl(
-            event, str(event.get_sender_id()),
+            event, str(event.get_sender_id()), include_tier_script=True,
         ):
             yield result
 
@@ -1614,7 +1888,7 @@ class EmotionFavourPlugin(Star):
             return
 
         persona_id = await self._get_persona_id(event)
-        page_size = 20
+        page_size = 8
         total_records = await self.db.count_records(persona_id)
         if total_records <= 0:
             yield event.plain_result("暂无印象记录。")
@@ -1658,15 +1932,66 @@ class EmotionFavourPlugin(Star):
         }
         headers = ["| 用户 | ID | 好感值 | 关系 | 主导情感 |", "| :--- | :--- | :---: | :---: | :--- |"]
         rows = []
+        rows_data = []
         for r in page_records:
             decayed_fav = self._decay_favour_value(r)
-            rel = escape_markdown(self._get_relationship(decayed_fav, r.user_id))
+            rel_raw = self._get_relationship(decayed_fav, r.user_id)
             top = get_dominant_emotions(r, 3)
             emotion_str = "、".join(f"{EMOTION_DISPLAY_NAMES[k]}({v})" for k, v in top) if top else "-"
-            display_name = name_map.get(r.user_id) or ""
-            rows.append(f"| {escape_markdown(display_name)} | {escape_markdown(r.user_id)} | {decayed_fav} | {rel} | {emotion_str} |")
+            display_name = name_map.get(r.user_id) or r.user_id
+            rows.append(
+                f"| {escape_markdown(display_name)} | {escape_markdown(r.user_id)} | "
+                f"{decayed_fav} | {escape_markdown(rel_raw)} | {emotion_str} |"
+            )
+            rows_data.append({
+                "name": display_name,
+                "user_id": r.user_id,
+                "favour": decayed_fav,
+                "relationship": rel_raw,
+                "record": r,
+            })
 
-        await self._send_chunked_t2i(event, f"📊 印象记录 - 第 {page}/{total_pages} 页", headers, rows, width=1200)
+        title = f"❀ 印象记录 · 第 {page}/{total_pages} 页"
+        try:
+            img_path = await self._render_t2i(
+                f"# {title}\n\n{build_list_html(rows_data)}", width=800
+            )
+            yield event.image_result(img_path)
+        except Exception as e:
+            logger.warning(f"{self._tag(event)} 印象记录 T2I 失败，回退纯文本: {e}")
+            yield event.plain_result("\n".join([title, "", *headers, *rows]))
+
+    @emotion_group.command("regenerate")
+    async def regenerate_tier_scripts(self, event: AstrMessageEvent):
+        """按当前人格设定重新生成各关系档位的描述（出图底部的档位注解）。"""
+        if not await self._check_command_permission(event, "regenerate"):
+            yield event.plain_result("权限不足！只有 Bot 管理员可以重新生成档位描述。")
+            return
+        persona_id = await self._get_persona_id(event)
+        if not self._advance_items():
+            yield event.plain_result("当前未配置关系档位，无需生成。")
+            return
+        try:
+            provider_id = await self._resolve_generation_provider(event)
+        except Exception as e:
+            logger.warning(f"{self._tag(event)} 解析档位描述生成模型失败: {type(e).__name__}: {e}")
+            provider_id = ""
+        if not provider_id:
+            yield event.plain_result("未找到可用的 LLM Provider，无法生成档位描述。")
+            return
+        await event.send(event.plain_result("正在按档位生成描述，请稍候…"))
+        try:
+            scripts = await self._ensure_tier_scripts(persona_id, provider_id, force=True)
+        except Exception as e:
+            logger.error(
+                f"{self._tag(event)} 重新生成档位描述失败: {type(e).__name__}: {e}"
+            )
+            yield event.plain_result("❌ 生成失败，请查看日志。")
+            return
+        if scripts:
+            yield event.plain_result(f"✅ 已为 {len(scripts)} 个档位生成描述。")
+        else:
+            yield event.plain_result("❌ 生成失败，请查看日志。")
 
     # ================= 修改命令 =================
 
@@ -1890,30 +2215,30 @@ class EmotionFavourPlugin(Star):
     async def help_menu(self, event: AstrMessageEvent):
         """按当前权限显示 emotion 指令帮助。"""
         msg = [
-            "⭐ emotion 指令帮助 ⭐",
+            "# ❀ emotion 指令帮助",
             "",
-            "[个人查询]",
-            "- /emotion me",
-            "- 兼容入口：/查询印象、/印象、/查询好感度、/好感度",
+            "## 个人查询",
+            "",
+            "- `/emotion me`　查看自己的印象",
+            "- 兼容入口：`/查询印象`、`/印象`、`/查询好感度`、`/好感度`",
         ]
 
         if self._is_bot_admin(event):
             msg.extend([
                 "",
-                "[Bot 管理员]",
-                "- /emotion query <@用户或ID>",
-                "- /emotion list [页码]",
-                "- /emotion set <@用户或ID> <好感度>",
-                "- /emotion mood <@用户或ID> [维度] <数值>",
-                "- /emotion clear <@用户或ID>",
-                "- /emotion clear-all",
-                "- /emotion persona",
-                "- /emotion persona-clear",
+                "## Bot 管理员",
                 "",
-                "示例：",
-                "- /emotion query 10001",
-                "- /emotion set 10001 60",
-                "- /emotion mood 10001 喜悦 80",
+                "- `/emotion query <@用户或ID>`　查看指定用户",
+                "- `/emotion list [页码]`　排行榜（每页 8 人）",
+                "- `/emotion set <@用户或ID> <好感度>`　设置好感值",
+                "- `/emotion mood <@用户或ID> [维度] <数值>`　修改情感",
+                "- `/emotion clear <@用户或ID>`　清空指定用户",
+                "- `/emotion clear-all`　清空当前人格",
+                "- `/emotion persona`　查看人设摘要",
+                "- `/emotion persona-clear`　清除人设摘要",
+                "- `/emotion regenerate`　重新生成各档位心态描述",
+                "",
+                "> 示例：`/emotion query 10001`　`/emotion set 10001 600`",
             ])
 
         md_text = "\n".join(msg)
@@ -1947,4 +2272,7 @@ class EmotionFavourPlugin(Star):
             return
         persona_id = await self._get_persona_id(event)
         await self.db.delete_persona_summary(persona_id)
-        yield event.plain_result(f"已清除人设摘要 (persona_id={persona_id})")
+        removed_scripts = await self.db.delete_tier_scripts(persona_id)
+        yield event.plain_result(
+            f"已清除人设摘要与 {removed_scripts} 条档位描述 (persona_id={persona_id})"
+        )
