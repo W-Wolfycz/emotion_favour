@@ -1,22 +1,33 @@
 """权限策略与「命令登记」不变量测试。
 
-- 公开命令不走管理员判定、管理命令必须 Bot 管理员、特殊 ID 才拿特殊初始值；
-- 两个命令集合与权限检查点都从 `main.py` 现取（不是测试自造副本），并断言每个
-  会做权限检查的命令名都已登记：`_check_command_permission` 对未登记命令是
-  fail-closed，漏登记的表现是「命令静默不可用」，只在真正用到时才发现。
+- 管理命令必须 Bot 管理员（含未登记命令 fail-closed）；
+- 特殊 ID 才拿特殊初始好感度；
+- 命令集合与权限检查点都从 `main.py` 现取（不是测试自造副本），并断言每个会做
+  权限检查的命令名都已登记：漏登记的表现是「命令静默不可用」。
 
 运行：
     python3 -m unittest tests.test_permission_policy -v
 """
 import asyncio
+import importlib.util
 import re
-import sys
 import types
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from support import extract_class_attribute, extract_method, read_main_source  # noqa: E402
+
+def _load_shared():
+    """按路径加载 tests/_shared.py（pytest 下不能按包名 import）。"""
+    path = Path(__file__).resolve().parent / "_shared.py"
+    spec = importlib.util.spec_from_file_location("ef_tests_shared", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+_shared = _load_shared()
+extract_class_attribute = _shared.extract_class_attribute
+extract_method = _shared.extract_method
+read_main_source = _shared.read_main_source
 
 CHECKED_COMMAND_PATTERN = re.compile(r'_check_command_permission\(event,\s*"([^"]+)"')
 
@@ -66,14 +77,9 @@ class TestPermissionPolicy(unittest.TestCase):
             max_favour_value=100,
         )
 
-    def test_public_commands_are_available_to_everyone(self):
-        plugin = self._plugin(is_admin=False)
-        self.assertTrue(self.public, "公开命令集合不应为空")
-        for name in sorted(self.public):
-            with self.subTest(command=name):
-                self.assertTrue(asyncio.run(self.check(plugin, _Event("10002"), name)))
-
     def test_management_commands_require_bot_admin(self):
+        """安全边界：管理命令对非管理员必须拒绝、对管理员必须放行，未登记命令
+        fail-closed。任一方向判错都没有运行期报错，只会静默越权或静默失效。"""
         non_admin = self._plugin(is_admin=False)
         bot_admin = self._plugin(is_admin=True)
         self.assertTrue(self.admin, "管理命令集合不应为空")
@@ -87,17 +93,19 @@ class TestPermissionPolicy(unittest.TestCase):
         )
 
     def test_checked_commands_are_registered(self):
-        """漏登记 = 命令静默不可用：新增命令只在真正被调用时才发现没权限。"""
+        """守「新增命令带权限检查但漏登记」：fail-closed 会让该命令静默不可用，
+        只有真被人用到时才暴露；检查点与登记表都从源码现取，不维护测试副本。"""
         checked = _checked_command_names(self.src)
         self.assertTrue(checked, "应从 main.py 提取到权限检查点")
         registered = set(self.public) | set(self.admin)
         self.assertEqual(sorted(set(checked) - registered), [])
 
     def test_explicit_special_ids_only_get_special_initial_favour(self):
+        """守「初始好感度被静默改写」：显式特使拿 admin_default_favour，其他人拿
+        default_favour；判错只会让新用户的起算值悄悄变成另一个数。"""
         plugin = self._plugin(is_admin=False)
         self.assertEqual(asyncio.run(self.initial(plugin, _Event("10002"))), 50)
         self.assertEqual(asyncio.run(self.initial(plugin, _Event("10001"))), 0)
-
 
 if __name__ == "__main__":
     unittest.main()

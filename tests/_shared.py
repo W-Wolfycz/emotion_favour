@@ -3,6 +3,14 @@
 集中「从 main.py 提取方法源码」的工具和几个通用桩对象，避免每个测试文件
 各抄一套样板（AGENTS：测试基础设施要复用，不为每个测试文件重复搭环境）。
 
+pytest 下 tests/ 不是包，跨测试文件不能按包名 import，统一由各测试文件
+按路径加载本模块：
+
+    _shared = importlib.util.module_from_spec(
+        importlib.util.spec_from_file_location(
+            "ef_tests_shared", Path(__file__).resolve().parent / "_shared.py"))
+    _shared.__spec__.loader.exec_module(_shared)
+
 本地不安装 astrbot，所以凡是插件类方法一律走源码提取 + 桩执行，
 不导入 `main.py`，也不导入真实 `astrbot.core`。
 """
@@ -18,8 +26,6 @@ MAIN_PY = PLUGIN_DIR / "main.py"
 
 if str(PLUGIN_DIR) not in sys.path:
     sys.path.insert(0, str(PLUGIN_DIR))
-if str(TESTS_DIR) not in sys.path:
-    sys.path.insert(0, str(TESTS_DIR))
 
 
 def read_main_source() -> str:
@@ -136,15 +142,6 @@ def extract_class_attribute(src: str, name: str) -> str:
         if depth <= 0:
             return textwrap.dedent("".join(block))
     raise ValueError(f"类属性 {name} 的赋值块不完整")
-
-
-def load_module_constant(module_path, name: str):
-    """读取模块顶层常量（如 MAX_INTERACTION_CHARS）的求值结果。"""
-    source = Path(module_path).read_text(encoding="utf-8")
-    matched = re.search(rf"^{re.escape(name)} = (.+)$", source, re.MULTILINE)
-    if not matched:
-        raise ValueError(f"未找到模块常量 {name}")
-    return eval(matched.group(1), {})  # noqa: S307
 
 
 class EventStub:

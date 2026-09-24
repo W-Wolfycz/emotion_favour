@@ -6,21 +6,24 @@
 运行：
     python3 -m unittest tests.test_emotion_html -v
 """
-import sys
+import importlib.util
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from support import PLUGIN_DIR  # noqa: E402
 
-sys.path.insert(0, str(PLUGIN_DIR))
+def _load_shared():
+    """按路径加载 tests/_shared.py（pytest 下不能按包名 import）。"""
+    path = Path(__file__).resolve().parent / "_shared.py"
+    spec = importlib.util.spec_from_file_location("ef_tests_shared", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+_load_shared()  # 只为把插件目录放进 sys.path，下面的 domain 直接 import
+
 from domain import build_list_html, build_report_html  # noqa: E402
 
-EMPTY_RECORD = SimpleNamespace(**{dim: 0 for dim in (
-    "joy", "trust", "fear", "surprise", "sadness", "disgust",
-    "anger", "anticipation", "pride", "guilt", "shame", "envy",
-)})
 
 def record(**overrides):
     values = dict(
@@ -30,9 +33,11 @@ def record(**overrides):
     values.update(overrides)
     return SimpleNamespace(**values)
 
+
 class OutputEscapingTest(unittest.TestCase):
     def test_user_controlled_text_is_escaped(self):
-        """昵称/关系名来自用户；漏转义时出图仍然成功，只有被注入才暴露。"""
+        """安全边界：昵称/关系名进 HTML 前必须转义。漏转义时出图仍然成功、
+        页面外观也正常，只有用户把标签写进昵称才暴露，属静默注入面。"""
         report_html = build_report_html(
             record(), favour=440, max_favour=800, relationship='<b>喜欢</b>',
             who='甲 "乙" · 10001', percent=44.7, hint="距下一级还需 111 点",

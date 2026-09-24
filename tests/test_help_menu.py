@@ -7,12 +7,24 @@
     python3 -m unittest tests.test_help_menu -v
 """
 import asyncio
-import sys
+import importlib.util
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from support import EventStub, load_methods, make_logger  # noqa: E402
+
+def _load_shared():
+    """按路径加载 tests/_shared.py（pytest 下不能按包名 import）。"""
+    path = Path(__file__).resolve().parent / "_shared.py"
+    spec = importlib.util.spec_from_file_location("ef_tests_shared", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+_shared = _load_shared()
+EventStub = _shared.EventStub
+load_methods = _shared.load_methods
+make_logger = _shared.make_logger
+
 
 class HelpMenuTest(unittest.TestCase):
     @classmethod
@@ -43,6 +55,8 @@ class HelpMenuTest(unittest.TestCase):
         return asyncio.run(collect())[0][1]
 
     def test_permission_controls_visible_commands(self):
+        """安全边界：非管理员看帮助时不能出现管理命令（越权信息面）。
+        管理员那一侧同时断言，避免用「一律不显示管理段」蒙对。"""
         admin_text = self._render(admin=True)
         self.assertIn("## Bot 管理员", admin_text)
         self.assertIn("/emotion regenerate", admin_text)

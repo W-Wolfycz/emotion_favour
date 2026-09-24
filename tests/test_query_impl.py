@@ -1,22 +1,32 @@
-"""`/emotion me` / `query` 的档位描述展示范围。
+"""`/emotion me` / `query` 的档位描述展示范围与进度口径。
 
-档位描述是「角色对这段关系的自述」，查他人时多带一句不会报错，属于静默泄漏。
+档位描述是「角色对这段关系的自述」，查他人时多带一句不会报错，属于静默泄漏；
+进度百分比/提示算错则只体现在出图的数字上，同样不报错。
 
 运行：
     python3 -m unittest tests.test_query_impl -v
 """
 import asyncio
-import sys
+import importlib.util
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from support import EventStub, PLUGIN_DIR, load_methods, make_logger  # noqa: E402
 
-sys.path.insert(0, str(PLUGIN_DIR))
+def _load_shared():
+    """按路径加载 tests/_shared.py（pytest 下不能按包名 import）。"""
+    path = Path(__file__).resolve().parent / "_shared.py"
+    spec = importlib.util.spec_from_file_location("ef_tests_shared", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+_shared = _load_shared()
+EventStub = _shared.EventStub
+load_methods = _shared.load_methods
+make_logger = _shared.make_logger
+
 from domain import (  # noqa: E402
-    EMOTION_DIMENSIONS,
     build_report_html,
     compute_tier_progress,
     format_emotion_detail,
@@ -25,13 +35,6 @@ from domain import (  # noqa: E402
 TIER_LOW = {"min_value": 351, "max_value": 550, "describe": "喜欢"}
 TIER_MAX = {"min_value": 551, "max_value": 800, "describe": "挚爱"}
 
-class _FavourRecord:
-    def __init__(self, persona_id="", user_id="", favour=0, **_kwargs):
-        self.persona_id = persona_id
-        self.user_id = user_id
-        self.favour = favour
-        for dimension in EMOTION_DIMENSIONS:
-            setattr(self, dimension, 0)
 
 def _record(**overrides):
     values = dict(
@@ -42,8 +45,10 @@ def _record(**overrides):
     values.update(overrides)
     return SimpleNamespace(**values)
 
+
 async def _display_name(_event, uid):
     return f"用户{uid}"
+
 
 class _Stub:
     min_favour_value = 0
@@ -52,7 +57,6 @@ class _Stub:
     def __init__(self, **overrides):
         self.persona_id = "persona_demo"
         self.record = overrides.get("record", _record())
-        self.initial_favour = overrides.get("initial_favour", 128)
         self.relationship = overrides.get("relationship", "喜欢")
         self.relationship_range = overrides.get("relationship_range")
         self.special = overrides.get("special", False)
@@ -60,7 +64,6 @@ class _Stub:
         self.tier_script_enabled = overrides.get("tier_script_enabled", True)
         self.tier_calls = []
         self.rendered = []
-        self.initial_calls = []
         self.db = SimpleNamespace(get_favour=self._get_favour)
 
     async def _get_favour(self, _persona_id, _user_id):
@@ -71,10 +74,6 @@ class _Stub:
 
     def _decay_favour_value(self, record):
         return record.favour
-
-    async def _get_initial_favour_for(self, _event, user_id):
-        self.initial_calls.append(user_id)
-        return self.initial_favour
 
     def _get_relationship(self, _favour, _user_id=""):
         return self.relationship
@@ -105,6 +104,7 @@ class _Stub:
     def _tag(self, _event):
         return "[EmotionFavour]"
 
+
 class QueryImplTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -113,7 +113,6 @@ class QueryImplTest(unittest.TestCase):
             namespace={
                 "logger": make_logger("test_query_impl"),
                 "get_user_display_name": _display_name,
-                "FavourRecord": _FavourRecord,
                 "compute_tier_progress": compute_tier_progress,
                 "build_report_html": build_report_html,
                 "format_emotion_detail": format_emotion_detail,
@@ -134,7 +133,8 @@ class QueryImplTest(unittest.TestCase):
         return stub, asyncio.run(collect())
 
     def test_simple_mode_does_not_always_report_max_tier(self):
-        """simple 模式（默认）没有 advance 档位，不能因此显示「已满级」与实际区间脱节。"""
+        """回归：simple 模式（默认）没有 advance 档位，不能用「没有下一档 = 已满级」
+        的口径，否则默认配置下任何好感度都显示已满级，与对话注入的区间口径矛盾。"""
         stub = _Stub(relationship_range=(31, 100))
         stub._find_tier = lambda _favour: None
         stub._find_next_tier = lambda _favour: None
@@ -144,7 +144,8 @@ class QueryImplTest(unittest.TestCase):
         self.assertIn("距下一级还需", md_text)
 
     def test_tier_script_can_be_disabled_by_config(self):
-        """开关关掉后既不显示也不该后台生成（配置被静默忽略会白烧 LLM 调用）。"""
+        """守「配置被静默忽略」：开关关掉后仍会后台生成并展示，出图照常成功，
+        但会白烧一次 LLM 调用且卡片底部多出一段本不该有的自述。"""
         stub, _ = self._run(
             call_kwargs={"include_tier_script": True}, tier_script_enabled=False
         )
@@ -152,7 +153,8 @@ class QueryImplTest(unittest.TestCase):
         self.assertNotIn("<blockquote>", stub.rendered[0])
 
     def test_tier_script_only_for_self_query(self):
-        """查他人时多带一句角色自述不会报错，属于静默泄漏，必须盯住。"""
+        """守「查他人时泄漏角色自述」：`include_tier_script` 只在自查入口为真，
+        多带一句不会报错，只有专门比对输出才发现。"""
         without, _ = self._run()
         self.assertEqual(without.tier_calls, [])
         self.assertNotIn("<blockquote>", without.rendered[0])
@@ -162,6 +164,24 @@ class QueryImplTest(unittest.TestCase):
         self.assertIn(
             "<blockquote>别多想，我只是有点习惯了。</blockquote>", with_script.rendered[0]
         )
+
+
+class ComputeTierProgressTest(unittest.TestCase):
+    def test_max_tier_progress_uses_global_ceiling(self):
+        """满级（next_tier_min=None）的进度右边界必须用 max_favour_value：改用档位
+        自身 max_value 不会报错，只会让「已满级」旁边悄悄显示一个偏低的百分比。"""
+        percent, hint = compute_tier_progress(
+            150, tier_min=101, tier_max=300, max_favour_value=800, next_tier_min=None,
+        )
+        self.assertEqual(hint, "已满级")
+        self.assertEqual(percent, 7.0)
+
+        # 非满级仍按档位区间算，并给出到下一档的差值
+        percent, hint = compute_tier_progress(
+            150, tier_min=101, tier_max=300, max_favour_value=800, next_tier_min=301,
+        )
+        self.assertEqual(percent, 24.6)
+        self.assertEqual(hint, "距下一级还需 151 点")
 
 if __name__ == "__main__":
     unittest.main()

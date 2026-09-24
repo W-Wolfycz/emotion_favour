@@ -1,20 +1,31 @@
 """`/emotion list` 昵称模式的取数分支。
 
-昵称不是数据库列，误走 list_records 会静默查到错误数据。
+昵称不是数据库列，误走 list_records 会静默查到错误数据（storage.list_records
+对未知排序列回落到 favour，不报错）。
 
 运行：
     python3 -m unittest tests.test_list_command -v
 """
 import asyncio
-import sys
+import importlib.util
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from support import EventStub, PLUGIN_DIR, load_methods, make_logger  # noqa: E402
 
-sys.path.insert(0, str(PLUGIN_DIR))
+def _load_shared():
+    """按路径加载 tests/_shared.py（pytest 下不能按包名 import）。"""
+    path = Path(__file__).resolve().parent / "_shared.py"
+    spec = importlib.util.spec_from_file_location("ef_tests_shared", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+_shared = _load_shared()
+EventStub = _shared.EventStub
+load_methods = _shared.load_methods
+make_logger = _shared.make_logger
+
 from domain import (  # noqa: E402
     EMOTION_DIMENSIONS,
     EMOTION_DISPLAY_NAMES,
@@ -22,9 +33,11 @@ from domain import (  # noqa: E402
     get_dominant_emotions,
 )
 
+
 def _stub_escape_markdown(text) -> str:
-    """其自身行为由 tests/test_utils.py 覆盖，这里只需要可判定的文本。"""
+    """只需要可判定的文本；转义本身不在本用例的判据内。"""
     return str(text)
+
 
 def _record(user_id, **overrides):
     values = dict(
@@ -38,13 +51,13 @@ def _record(user_id, **overrides):
         setattr(record, dimension, values[dimension])
     return record
 
+
 async def _display_name(_event, uid):
     return f"用户{uid}"
 
+
 class _Stub:
     group_sort_by = "favour"
-    min_favour_value = 0
-    max_favour_value = 800
 
     def __init__(self, **overrides):
         self.permitted = overrides.get("permitted", True)
@@ -97,6 +110,7 @@ class _Stub:
     def _tag(self, _event):
         return "[EmotionFavour]"
 
+
 class ListCommandTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -124,7 +138,8 @@ class ListCommandTest(unittest.TestCase):
         return stub, asyncio.run(collect())
 
     def test_nickname_sort_mode_does_not_query_by_column(self):
-        """nickname 模式的排序键不是数据库列，误改成 list_records 会静默查错数据。"""
+        """守「昵称模式误走数据库排序列」：list_records 对未知列静默回落 favour，
+        出图照常成功但顺序与页码内容都是错的，不看数据看不出来。"""
         stub = _Stub(total=3)
         stub.group_sort_by = "nickname"
         stub, results = self._run(stub=stub)

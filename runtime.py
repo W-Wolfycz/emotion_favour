@@ -3,7 +3,7 @@
 本模块不依赖 AstrBot，便于使用标准库单元测试：
 
 - :class:`TaskSupervisor` 持有 fire-and-forget 任务引用、消费异常，并在插件
-  ``terminate()`` 时区分长期任务和短期可 flush 任务进行收尾。
+  ``terminate()`` 时给在跑的任务一个有限的完成窗口。
 - :class:`KeyedLockPool` 按业务 key 串行执行临界区，避免同一 persona/user 的
   LLM 结算、命令修改和 WebUI 修改乱序覆盖。
 - :class:`PersonaMutationGate` 为人格级管理操作提供写入屏障，并用 epoch
@@ -30,23 +30,13 @@ class TaskSupervisor:
         self._logger = logger
         self._name_prefix = name_prefix
         self._transient: set[asyncio.Task] = set()
-        self._persistent: set[asyncio.Task] = set()
         self._closing = False
-
-    @property
-    def closing(self) -> bool:
-        return self._closing
-
-    @property
-    def pending_count(self) -> int:
-        return sum(not task.done() for task in self._transient | self._persistent)
 
     def spawn(
         self,
         awaitable: Awaitable[T],
         *,
         name: str,
-        persistent: bool = False,
     ) -> Optional[asyncio.Task[T]]:
         """创建并保活任务；关闭阶段拒绝新任务。"""
         if self._closing:
@@ -59,14 +49,12 @@ class TaskSupervisor:
             awaitable,
             name=f"{self._name_prefix}.{name}",
         )
-        bucket = self._persistent if persistent else self._transient
-        bucket.add(task)
+        self._transient.add(task)
         task.add_done_callback(self._on_done)
         return task
 
     def _on_done(self, task: asyncio.Task) -> None:
         self._transient.discard(task)
-        self._persistent.discard(task)
         if task.cancelled():
             return
         try:
@@ -80,14 +68,8 @@ class TaskSupervisor:
             )
 
     async def close(self, *, flush_timeout: float = 8.0) -> None:
-        """停止长期任务，并给短期任务一个有限的完成窗口。"""
+        """给在跑的后台任务一个有限的完成窗口，超时后再取消。"""
         self._closing = True
-
-        persistent = [task for task in self._persistent if not task.done()]
-        for task in persistent:
-            task.cancel()
-        if persistent:
-            await asyncio.gather(*persistent, return_exceptions=True)
 
         transient = [task for task in self._transient if not task.done()]
         if transient:
@@ -103,7 +85,6 @@ class TaskSupervisor:
                 await asyncio.gather(*transient, return_exceptions=True)
 
         self._transient.clear()
-        self._persistent.clear()
 
 
 @dataclass
