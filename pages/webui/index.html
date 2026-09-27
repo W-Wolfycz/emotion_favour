@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>emotion_favour · 印象管理台</title>
-  <link rel="stylesheet" href="style.css?v=3.4.3-r6">
+  <link rel="stylesheet" href="style.css?v=3.6.0">
   <script>
     // 防止浅色主题闪烁（FOUC）：AstrBot 主 webui 注入 localStorage 主题
     (function () {
@@ -69,6 +69,7 @@
         <span class="stat-item">人格：<strong id="persona-tag">—</strong></span>
         <span class="stat-item">共 <strong id="user-count">0</strong> 位用户</span>
         <span class="stat-item">好感度范围：<strong id="range-tag">—</strong></span>
+        <span class="stat-item" id="health-tag">结算：<span id="health-value">—</span></span>
         <span class="stat-item" id="mode-tag" hidden>关系模式：<strong id="mode-value">—</strong></span>
         <span class="sort-bar">
           <span class="sort-label">排序：</span>
@@ -136,6 +137,18 @@
         <span class="stored-favour-note" id="edit-stored-favour"></span>
       </div>
       <div class="emotion-grid" id="edit-emotion-grid"></div>
+      <details class="emotions-collapse scar-collapse" id="edit-scars">
+        <summary>伤痕（只读）</summary>
+        <div class="scar-grid" id="edit-scar-grid"></div>
+      </details>
+      <details class="emotions-collapse injection-collapse" id="edit-injection">
+        <summary>注入预览</summary>
+        <div class="injection-meta">
+          <span>当前关系：<strong id="injection-relationship">—</strong></span>
+          <span>有效好感：<strong id="injection-favour">—</strong></span>
+        </div>
+        <pre class="injection-text" id="injection-text">加载中...</pre>
+      </details>
     </div>
     <div class="dialog-footer">
       <span class="updated-at" id="edit-updated-at">—</span>
@@ -227,7 +240,7 @@
     </div>
   </dialog>
 
-  <script src="persona_logic.js?v=3.4.3-r6"></script>
-  <script src="app.js?v=3.4.3-r6"></script>
+  <script src="persona_logic.js?v=3.6.0"></script>
+  <script src="app.js?v=3.6.0"></script>
 </body>
 </html>

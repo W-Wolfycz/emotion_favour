@@ -942,6 +942,75 @@ body {
   color: var(--text-color);
 }
 
+/* 注入预览：复用 .emotions-collapse 的折叠外壳，只加内容区样式 */
+.injection-collapse summary {
+  margin-bottom: 8px;
+}
+
+.injection-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  margin-bottom: 8px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.injection-meta strong {
+  color: var(--heading-color);
+  font-weight: 600;
+}
+
+.injection-text {
+  margin: 0;
+  padding: 10px 12px;
+  max-height: 260px;
+  overflow: auto;
+  background: var(--background-color);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  color: var(--text-color);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* 加载中 / 拉取失败的一行浅色提示 */
+.injection-text.muted {
+  color: var(--text-muted);
+}
+
+/* 伤痕只读展示（红=有伤，越负越深） */
+.scar-collapse summary {
+  margin-bottom: 8px;
+}
+
+.scar-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.scar-chip {
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  border: 1px solid transparent;
+}
+
+.scar-negative {
+  color: #c0392b;
+  background: rgba(192, 57, 43, 0.08);
+  border-color: rgba(192, 57, 43, 0.25);
+}
+
+.scar-empty {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
 /* ==================== 状态显示 ==================== */
 
 .loading-wrap {

@@ -1,6 +1,6 @@
 # emotion_favour 代码逻辑测试
 
-当前源码版本：3.5.0。当前规模：Python 45 项 + Node 3 项。
+当前源码版本：3.5.0。当前规模：Python 66 项 + Node 3 项。
 
 ## 定位与边界
 
@@ -8,8 +8,8 @@
 `astrbot.core`，也不依赖 AstrBot 源码、backend 或插件运行依赖（sqlmodel、
 aiofiles 等）；需要真实运行时的行为由部署端验收。
 
-自动化测试允许使用 mock 和源码片段提取，但不得依赖或修改真实插件数据，
-也不得执行以下操作：
+自动化测试允许使用 mock 和源码片段提取，也允许在 `tempfile` 里建真实 SQLite 文件
+（见 `test_migrations.py`），但不得依赖或修改真实插件数据，也不得执行以下操作：
 
 - 启动、停止或重载真实 AstrBot
 - 调用真实 LLM / Provider 或发送平台消息
@@ -35,6 +35,22 @@ python3 -m unittest tests.test_tier_script_flow.EnsureTierScriptsTest -v
 node --test tests/test_persona_logic.js
 ```
 
+提交前的语法级冒烟（本地不装 astrbot，所以只做 `ast.parse`；真正的 import 期错误
+只能在部署端 reload 时暴露）：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -c "
+import ast, pathlib
+for path in sorted(pathlib.Path('.').glob('*.py')):
+    ast.parse(path.read_text(encoding='utf-8'))
+print('ast.parse OK')
+"
+
+# ruff 致命集（pyproject.toml 配置的 E9/F63/F7/F82）；F821 专抓"用了没导入的名字"——
+# 它能拦住 ast.parse 与测试都看不见的 NameError（如只在使用处才触发的漏 import）。
+~/.local/bin/ruff check .
+```
+
 ## 测试模块
 
 | 文件 | 验证内容 | 隔离方式 |
@@ -57,6 +73,10 @@ node --test tests/test_persona_logic.js
 | `test_config.py` | 重试次数钳制、备份保留期、档位重叠校验 | 直接导入 `config.py` |
 | `test_utils.py` | 过期文件清理的后缀/年龄过滤 | 从 `utils.py` 提取顶层函数 |
 | `test_render_custom_t2i.py` | 出图模板的正文注入顺序/转义与临时 HTML 清理 | 假 page/browser，不启动 Playwright |
+| `test_migrations.py` | 迁移 runner 的升级、时间戳 UTC 化、幂等、备份时机、失败回滚 | 真 `db_migrations.py` + stdlib sqlite，tempfile 造存量库 |
+| `test_settlement_contract.py` | 结算 prompt 示例与解析器的标签契约、clamp、维度白名单、坏输出不写库 | 从 `main.py` 提取 `_calculate_favour_bg` + 桩 self |
+| `test_numeric_invariants.py` | 收益递减、好感衰减、情感代谢、档位百分比的数值不变量 | 直接导入 `domain.py`，固定种子 stdlib random |
+| `test_message_placeholder.py` | 非文本消息的占位映射（空 message_str 会让整轮结算静默跳过） | 从 `utils.py` 提取顶层函数 |
 | `test_persona_logic.js` | 初始人格回退、搜索过滤、键盘导航 | Node 内置测试运行器 |
 
 ## 部署端验收
@@ -64,8 +84,9 @@ node --test tests/test_persona_logic.js
 以下行为不放进本目录的自动化测试，由部署端 Beta/体验测试确认：
 
 - 插件真实加载、初始化、卸载和热重载
-- 既有运行数据库的备份、迁移和数据保全
-- 数据库迁移 runner 的成功、幂等、失败回滚、备份与 schema 校验
+- 既有运行数据库的真实备份、迁移和数据保全（迁移 runner 的升级/幂等/备份时机/失败
+  回滚与 schema 校验已由 `test_migrations.py` 在 stdlib 临时库上本地覆盖，仍待部署端
+  用真实存量库确认一次）
 - 真实 Provider 响应、后台 LLM 任务及平台消息链路
 - Playwright Chromium 安装、真实 HTML 渲染与错误提示（模板注入顺序/转义与临时文件
   清理由 `test_render_custom_t2i.py` 用假 page 覆盖，不做真实浏览器验收）
@@ -82,7 +103,9 @@ node --test tests/test_persona_logic.js
 - 同一个不变量只留一条最有代表性的断言；等价输入不要用 subTest 堆数量，
   真正的精简以「删掉后有没有不变量失去保护」为准。
 - 新增或修改领域规则时，优先为纯函数补充用例。
-- 数据库持久化与迁移逻辑不在本目录自动化覆盖，由部署端验收。
+- 数据库迁移/持久化逻辑走 `test_migrations.py`：真实 runner 在 tempfile 建库上跑，
+  只依赖 stdlib（sqlite3/tempfile/zoneinfo），不导入 astrbot/sqlmodel/aiosqlite；
+  涉及真实运行库的数据保全仍由部署端验收。
 - 修改 Prompt 注入、权限或关系档位时，更新对应行为测试。
 - 外部依赖统一使用 mock；不得把下载、联网或真实平台副作用引入测试。
 - 共享 Fake/桩统一放 `_shared.py`；pytest 下 `tests/` 不是包，各测试文件一律用

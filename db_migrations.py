@@ -217,6 +217,10 @@ FAVOUR_COLUMNS = (
     "joy", "trust", "fear", "surprise", "sadness", "disgust", "anger",
     "anticipation", "pride", "guilt", "shame", "envy",
 )
+EMOTION_COLUMNS = FAVOUR_COLUMNS[6:]
+# 伤痕列（0 = 无历史，负 = 有伤），列名与 domain.scar_field 保持一致
+SCAR_COLUMNS = tuple(f"scar_{name}" for name in EMOTION_COLUMNS)
+FAVOUR_COLUMNS = FAVOUR_COLUMNS + SCAR_COLUMNS
 PERSONA_SUMMARY_COLUMNS = ("id", "persona_id", "summary", "persona_hash", "updated_at")
 TIER_SCRIPT_COLUMNS = (
     "id", "persona_id", "tier_key", "tier_label", "script", "persona_hash", "updated_at",
@@ -269,7 +273,17 @@ def add_emotion_columns(connection: sqlite3.Connection) -> None:
     if not table_exists(connection, "favour_records"):
         return
     existing = set(column_names(connection, "favour_records"))
-    for name in FAVOUR_COLUMNS[6:]:
+    for name in EMOTION_COLUMNS:
+        if name not in existing:
+            connection.execute(f'ALTER TABLE favour_records ADD COLUMN "{name}" INTEGER DEFAULT 0')
+
+
+def add_scar_columns(connection: sqlite3.Connection) -> None:
+    """伤痕列：默认 0（无历史），存量用户升级后行为与升级前逐位相同。"""
+    if not table_exists(connection, "favour_records"):
+        return
+    existing = set(column_names(connection, "favour_records"))
+    for name in SCAR_COLUMNS:
         if name not in existing:
             connection.execute(f'ALTER TABLE favour_records ADD COLUMN "{name}" INTEGER DEFAULT 0')
 

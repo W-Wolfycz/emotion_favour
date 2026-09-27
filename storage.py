@@ -1,5 +1,6 @@
 # storage.py
 import json
+import os
 import string
 import asyncio
 import sqlite3
@@ -19,6 +20,8 @@ from .domain import (
     EMOTION_DIMENSIONS,
     EMOTION_DISPLAY_NAMES,
     EMOTION_GROUPS,
+    SCAR_MAX,
+    SCAR_MIN,
     TICK_SECONDS,
     TONE_INSTRUCTIONS,
     apply_emotion_decay,
@@ -31,6 +34,7 @@ from .domain import (
     diminish_delta,
     format_emotion_detail,
     get_dominant_emotions,
+    scar_field,
     utc_now,
 )
 from .log import logger
@@ -39,6 +43,7 @@ from .db_migrations import (
     SQLiteMigrationRunner,
     TIER_SCRIPT_DDL,
     add_emotion_columns,
+    add_scar_columns,
     ensure_tier_scripts_table,
     normalize_utc_timestamps,
     validate_favour_schema,
@@ -127,6 +132,20 @@ class FavourRecord(SQLModel, table=True):
     shame: int = Field(default=0)
     envy: int = Field(default=0)
 
+    # 12 维伤痕（0 = 无历史，负 = 有伤，范围 SCAR_MIN~0）
+    scar_joy: int = Field(default=0)
+    scar_trust: int = Field(default=0)
+    scar_fear: int = Field(default=0)
+    scar_surprise: int = Field(default=0)
+    scar_sadness: int = Field(default=0)
+    scar_disgust: int = Field(default=0)
+    scar_anger: int = Field(default=0)
+    scar_anticipation: int = Field(default=0)
+    scar_pride: int = Field(default=0)
+    scar_guilt: int = Field(default=0)
+    scar_shame: int = Field(default=0)
+    scar_envy: int = Field(default=0)
+
 
 class PersonaSummaryRecord(SQLModel, table=True):
     __tablename__ = "persona_summaries"
@@ -207,6 +226,7 @@ class FavourDBManager:
             self.data_dir / "backups",
             (
                 SQLiteMigration("add_emotion_columns_v1", add_emotion_columns),
+                SQLiteMigration("add_scar_columns_v1", add_scar_columns),
                 SQLiteMigration("ensure_tier_scripts_table_v1", ensure_tier_scripts_table),
                 SQLiteMigration(
                     "normalize_utc_timestamps_v1",
@@ -353,6 +373,9 @@ class FavourDBManager:
                 }
                 async with aio_open(temporary, "w", encoding="utf-8") as f:
                     await f.write(json.dumps(payload, ensure_ascii=False, indent=2))
+                    # 先落盘再改名：否则断电后可能留下"名字对、内容空"的备份
+                    await f.flush()
+                    await asyncio.to_thread(os.fsync, f.fileno())
                 await asyncio.to_thread(temporary.replace, filename)
                 protected = frozenset(self._protected_backup_files)
                 removed = await asyncio.to_thread(
@@ -449,6 +472,7 @@ class FavourDBManager:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            self._quarantine_backup(path, exc)
             raise ValueError("备份文件损坏或无法读取") from exc
 
         if isinstance(payload, dict):
@@ -473,6 +497,15 @@ class FavourDBManager:
         if len(records) != len(records_payload):
             raise ValueError("备份文件包含无效记录")
         return path, records, timestamp_storage
+
+    def _quarantine_backup(self, path: Path, exc: Exception) -> None:
+        """把损坏的备份改名隔离，免得每次扫描都报同一个错。"""
+        try:
+            quarantined = path.with_suffix(path.suffix + ".damaged")
+            path.replace(quarantined)
+            logger.warning(f"备份文件损坏，已隔离为 {quarantined.name}: {type(exc).__name__}")
+        except OSError as move_error:
+            logger.warning(f"备份文件损坏且隔离失败: {type(move_error).__name__}")
 
     def _backup_kind(self, filename: str) -> str:
         if filename.startswith("pre_restore_"):
@@ -726,8 +759,19 @@ class FavourDBManager:
                 records.extend(result.scalars().all())
         return records
 
-    async def update_favour(self, persona_id: str, user_id: str, favour: Optional[int] = None, emotion_updates: Optional[dict] = None) -> bool:
-        """原子 UPSERT：favour 为绝对值，emotion_updates 为增量。"""
+    async def update_favour(
+        self,
+        persona_id: str,
+        user_id: str,
+        favour: Optional[int] = None,
+        emotion_updates: Optional[dict] = None,
+        scar_updates: Optional[dict] = None,
+    ) -> bool:
+        """原子 UPSERT：favour 为绝对值，emotion_updates / scar_updates 为增量。
+
+        scar_updates 按维度名传（内部映射到 `scar_<维度>` 列），值域 SCAR_MIN~SCAR_MAX；
+        它只由结算路径写，管理台手改不碰这两类需求（伤痕不该被用户抹掉）。
+        """
         await self.init_db()
         if not _is_valid_userid(user_id):
             return False
@@ -744,6 +788,15 @@ class FavourDBManager:
                     except (TypeError, ValueError):
                         continue
 
+                clean_scars: dict[str, int] = {}
+                for dim, value in (scar_updates or {}).items():
+                    if dim not in EMOTION_DIMENSIONS:
+                        continue
+                    try:
+                        clean_scars[dim] = int(value)
+                    except (TypeError, ValueError):
+                        continue
+
                 insert_values = {
                     "persona_id": persona_id,
                     "user_id": user_id,
@@ -751,6 +804,10 @@ class FavourDBManager:
                     "created_at": now,
                     "updated_at": now,
                     **{dim: max(0, min(100, delta)) for dim, delta in clean_deltas.items()},
+                    **{
+                        scar_field(dim): max(SCAR_MIN, min(SCAR_MAX, delta))
+                        for dim, delta in clean_scars.items()
+                    },
                 }
                 stmt = sqlite_insert(FavourRecord).values(**insert_values)
                 updates = {"updated_at": now}
@@ -759,6 +816,11 @@ class FavourDBManager:
                 for dim, delta in clean_deltas.items():
                     column = getattr(FavourRecord, dim)
                     updates[dim] = func.max(0, func.min(100, column + delta))
+                for dim, delta in clean_scars.items():
+                    column = getattr(FavourRecord, scar_field(dim))
+                    updates[scar_field(dim)] = func.max(
+                        SCAR_MIN, func.min(SCAR_MAX, column + delta)
+                    )
                 stmt = stmt.on_conflict_do_update(
                     index_elements=["persona_id", "user_id"],
                     set_=updates,

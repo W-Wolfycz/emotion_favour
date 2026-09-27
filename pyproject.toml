@@ -1,0 +1,11 @@
+# 只启用 ruff 的致命集：语法级错误、未定义名、重复定义/import。
+# 这些是 ast.parse 抓不到的（未定义名、重复定义），与 AGENTS.md 的
+# 「模块级导入函数不得经 self. 调用」一类约定互补。
+# 刻意不启用格式类规则，也不跑 ruff format：本仓库的排版是手工风格。
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E9", "F63", "F7", "F82"]
+ignore = []

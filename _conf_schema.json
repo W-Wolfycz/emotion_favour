@@ -16,17 +16,12 @@
     ],
     "hint": "Galgame 模式：好感度容易提升，性格宽容。正常模式：平衡判定，符合一般社交直觉。拟真模式：好感度提升严格，性格复杂，难以取悦。"
   },
-  "group_sort_by": {
-    "description": "群组好感度排序方式",
+  "llm_provider": {
+    "description": "后台任务模型",
     "type": "string",
-    "default": "default",
-    "options": [
-      "default",
-      "favour",
-      "nickname",
-      "userid"
-    ],
-    "hint": "default 按添加时间排序；favour 按好感度从高到低排序；nickname 按昵称 A-Z 排序；userid 按用户 ID 排序。"
+    "default": "",
+    "_special": "select_provider",
+    "hint": "用于好感结算、人设摘要、档位描述生成等插件后台 LLM 任务；留空则跟随当前会话的对话模型。"
   },
   "min_favour_value": {
     "description": "好感度数值下限（例如 -100）",
@@ -46,17 +41,28 @@
     "default": 0,
     "hint": "新用户首次交互时的初始好感度值。别超出自定义的范围哦！"
   },
-  "llm_provider": {
-    "description": "后台任务模型",
+  "group_sort_by": {
+    "description": "群组好感度排序方式",
     "type": "string",
-    "default": "",
-    "_special": "select_provider",
-    "hint": "用于好感结算、人设摘要、档位描述生成等插件后台 LLM 任务；留空则跟随当前会话的对话模型。"
+    "default": "default",
+    "options": [
+      "default",
+      "favour",
+      "nickname",
+      "userid"
+    ],
+    "hint": "default 按添加时间排序；favour 按好感度从高到低排序；nickname 按昵称 A-Z 排序；userid 按用户 ID 排序。"
+  },
+  "tier_script_enabled": {
+    "description": "出图显示档位描述",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后 /emotion me 出图底部会显示当前关系档位的一句角色自述（按人格 × 档位生成，插件启动后自动补齐）。关闭后既不显示也不生成，已有描述会留在库里不删。"
   },
   "relationship_config": {
     "description": "好感度关系映射配置",
     "type": "object",
-    "hint": "根据好感度数值映射关系等级，用于查询展示和LLM行为引导。",
+    "hint": "关系等级的定义与档位描述：simple 用一组关系名均分，advance 用表格逐档配置边界、规则与过渡预告。",
     "items": {
       "mode": {
         "description": "映射模式",
@@ -133,29 +139,11 @@
       }
     }
   },
-  "advanced_config": {
-    "description": "高级配置",
+  "settlement_config": {
+    "description": "结算与衰减",
     "type": "object",
-    "hint": "包含数值波动范围、特殊用户和运行时控制等高级选项。",
+    "hint": "后台结算每轮允许的变化幅度、可选的伤痕机制，以及情感与好感随时间的回归行为。",
     "items": {
-      "admin_default_favour": {
-        "description": "特殊用户初始好感度",
-        "type": "int",
-        "default": 50,
-        "hint": "仅 favour_envoys 列表内用户首次建立记录时使用；Bot管理员、群主和群管理员不会自动应用。"
-      },
-      "admin_default_relationship": {
-        "description": "特殊用户关系",
-        "type": "string",
-        "default": "",
-        "hint": "留空则使用 relationship_config 映射。非空时，仅 favour_envoys 中明确填写的用户使用该特殊关系。"
-      },
-      "favour_envoys": {
-        "description": "特殊关系用户ID列表",
-        "type": "list",
-        "default": [],
-        "hint": "ID 填谁，谁就使用上面的特殊初始好感度和特殊关系。填写 QQ 号即可，一行一个；管理员不会自动加入。"
-      },
       "favour_change_min": {
         "description": "好感度单次变化最小值",
         "type": "int",
@@ -180,29 +168,39 @@
         "default": 5,
         "hint": "每个情感维度单次变化的上限（正值）。"
       },
-      "history_rounds": {
-        "description": "后台任务模型参考的近期对话轮数",
-        "type": "int",
-        "default": 0,
-        "hint": "0 表示仅参考当前一轮互动（默认行为）。设为 1-10 时，后台任务模型将参考最近 N 轮对话来判断好感度变化，需注意 Token 开销。"
-      },
-      "tier_script_enabled": {
-        "description": "出图显示档位描述",
-        "type": "bool",
-        "default": true,
-        "hint": "开启后 /emotion me 出图底部会显示当前关系档位的一句角色自述（按人格 × 档位生成，首次查询时后台补齐）。关闭则完全不生成也不显示。"
-      },
-      "use_chat_memory": {
-        "description": "使用 chat_memory 插件提供对话上下文",
+      "scar_enabled": {
+        "description": "启用伤痕机制",
         "type": "bool",
         "default": false,
-        "hint": "启用后，后台任务模型从 chat_memory 正式版 ≥ 1.0.0 按用户ID和当前人格读取严格配对的 LLM 历史；未启用时使用 AstrBot 自带上下文（群聊场景共享）。未安装、版本不兼容或查询失败时，本轮自动回退到 AstrBot 自带上下文。https://github.com/W-Wolfycz/chat_memory"
+        "hint": "开启后每个参与维度会额外记录一份伤痕：同一个冒犯，第一次和第十次不再等价——伤痕放大同向伤害、抑制正向修复，并随时间与善意互动缓慢消退。只作用于被伤害的方向（正向维下跌、负向维上涨），惊讶、内疚、害羞不参与。"
+      },
+      "scar_penalty_k": {
+        "description": "满痕伤害倍率上限 k",
+        "type": "float",
+        "default": 2.0,
+        "slider": {
+          "min": 1,
+          "max": 4,
+          "step": 0.1
+        },
+        "hint": "满痕时的伤害倍率上限：填 2 就是最多 2 倍，填 4 就是最多 4 倍，填 1 等于不放大。信任权重最高（1.0），会正好吃满这个上限；其余维度按各自权重落在该倍数之内，喜悦约 1.5 倍、期待约 1.4 倍。"
+      },
+      "scar_repair_k2": {
+        "description": "满痕修复倍率下限 k2",
+        "type": "float",
+        "default": 0.5,
+        "slider": {
+          "min": 0,
+          "max": 1,
+          "step": 0.05
+        },
+        "hint": "满痕时的修复倍率下限：填 0.5 表示伤痕满时善意互动只剩一半效果，填 0 表示完全无法用善意修复、只能等时间淡去。信任同样吃满这条下限，喜悦与期待只降到约 0.85 倍。"
       },
       "emotion_decay_enabled": {
         "description": "启用情感时间衰减",
         "type": "bool",
         "default": true,
-        "hint": "开启后，长时间未互动的用户情感维度会自然衰减回归 baseline，防止情绪长期累积不消退"
+        "hint": "关闭后情感维度不再随时间回归，长期不互动也会保持原值（好感度衰减不受影响，两者独立）。"
       },
       "emotion_decay_rate_volatile": {
         "description": "挥发组衰减率（surprise/anticipation）",
@@ -247,13 +245,57 @@
         "description": "启用好感度时间衰减",
         "type": "bool",
         "default": true,
-        "hint": "开启后，长时间未互动的用户好感度会向锚点自然回归，与情感维度衰减相互独立。仅在后台任务模型结算时落盘新值。"
+        "hint": "关闭后好感度不再向锚点回归，长期不互动的数值也不会下降（情感衰减不受影响，两者独立）。"
       },
       "favour_decay_anchor": {
         "description": "好感度衰减锚点",
         "type": "int",
         "default": 50,
         "hint": "好感度向此值回归。只有高于锚点的部分会衰减；≤ 锚点的好感度不衰减（负面印象不会被时间冲淡）。范围跟随 min/max_favour_value。"
+      }
+    }
+  },
+  "access_config": {
+    "description": "权限与特殊用户",
+    "type": "object",
+    "hint": "Bot 管理员与特殊用户名单；特殊关系与特殊初始好感只认明确列出的 ID，管理员不自动获得特殊值。",
+    "items": {
+      "admin_default_favour": {
+        "description": "特殊用户初始好感度",
+        "type": "int",
+        "default": 50,
+        "hint": "仅 favour_envoys 列表内用户首次建立记录时使用；Bot管理员、群主和群管理员不会自动应用。"
+      },
+      "admin_default_relationship": {
+        "description": "特殊用户关系",
+        "type": "string",
+        "default": "",
+        "hint": "留空则使用 relationship_config 映射。非空时，仅 favour_envoys 中明确填写的用户使用该特殊关系。"
+      },
+      "favour_envoys": {
+        "description": "特殊关系用户ID列表",
+        "type": "list",
+        "default": [],
+        "hint": "ID 填谁，谁就使用上面的特殊初始好感度和特殊关系。填写 QQ 号即可，一行一个；管理员不会自动加入。"
+      }
+    }
+  },
+  "runtime_config": {
+    "description": "运行与数据",
+    "type": "object",
+    "hint": "对话历史来源、备份保留与后台任务的超时/重试；不确定时保持默认即可。",
+    "items": {
+      "history_rounds": {
+        "description": "后台任务模型参考的近期对话轮数",
+        "type": "int",
+        "default": 0,
+        "hint": "0 表示仅参考当前一轮互动（默认行为）。设为 1-10 时，后台任务模型将参考最近 N 轮对话来判断好感度变化，需注意 Token 开销。"
+      },
+      "use_chat_memory": {
+        "description": "使用 chat_memory 插件提供对话上下文",
+        "type": "bool",
+        "default": false,
+        "hint": "启用后，后台任务模型从 chat_memory 正式版 ≥ 1.0.0 按用户ID和当前人格读取严格配对的 LLM 历史；未启用时使用 AstrBot 自带上下文（群聊场景共享）。未安装、版本不兼容或查询失败时，本轮自动回退到 AstrBot 自带上下文。https://github.com/W-Wolfycz/chat_memory"
       },
       "backup_retention_days": {
         "description": "JSON 备份保留天数",
@@ -277,7 +319,159 @@
         "description": "后台 LLM 请求最大尝试次数",
         "type": "int",
         "default": 5,
-        "hint": "好感结算、人设摘要、档位描述生成等后台调用的最大尝试次数（含首次请求），范围 1-10。默认 5；设为 1 表示失败不重试。"
+        "hint": "好感结算、人设摘要、档位描述生成等后台调用的最大尝试次数（含首次请求），范围 1-10。默认 5 与上游一致；设为 1 表示失败不重试（超时上限由「后台调用超时」单独控制）。"
+      }
+    }
+  },
+  "advanced_config": {
+    "description": "旧路径（升级时自动搬运后删除）",
+    "type": "object",
+    "invisible": true,
+    "hint": "v3.6.0 重排分组前的旧键。插件启动时会把非默认取值搬进新分组并删除这些键，升级无需手动重填。",
+    "items": {
+      "admin_default_favour": {
+        "description": "[旧路径] 已迁至新分组，仅作旧配置兜底，请勿修改",
+        "type": "int",
+        "invisible": true,
+        "default": 50
+      },
+      "admin_default_relationship": {
+        "description": "[旧路径] 已迁至新分组，仅作旧配置兜底，请勿修改",
+        "type": "string",
+        "invisible": true,
+        "default": ""
+      },
+      "favour_envoys": {
+        "description": "[旧路径] 已迁至新分组，仅作旧配置兜底，请勿修改",
+        "type": "list",
+        "invisible": true,
+        "default": []
+      },
+      "favour_change_min": {
+        "description": "[旧路径] 已迁至新分组，仅作旧配置兜底，请勿修改",
+        "type": "int",
+        "invisible": true,
+        "default": -5
+      },
+      "favour_change_max": {
+        "description": "[旧路径] 已迁至新分组，仅作旧配置兜底，请勿修改",
+        "type": "int",
+        "invisible": true,
+        "default": 5
+      },
+      "emotion_change_min": {
+        "description": "[旧路径] 已迁至新分组，仅作旧配置兜底，请勿修改",
+        "type": "int",
+        "invisible": true,
+        "default": -10
+      },
+      "emotion_change_max": {
+        "description": "[旧路径] 已迁至新分组，仅作旧配置兜底，请勿修改",
+        "type": "int",
+        "invisible": true,
+        "default": 5
+      },
+      "history_rounds": {
+        "description": "[旧路径] 已迁至新分组，仅作旧配置兜底，请勿修改",
+        "type": "int",
+        "invisible": true,
+        "default": 0
+      },
+      "tier_script_enabled": {
+        "description": "[旧路径] 已迁至新分组，仅作旧配置兜底，请勿修改",
+        "type": "bool",
+        "invisible": true,
+        "default": true
+      },
+      "use_chat_memory": {
+        "description": "[旧路径] 已迁至新分组，仅作旧配置兜底，请勿修改",
+        "type": "bool",
+        "invisible": true,
+        "default": false
+      },
+      "emotion_decay_enabled": {
+        "description": "[旧路径] 已迁至新分组，仅作旧配置兜底，请勿修改",
+        "type": "bool",
+        "invisible": true,
+        "default": true
+      },
+      "emotion_decay_rate_volatile": {
+        "description": "[旧路径] 已迁至新分组，仅作旧配置兜底，请勿修改",
+        "type": "float",
+        "invisible": true,
+        "default": 0.7
+      },
+      "emotion_decay_rate_standard": {
+        "description": "[旧路径] 已迁至新分组，仅作旧配置兜底，请勿修改",
+        "type": "float",
+        "invisible": true,
+        "default": 0.85
+      },
+      "emotion_decay_rate_sticky": {
+        "description": "[旧路径] 已迁至新分组，仅作旧配置兜底，请勿修改",
+        "type": "float",
+        "invisible": true,
+        "default": 0.93
+      },
+      "emotion_decay_min_hours": {
+        "description": "[旧路径] 已迁至新分组，仅作旧配置兜底，请勿修改",
+        "type": "float",
+        "invisible": true,
+        "default": 1.0
+      },
+      "scar_enabled": {
+        "description": "[旧路径] 已迁至新分组，仅作旧配置兜底，请勿修改",
+        "type": "bool",
+        "invisible": true,
+        "default": false
+      },
+      "scar_penalty_k": {
+        "description": "[旧路径] 已迁至新分组，仅作旧配置兜底，请勿修改",
+        "type": "float",
+        "invisible": true,
+        "default": 2.0
+      },
+      "scar_repair_k2": {
+        "description": "[旧路径] 已迁至新分组，仅作旧配置兜底，请勿修改",
+        "type": "float",
+        "invisible": true,
+        "default": 0.5
+      },
+      "favour_decay_enabled": {
+        "description": "[旧路径] 已迁至新分组，仅作旧配置兜底，请勿修改",
+        "type": "bool",
+        "invisible": true,
+        "default": true
+      },
+      "favour_decay_anchor": {
+        "description": "[旧路径] 已迁至新分组，仅作旧配置兜底，请勿修改",
+        "type": "int",
+        "invisible": true,
+        "default": 50
+      },
+      "backup_retention_days": {
+        "description": "[旧路径] 已迁至新分组，仅作旧配置兜底，请勿修改",
+        "type": "int",
+        "invisible": true,
+        "default": 0
+      },
+      "settlement_timeout_seconds": {
+        "description": "[旧路径] 已迁至新分组，仅作旧配置兜底，请勿修改",
+        "type": "float",
+        "invisible": true,
+        "default": 60.0
+      },
+      "terminate_flush_timeout_seconds": {
+        "description": "[旧路径] 已迁至新分组，仅作旧配置兜底，请勿修改",
+        "type": "float",
+        "invisible": true,
+        "default": 8.0
+      },
+      "llm_request_max_retries": {
+        "description": "[旧路径] 已迁至新分组，仅作旧配置兜底，请勿修改",
+        "type": "int",
+        "invisible": true,
+        "default": 5
       }
     }
   }

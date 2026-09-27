@@ -25,7 +25,14 @@ from quart import jsonify, request
 
 from astrbot.api import logger
 
-from .domain import EMOTION_DIMENSIONS, EMOTION_DISPLAY_NAMES, EMOTION_GROUPS, utc_now
+from .domain import (
+    EMOTION_DIMENSIONS,
+    EMOTION_DISPLAY_NAMES,
+    EMOTION_GROUPS,
+    build_injection_prompt,
+    scar_field,
+    utc_now,
+)
 from .storage import _is_valid_userid
 
 
@@ -85,6 +92,10 @@ def _record_to_dict(
     """
     decayed = plugin._decay_favour_value(record, now=now)
     emotions = {dim: int(getattr(record, dim, 0)) for dim in EMOTION_DIMENSIONS}
+    scars = {
+        dim: int(getattr(record, scar_field(dim), 0) or 0)
+        for dim in EMOTION_DIMENSIONS
+    }
     is_special = plugin._is_special_override(record.user_id)
     created_at = plugin.db.to_local_datetime(record.created_at)
     updated_at = plugin.db.to_local_datetime(record.updated_at)
@@ -97,6 +108,9 @@ def _record_to_dict(
         "relationship_range": list(plugin._get_relationship_range(decayed, record.user_id) or []),
         "is_special_override": is_special,
         "emotions": emotions,
+        # 只读：伤痕由结算路径写，管理台不提供手改入口
+        "scars": scars,
+        "scar_enabled": bool(getattr(plugin, "scar_enabled", False)),
         "created_at": str(created_at) if created_at else "",
         "updated_at": str(updated_at) if updated_at else "",
     }
@@ -439,8 +453,53 @@ def register_web_apis(context, plugin) -> None:
 
     # ==================== 注册 ====================
 
+    async def get_injection_preview():
+        """预览某用户当前会收到的那段注入提示词（只读，供调试 Prompt/档位用）。"""
+        not_ready = _not_ready()
+        if not_ready:
+            return not_ready
+        persona_id, err = _persona_id_from(request.args.get("persona_id"))
+        if err:
+            return err
+        user_id = str(request.args.get("user_id") or "").strip()
+        if not user_id:
+            return _err("user_id 不能为空", 400)
+        record = await plugin.db.get_favour(persona_id, user_id)
+        if record is None:
+            return _err("该用户在所选人格下没有记录", 404)
+        try:
+            favour = plugin._decay_favour_value(record)
+            relationship = plugin._get_relationship(favour, user_id)
+            favour_range = plugin._get_relationship_range(favour, user_id)
+            tier_extras = plugin._get_tier_extras(favour, user_id)
+            text = build_injection_prompt(
+                record, relationship, favour_range, favour,
+                tier_extras=tier_extras, show_scars=plugin.scar_enabled,
+            )
+        except Exception as e:
+            return _internal_error(e)
+        return _ok(text=text, relationship=relationship, favour=favour)
+
+    async def get_settlement_health():
+        """各人格的后台结算健康度计数（只读；内存态，重启清零）。"""
+        not_ready = _not_ready()
+        if not_ready:
+            return not_ready
+        try:
+            return _ok(stats=plugin.settlement_health_snapshot())
+        except Exception as e:
+            return _internal_error(e)
+
     context.register_web_api(
         f"/{PLUGIN_NAME}/about", get_about, ["GET"], "获取插件版本信息"
+    )
+    context.register_web_api(
+        f"/{PLUGIN_NAME}/injection-preview", get_injection_preview, ["GET"],
+        "预览当前会注入给主模型的情感提示词",
+    )
+    context.register_web_api(
+        f"/{PLUGIN_NAME}/health", get_settlement_health, ["GET"],
+        "获取各人格的后台结算健康度计数",
     )
     context.register_web_api(
         f"/{PLUGIN_NAME}/personas", get_personas, ["GET"], "获取所有 persona_id 列表"
@@ -467,4 +526,4 @@ def register_web_apis(context, plugin) -> None:
         f"/{PLUGIN_NAME}/backups/delete", delete_backup, ["POST"], "删除当前人格数据备份"
     )
 
-    logger.info(f"[{PLUGIN_NAME}] ✅ Web API 已注册（共 9 个端点）")
+    logger.info(f"[{PLUGIN_NAME}] ✅ Web API 已注册（共 11 个端点）")

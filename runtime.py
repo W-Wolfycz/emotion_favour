@@ -4,6 +4,9 @@
 
 - :class:`TaskSupervisor` 持有 fire-and-forget 任务引用、消费异常，并在插件
   ``terminate()`` 时给在跑的任务一个有限的完成窗口。
+- 调用纪律：锁嵌套顺序固定为 ``KeyedLockPool.hold()`` → ``PersonaMutationGate.write()``，
+  不要反向；``hold()`` 内只允许在最细的 key 上等待 LLM（现存的唯一例外），
+  其余 IO 一律移到锁外。
 - :class:`KeyedLockPool` 按业务 key 串行执行临界区，避免同一 persona/user 的
   LLM 结算、命令修改和 WebUI 修改乱序覆盖。
 - :class:`PersonaMutationGate` 为人格级管理操作提供写入屏障，并用 epoch
@@ -79,9 +82,15 @@ class TaskSupervisor:
                     timeout=max(0.1, float(flush_timeout)),
                 )
             except asyncio.TimeoutError:
-                for task in transient:
-                    if not task.done():
-                        task.cancel()
+                cancelled = [task for task in transient if not task.done()]
+                for task in cancelled:
+                    task.cancel()
+                if cancelled:
+                    # "失败即弃"是既定策略，但"这轮弃了多少"应当留痕
+                    self._logger.warning(
+                        f"[EmotionFavour] 收尾窗口 {flush_timeout}s 到期，"
+                        f"已取消 {len(cancelled)} 个在飞任务"
+                    )
                 await asyncio.gather(*transient, return_exceptions=True)
 
         self._transient.clear()

@@ -1,5 +1,6 @@
 # utils.py
 # 通用工具函数
+import re
 import string
 import time
 from pathlib import Path
@@ -86,5 +87,51 @@ async def get_user_display_name(event: AstrMessageEvent, user_id: str) -> str:
         else:
             info = await event.bot.get_stranger_info(user_id=int(user_id))
             return info.get("nickname") or user_id
-    except:
+    except Exception:
+        # 只吞普通异常：裸 except 会把 CancelledError 一起吃掉，破坏任务取消语义
         return user_id
+
+
+# 非文本消息组件 → 结算用占位文本。用户只发图片/表情/语音时 message_str 为空，
+# 不补占位的话整轮不会进入结算（回复侧早有同样的占位处理）。
+MEDIA_PLACEHOLDERS = {
+    "Image": "[图片]",
+    "Face": "[表情]",
+    "Record": "[语音]",
+    "Video": "[视频]",
+    "File": "[文件]",
+    "Forward": "[转发消息]",
+    "Node": "[转发消息]",
+    "Poke": "[戳一戳]",
+    "Share": "[分享]",
+    "Location": "[位置]",
+    "Music": "[音乐]",
+    "Json": "[卡片]",
+}
+
+
+def placeholder_for_message(chain) -> str:
+    """把非文本消息链映射成占位文本；认不出类型时给通用占位。"""
+    names = [type(comp).__name__ for comp in (chain or [])]
+    parts = [MEDIA_PLACEHOLDERS[name] for name in names if name in MEDIA_PLACEHOLDERS]
+    return "".join(parts) or "[非文本消息]"
+
+
+def strip_reply_markers(text: str, pattern) -> str:
+    """剥掉正文里的思考块与旧注入标记，围栏代码块内的内容原样保留。
+
+    模型偶尔会把 <thinking> 直接写进正文（core 的 result_decorate 只处理独立的
+    reasoning_content 字段），泄露给用户；但它也可能在示例代码里引用这些标签，
+    那种情况必须原样发出。整条回复都是思考块时返回原文——发空消息比露出异常更糟。
+    """
+    stashed: list[str] = []
+
+    def _stash(match: "re.Match") -> str:
+        stashed.append(match.group(0))
+        return f"\x00block{len(stashed) - 1}\x00"
+
+    protected = re.sub(r"```[\s\S]*?```", _stash, text)
+    cleaned = pattern.sub("", protected).strip()
+    for index, block in enumerate(stashed):
+        cleaned = cleaned.replace(f"\x00block{index}\x00", block)
+    return cleaned or text

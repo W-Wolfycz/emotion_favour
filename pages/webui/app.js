@@ -51,6 +51,7 @@ const state = {
   total: 0,
   totalPages: 1,
   userIdSearch: '',
+  healthStats: null,      // 后台结算健康度：{persona_id: {success, no_xml, ...}}，只读
 };
 
 // dialog 运行时上下文（打开时填，关闭时清）
@@ -78,6 +79,11 @@ async function apiPost(endpoint, body = {}) {
   return bridge.apiPost(endpoint, body);
 }
 
+/** 只读端点判成功：契约用 {ok:true}，后端既有响应助手用 {success:true}，两者都认。 */
+function isApiOk(resp) {
+  return Boolean(resp) && (resp.ok === true || resp.success === true);
+}
+
 const api = {
   getAbout: () => apiGet('about'),
   getPersonas: () => apiGet('personas'),
@@ -85,6 +91,9 @@ const api = {
     apiGet('records', { persona_id, page, page_size, sort_by, sort_order, user_id_search }),
   getRelationship: (persona_id, user_id, favour) =>
     apiGet('relationship', { persona_id, user_id, favour }),
+  getInjectionPreview: (persona_id, user_id) =>
+    apiGet('injection-preview', { persona_id, user_id }),
+  getHealth: () => apiGet('health'),
   saveRecord: (payload) => apiPost('records/save', payload),
   getBackups: (persona_id) => apiGet('backups', { persona_id }),
   createBackup: (persona_id) => apiPost('backups/create', { persona_id }),
@@ -276,7 +285,7 @@ function setupPersonaComboboxes() {
       state.currentPersona = personaId;
       state.page = 1;
       storeSelectedPersona(personaId);
-      await loadRecords();
+      await Promise.all([loadRecords(), loadHealth()]);
     },
     () => state.currentPersona,
   );
@@ -420,7 +429,7 @@ async function loadPersonas() {
   createPersonaCombobox.setOptions(state.personas);
   switcher.hidden = state.personas.length <= 1;
 
-  await loadRecords();
+  await Promise.all([loadRecords(), loadHealth()]);
 }
 
 async function loadRecords() {
@@ -428,6 +437,7 @@ async function loadRecords() {
     showEmpty();
     return;
   }
+  renderHealth();  // 先按当前人格刷新顶栏结算项（用缓存，避免短暂显示上一个人格的数字）
   showLoading();
   try {
     const resp = await api.getRecords(
@@ -478,6 +488,64 @@ function renderStats() {
 
 function getSortedRecords() {
   return state.records;
+}
+
+// ---- 结算健康度（顶栏统计条，只读） ----
+
+// 失败分类：与后端 _bump_settlement_stat 的 outcome 取值一一对应
+const HEALTH_FAIL_ITEMS = [
+  ['no_xml', '无 XML'],
+  ['parse_error', '解析失败'],
+  ['no_provider', '无可用模型'],
+  ['exception', '异常'],
+];
+
+/** 拉取各人格结算计数；失败保持静默（只读展示，不弹 toast），沿用上次缓存。 */
+async function loadHealth() {
+  try {
+    const resp = await api.getHealth();
+    if (isApiOk(resp) && resp.stats && typeof resp.stats === 'object') {
+      state.healthStats = resp.stats;
+    }
+  } catch (e) { /* 静默：健康度拿不到不影响记录管理 */ }
+  renderHealth();
+}
+
+function buildHealthTitle(entry, success, failCounts, failTotal) {
+  const lines = [`成功 ${success}`];
+  lines.push(HEALTH_FAIL_ITEMS.map(([, label], i) => `${label} ${failCounts[i]}`).join(' · '));
+  if (failTotal > 0 && entry.last_error_type) {
+    const at = formatDate(entry.last_error_at).replace('T', ' ');
+    lines.push(`最近失败：${entry.last_error_type}（${at}）`);
+  }
+  // 被 clamp / 收益递减吃掉的幅度：结算成功但数值没到位，是这套统计里唯一会静默失真的部分
+  const clampedTotal = Number(entry.clamped_total) || 0;
+  if (clampedTotal > 0) {
+    const clampedLast = Number(entry.clamped_last) || 0;
+    const last = clampedLast > 0 ? `（最近一次 ${clampedLast}）` : '';
+    lines.push(`本区间被截断/递减吃掉 ${clampedTotal}${last}`);
+  }
+  lines.push('统计为内存态，插件重启后清零');
+  return lines.join('\n');
+}
+
+/** 按 state.currentPersona 渲染；无该人格统计时只显示占位符。 */
+function renderHealth() {
+  const tag = document.getElementById('health-tag');
+  const value = document.getElementById('health-value');
+  const entry = state.healthStats?.[state.currentPersona];
+  if (!entry) {
+    value.textContent = '—';
+    tag.title = '暂无该人格的后台结算记录';
+    return;
+  }
+  const success = Number(entry.success) || 0;
+  const failCounts = HEALTH_FAIL_ITEMS.map(([key]) => Number(entry[key]) || 0);
+  const failTotal = failCounts.reduce((sum, n) => sum + n, 0);
+  value.innerHTML = failTotal > 0
+    ? `成功 <strong>${success}</strong> · 失败 <strong>${failTotal}</strong>`
+    : `成功 <strong>${success}</strong>`;
+  tag.title = buildHealthTitle(entry, success, failCounts, failTotal);
 }
 
 function renderPager() {
@@ -631,6 +699,35 @@ function collectEmotions(container) {
   return result;
 }
 
+/**
+ * 伤痕只读展示：负=有伤、越负越深，由结算路径写入，管理台不提供手改入口。
+ * 只列非 0 维度；关闭该机制时说明「未启用」，避免把全 0 误读成「没有伤痕」。
+ */
+function renderScarGrid(container, record) {
+  const displayNames = state.meta?.emotion_display_names || {};
+  const scars = record.scars || {};
+  const entries = Object.entries(scars).filter(([, value]) => value !== 0);
+  container.innerHTML = '';
+
+  if (!record.scar_enabled) {
+    container.innerHTML = '<div class="scar-empty">伤痕机制未启用（配置项 advanced_config.scar_enabled）</div>';
+    return;
+  }
+  if (entries.length === 0) {
+    container.innerHTML = '<div class="scar-empty">暂无伤痕：所有维度都止于 0</div>';
+    return;
+  }
+  entries
+    .sort((a, b) => a[1] - b[1])
+    .forEach(([dim, value]) => {
+      const chip = document.createElement('span');
+      chip.className = 'scar-chip scar-negative';
+      chip.textContent = `${displayNames[dim] || dim} ${value}`;
+      chip.title = '伤痕：同向伤害被放大、正向修复被抑制，随时间与善意互动缓慢消退';
+      container.appendChild(chip);
+    });
+}
+
 function bindSliderEvents(container) {
   container.querySelectorAll('input[type="range"]').forEach(slider => {
     const valueSpan = slider.parentElement.querySelector('.slider-value');
@@ -661,6 +758,51 @@ function isEditDirty() {
   );
 }
 
+// ---- 注入预览（只读：该用户当前会注入给主模型的完整提示词） ----
+
+let injectionPreviewSeq = 0;  // 递增序号，丢弃已关闭/已换人弹窗的迟到响应
+
+const INJECTION_HINT = '暂时无法获取注入预览，该用户可能还没有印象记录';
+
+function setInjectionText(text, muted = false) {
+  const el = document.getElementById('injection-text');
+  el.textContent = text;
+  el.className = muted ? 'injection-text muted' : 'injection-text';
+}
+
+function showInjectionHint(message) {
+  document.getElementById('injection-relationship').textContent = '—';
+  document.getElementById('injection-favour').textContent = '—';
+  setInjectionText(message, true);
+}
+
+/** 打开弹窗时重置为折叠 + 加载态；失败只显示浅色提示，不弹 toast。 */
+function resetInjectionPreview() {
+  injectionPreviewSeq += 1;
+  document.getElementById('edit-injection').open = false;
+  showInjectionHint('加载中...');
+}
+
+async function loadInjectionPreview(userId) {
+  const seq = injectionPreviewSeq;
+  try {
+    const resp = await api.getInjectionPreview(state.currentPersona, userId);
+    if (seq !== injectionPreviewSeq) return;
+    if (!isApiOk(resp) || !resp.text) {
+      showInjectionHint(resp?.error || INJECTION_HINT);
+      return;
+    }
+    document.getElementById('injection-relationship').textContent = resp.relationship || '—';
+    const favour = Number(resp.favour);
+    document.getElementById('injection-favour').textContent =
+      Number.isNaN(favour) ? '—' : String(favour);
+    setInjectionText(String(resp.text));
+  } catch (e) {
+    if (seq !== injectionPreviewSeq) return;
+    showInjectionHint(INJECTION_HINT);
+  }
+}
+
 function openEditDialog(userId) {
   const record = state.records.find(r => r.user_id === userId);
   if (!record) {
@@ -689,6 +831,7 @@ function openEditDialog(userId) {
   const grid = document.getElementById('edit-emotion-grid');
   buildEmotionGrid(grid, record.emotions || {});
   bindSliderEvents(grid);
+  renderScarGrid(document.getElementById('edit-scar-grid'), record);
 
   // 实时算关系名
   const updateRelationship = debounce(async (favour) => {
@@ -716,6 +859,8 @@ function openEditDialog(userId) {
     snapshot: JSON.parse(JSON.stringify(record)),
   };
 
+  resetInjectionPreview();
+  loadInjectionPreview(userId);
   dialog.showModal();
 }
 
@@ -1138,7 +1283,7 @@ function setupEventListeners() {
       await loadPersonas();
       return;
     }
-    await loadRecords();
+    await Promise.all([loadRecords(), loadHealth()]);
     showToast('已刷新', 'success');
   });
 

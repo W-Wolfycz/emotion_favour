@@ -1,6 +1,8 @@
 # main.py
+import os
 import re
 import json
+import shutil
 import asyncio
 import traceback
 import hashlib
@@ -18,7 +20,12 @@ from astrbot.core.agent.message import TextPart
 from astrbot.core.utils.session_waiter import session_waiter, SessionController, SessionFilter
 
 from .log import logger
-from .config import PluginSettings, validate_advance_tiers
+from .config import (
+    PluginSettings,
+    load_schema_defaults,
+    migrate_config_layout,
+    validate_advance_tiers,
+)
 from .runtime import (
     KeyedLockPool,
     MutationEpochTracker,
@@ -48,12 +55,17 @@ from .domain import (
     parse_tier_script_response,
     tier_scripts_fresh,
     diminish_delta,
+    utc_now,
     apply_emotion_decay,
+    apply_scar,
+    apply_scar_decay,
     compute_favour_decay,
     record_fields_changed,
 )
 from .utils import (
     cleanup_old_files,
+    placeholder_for_message,
+    strip_reply_markers,
     get_target_uid,
     escape_markdown,
     get_user_display_name,
@@ -73,6 +85,10 @@ class SenderSessionFilter(SessionFilter):
 class EmotionFavourPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
+
+        # 持久数据目录要在配置迁移之前算出来：迁移的首件事是把旧配置备份进去
+        self.data_dir = StarTools.get_data_dir("emotion_favour")
+        self._migrate_config_if_needed(config)
 
         self.settings = PluginSettings.from_mapping(config)
         for warning in self.settings.warnings:
@@ -95,7 +111,6 @@ class EmotionFavourPlugin(Star):
         self.persona_mgr = context.persona_manager
 
         # 数据库
-        self.data_dir = StarTools.get_data_dir("emotion_favour")
         timezone_name = str(context.get_config().get("timezone", "Asia/Shanghai") or "Asia/Shanghai")
         self.db = FavourDBManager(
             self.data_dir,
@@ -112,6 +127,8 @@ class EmotionFavourPlugin(Star):
         self._record_epochs = MutationEpochTracker()
         self._persona_mutations = PersonaMutationGate()
         self._blocked_records: set[tuple[str, str, str]] = set()
+        # 结算健康度计数（内存态、按 persona；纯诊断，重启清零）
+        self._settlement_stats: dict[str, dict] = {}
         self._browser_lock = asyncio.Lock()
 
         # Playwright T2I
@@ -130,6 +147,55 @@ class EmotionFavourPlugin(Star):
 
         # 本地化 CDN 脚本缓存
         self._local_scripts: dict[str, str] = {}
+
+
+    def _migrate_config_if_needed(self, config: AstrBotConfig) -> None:
+        """把 v3.6.0 之前写在 advanced_config 里的取值搬进新分组，并删掉那些旧键。
+
+        迁移前先把配置文件原样备份到插件数据目录；读取侧对新旧两条路径都兼容，
+        所以任何一步失败都只告警、不阻断插件加载。
+        """
+        schema_path = Path(__file__).resolve().parent / "_conf_schema.json"
+        try:
+            report = migrate_config_layout(
+                config, defaults=load_schema_defaults(schema_path)
+            )
+        except Exception as exc:
+            logger.warning(
+                f"[EmotionFavour] 配置分组迁移失败，继续按旧路径读取: {type(exc).__name__}"
+            )
+            return
+        if not report.changed:
+            # 旧键里全是默认值（或压根没有旧键）：不必写盘
+            return
+
+        backup_name = ""
+        source = str(getattr(config, "config_path", "") or "")
+        try:
+            if source and os.path.exists(source):
+                stamp = utc_now().strftime("%Y%m%d_%H%M%S")
+                target = self.data_dir / f"config_backup_{stamp}.json"
+                shutil.copy2(source, target)
+                backup_name = target.name
+        except OSError as exc:
+            logger.warning(f"[EmotionFavour] 配置备份失败: {type(exc).__name__}")
+
+        save_config = getattr(config, "save_config", None)
+        if not callable(save_config):
+            logger.warning("[EmotionFavour] 配置对象不支持写回，旧键保留在文件里")
+            return
+        try:
+            save_config()
+        except Exception as exc:
+            logger.warning(
+                f"[EmotionFavour] 配置写回失败，旧键仍留在文件里: {type(exc).__name__}"
+            )
+            return
+        logger.info(
+            f"[EmotionFavour] 配置分组迁移完成: 搬运 {len(report.moved)} 项、"
+            f"清理 {len(report.removed)} 个旧键"
+            f"{'，备份 ' + backup_name if backup_name else ''}"
+        )
 
     async def initialize(self):
         """AstrBot 受管初始化入口。"""
@@ -239,6 +305,36 @@ class EmotionFavourPlugin(Star):
             if platform_id:
                 return f"[EmotionFavour][platform:{platform_id}]"
         return "[EmotionFavour]"
+
+    def _bump_settlement_stat(
+        self, persona_id: str, outcome: str, error: str = "", *, clamped: int = 0
+    ) -> None:
+        """累计某人格的结算结果，供 WebUI 健康度展示（内存态，重启清零）。"""
+        if not persona_id:
+            return
+        stats = self._settlement_stats.get(persona_id)
+        if stats is None:
+            if len(self._settlement_stats) >= self._SETTLEMENT_STATS_MAX_PERSONAS:
+                return
+            stats = {
+                "success": 0, "no_xml": 0, "parse_error": 0,
+                "no_provider": 0, "exception": 0,
+                "last_error_type": "", "last_error_at": "",
+                "clamped_total": 0, "clamped_last": 0,
+            }
+            self._settlement_stats[persona_id] = stats
+        stats[outcome] = stats.get(outcome, 0) + 1
+        if error:
+            stats["last_error_type"] = error
+            stats["last_error_at"] = utc_now().isoformat(timespec="seconds")
+        if clamped:
+            # 被 clamp / 收益递减吃掉多少幅度：以前彻底不可见，现在可诊断
+            stats["clamped_total"] = stats.get("clamped_total", 0) + clamped
+            stats["clamped_last"] = clamped
+
+    def settlement_health_snapshot(self) -> dict:
+        """各 persona 的结算计数副本（只读，供 Web API）。"""
+        return {pid: dict(stats) for pid, stats in self._settlement_stats.items()}
 
     def _record_key(self, persona_id: str, user_id: str) -> tuple[str, str, str]:
         return ("record", str(persona_id), str(user_id))
@@ -865,6 +961,9 @@ class EmotionFavourPlugin(Star):
     # 启动预热档位描述前的等待秒数（等其它服务就绪；测试里覆盖为 0）
     _TIER_SCRIPT_WARM_DELAY = 5.0
 
+    # 结算健康度最多跟踪多少个人格（纯诊断，超出不再记新人格）
+    _SETTLEMENT_STATS_MAX_PERSONAS = 200
+
     _CDN_TO_FILE = {
         "https://cdn.jsdelivr.net/npm/marked/marked.min.js": "marked.min.js",
         "https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js": "highlight.min.js",
@@ -1135,6 +1234,7 @@ class EmotionFavourPlugin(Star):
                 favour_range,
                 current_favour,
                 tier_extras=tier_extras,
+                show_scars=self.scar_enabled,
             )
 
             inject_runtime_prompt(req, prompt_final, TextPart)
@@ -1153,6 +1253,11 @@ class EmotionFavourPlugin(Star):
         if res is None or not res.is_llm_result():
             return
         user_text = event.message_str
+        if not user_text.strip():
+            # 用户侧同样补占位：纯图片/表情/语音/戳一戳等消息的 message_str 为空，
+            # 不补的话这些轮次永远不会进入结算（core 只把文本段累加进 message_str）。
+            chain = event.get_messages() if hasattr(event, "get_messages") else []
+            user_text = placeholder_for_message(chain)
         # 文本拼 Plain；图片等媒体组件用占位符，避免纯图片/图文混合回复
         # 的轮次被静默跳过结算。
         parts = []
@@ -1206,6 +1311,7 @@ class EmotionFavourPlugin(Star):
         *,
         favour: Optional[int] = None,
         emotion_updates: Optional[dict] = None,
+        scar_updates: Optional[dict] = None,
     ) -> bool:
         """仅当结算启动后的 persona epoch 未变化时写入结果。
 
@@ -1227,12 +1333,39 @@ class EmotionFavourPlugin(Star):
                 user_id,
                 favour=favour,
                 emotion_updates=emotion_updates,
+                scar_updates=scar_updates,
             ):
                 raise RuntimeError(
                     f"update_favour 写入失败: persona={persona_id} "
                     f"user={user_id}"
                 )
             return True
+
+    @filter.on_decorating_result(priority=20)
+    async def _strip_emitted_markers(self, event: AstrMessageEvent):
+        """发送前剥掉正文里的思考块与旧注入标记。
+
+        core 的 result_decorate 只处理独立的 reasoning_content 字段，模型如果把
+        <thinking> 直接写进正文，标签会原样发给用户；这里复用清洗历史用的同一套
+        正则兜底。整条回复都是思考块时保持原样——发空消息比露出异常更糟。
+        """
+        res = event.get_result()
+        if res is None or not res.chain:
+            return
+        try:
+            changed = False
+            for comp in res.chain:
+                if not isinstance(comp, Plain):
+                    continue
+                original = str(comp.text or "")
+                cleaned = strip_reply_markers(original, self._CTX_CLEAN_PATTERN)
+                if cleaned != original:
+                    comp.text = cleaned
+                    changed = True
+            if changed:
+                logger.debug(f"{self._tag(event)} 已剥离回复正文中的思考块/注入标记")
+        except Exception as e:
+            logger.warning(f"{self._tag(event)} 剥离回复标记失败: {type(e).__name__}: {e}")
 
     @filter.on_decorating_result(priority=15)
     async def _on_session_reset(self, event: AstrMessageEvent):
@@ -1272,12 +1405,14 @@ class EmotionFavourPlugin(Star):
                 if mutation_epoch is None:
                     return
 
-            # 提前获取后台任务模型（供人设摘要提取和结算共用）
-            if self.llm_provider:
-                provider_id = self.llm_provider.strip()
-            else:
-                provider_id = await self.context.get_current_chat_provider_id(umo=umo)
+            # 提前获取后台任务模型（供人设摘要提取和结算共用）；走统一解析口径
+            try:
+                provider_id = await self._resolve_generation_provider(event)
+            except Exception as e:
+                logger.warning(f"{tag} 解析结算模型失败: {type(e).__name__}: {e}")
+                provider_id = ""
             if not provider_id:
+                self._bump_settlement_stat(persona_id, "no_provider", "ProviderNotFound")
                 logger.warning(f"{tag} 未找到可用的 LLM Provider 进行印象结算")
                 return
 
@@ -1323,10 +1458,14 @@ class EmotionFavourPlugin(Star):
 
             record = await self.db.get_favour(persona_id, user_id)
             if record:
-                # 好感 transient 值必须先于任何写库计算：情感衰减落盘会刷新
-                # updated_at，之后再算 Δt≈0，会吞掉好感时间衰减。
+                # 好感 transient 值必须先于任何写库计算：衰减落盘会刷新 updated_at，
+                # 之后再算 Δt≈0，会吞掉好感时间衰减。
                 transient_favour = self._decay_favour_value(record)
-                # 情感时间衰减
+                # 两类时间衰减都要在「写库之前」用同一个 updated_at 算出来：先写情感衰减
+                # 会刷新 updated_at，紧随其后的伤痕衰减就会因 Δt≈0 永远不生效。
+                decay_deltas: dict[str, int] = {}
+                scar_decay: dict[str, int] = {}
+                elapsed_hours = 0.0
                 if self.emotion_decay_enabled:
                     decayed, elapsed_hours = apply_emotion_decay(
                         record,
@@ -1335,19 +1474,33 @@ class EmotionFavourPlugin(Star):
                         self.emotion_decay_rate_sticky,
                         self.emotion_decay_min_hours,
                     )
-                    if decayed:
-                        decay_deltas = {dim: nv - getattr(record, dim) for dim, nv in decayed.items()}
-                        if not await self._update_settlement_record(
-                            persona_id,
-                            user_id,
-                            mutation_epoch,
-                            emotion_updates=decay_deltas,
-                        ):
-                            return
-                        record = await self.db.get_favour(persona_id, user_id)
+                    decay_deltas = {
+                        dim: nv - getattr(record, dim) for dim, nv in decayed.items()
+                    }
+                if self.scar_enabled:
+                    scar_decay, _scar_hours = apply_scar_decay(
+                        record,
+                        min_hours=self.emotion_decay_min_hours,
+                    )
+                if decay_deltas or scar_decay:
+                    if not await self._update_settlement_record(
+                        persona_id,
+                        user_id,
+                        mutation_epoch,
+                        emotion_updates=decay_deltas or None,
+                        scar_updates=scar_decay or None,
+                    ):
+                        return
+                    record = await self.db.get_favour(persona_id, user_id)
+                    if decay_deltas:
                         logger.info(
                             f"{tag} 情感衰减: 用户 {user_id}, "
-                            f"{elapsed_hours:.1f}h, {list(decayed.keys())}"
+                            f"{elapsed_hours:.1f}h, {list(decay_deltas.keys())}"
+                        )
+                    if scar_decay:
+                        logger.info(
+                            f"{tag} 伤痕衰减: 用户 {user_id}, "
+                            f"{list(scar_decay.keys())}"
                         )
                 current_favour = transient_favour
                 emotion_panel = build_emotion_panel(record)
@@ -1417,8 +1570,10 @@ class EmotionFavourPlugin(Star):
             result_cleaned = re.sub(r'```(?:xml)?\s*', '', result_text).strip()
             xml_match = re.search(r'<result>.*?</result>', result_cleaned, re.DOTALL)
             if not xml_match:
+                self._bump_settlement_stat(persona_id, "no_xml")
                 logger.warning(
-                    f"{tag} 印象结算未在模型回复中找到 XML: {result_text}"
+                    f"{tag} 印象结算未在模型回复中找到 XML"
+                    f"（回复长度 {len(result_text)}）"
                 )
                 return
             try:
@@ -1434,17 +1589,20 @@ class EmotionFavourPlugin(Star):
                     for child in emotions_elem:
                         data["emotions"][child.tag.lower()] = (child.text or "0").strip()
             except Exception as e:
+                self._bump_settlement_stat(persona_id, "parse_error", type(e).__name__)
                 logger.warning(
-                    f"{tag} 印象结算 XML 解析失败: {result_text} ({e})"
+                    f"{tag} 印象结算 XML 解析失败"
+                    f"（回复长度 {len(result_text)}）: {type(e).__name__}"
                 )
                 return
 
-            delta = int(round(float(data.get("change", 0))))
+            raw_delta = int(round(float(data.get("change", 0))))
             # clamp 到配置的单轮变化范围，防止模型幻觉输出大幅跳变
             delta = max(
                 self.favour_change_min,
-                min(self.favour_change_max, delta),
+                min(self.favour_change_max, raw_delta),
             )
+            throttle_loss = abs(raw_delta - delta)
             raw_emotions = data.get("emotions", {})
             reasoning = data.get("reasoning", "")
             if reasoning:
@@ -1482,7 +1640,12 @@ class EmotionFavourPlugin(Star):
             for dim, value in raw_emotions.items():
                 if dim in EMOTION_DIMENSIONS:
                     try:
-                        clamped = max(self.emotion_change_min, min(self.emotion_change_max, int(value)))
+                        raw_value = int(value)
+                        clamped = max(
+                            self.emotion_change_min,
+                            min(self.emotion_change_max, raw_value),
+                        )
+                        throttle_loss += abs(raw_value - clamped)
                         if clamped != 0:
                             clamped_emotions[dim] = clamped
                     except (ValueError, TypeError):
@@ -1493,7 +1656,22 @@ class EmotionFavourPlugin(Star):
                 for dim in list(clamped_emotions.keys()):
                     if clamped_emotions[dim] > 0:
                         current_val = getattr(record, dim, 0)
-                        clamped_emotions[dim] = diminish_delta(current_val, clamped_emotions[dim])
+                        before_decay = clamped_emotions[dim]
+                        clamped_emotions[dim] = diminish_delta(current_val, before_decay)
+                        throttle_loss += before_decay - clamped_emotions[dim]
+
+            # 伤痕：放大同向伤害、抑制正向修复；伤痕增量同步落盘
+            scar_updates: dict[str, int] = {}
+            if self.scar_enabled and clamped_emotions:
+                before_scar = dict(clamped_emotions)
+                clamped_emotions, scar_updates = apply_scar(
+                    record,
+                    clamped_emotions,
+                    k=self.scar_penalty_k,
+                    k2=self.scar_repair_k2,
+                )
+                for dim, value in clamped_emotions.items():
+                    throttle_loss += abs(before_scar.get(dim, value) - value)
 
             if not await self._update_settlement_record(
                 persona_id,
@@ -1501,15 +1679,21 @@ class EmotionFavourPlugin(Star):
                 mutation_epoch,
                 favour=new_fav,
                 emotion_updates=clamped_emotions if clamped_emotions else None,
+                scar_updates=scar_updates or None,
             ):
                 return
+            self._bump_settlement_stat(persona_id, "success", clamped=throttle_loss)
             logger.info(
                 f"{tag} 用户 {user_id} 结算: 好感值 {old_fav}->{new_fav} "
                 f"(Δ{delta})"
                 f"{', 情感: ' + str(clamped_emotions) if clamped_emotions else ''}"
+                f"{', 余额: ' + str(scar_updates) if scar_updates else ''}"
             )
         except Exception as e:
             tag_fallback = locals().get("tag") or "[EmotionFavour]"
+            self._bump_settlement_stat(
+                locals().get("persona_id") or "", "exception", type(e).__name__
+            )
             logger.error(
                 f"{tag_fallback} 印象后台结算出错: {str(e)}\n"
                 f"{traceback.format_exc()}"

@@ -1,8 +1,8 @@
 """domain.build_injection_prompt / build_system_prompt_extra 注入内容的静默失效点。
 
 注入文本只进模型上下文，出错不抛异常、界面也不显示，只能靠断言盯住三类：
-进度门（≥80% 才预告解锁）、满级不再给解锁预告、有效好感度与 <情感/> 属性形式与
-`<禁止>` 的禁令分层（thinking 禁令若退回动态标签就是真实泄漏）。
+进度门（≥80% 才预告解锁）、满级不再给解锁预告、有效好感度与 <情感> 面板口径
+（只列非 0 维）以及 `<禁止>` 的禁令分层（thinking 禁令若退回动态标签就是真实泄漏）。
 
 运行：
     python3 -m unittest tests.test_storage_injection -v
@@ -29,8 +29,8 @@ from domain import (  # noqa: E402
 
 
 class _Rec:
-    """FavourRecord stub。build_injection_prompt 直接读 12 维属性构造 <情感 .../>，
-    所以这里要把所有维度都列出来（默认 0）。"""
+    """FavourRecord stub，12 维全 0。build_injection_prompt 直接读 12 维属性拼面板，
+    所以这里要把所有维度都列出来。"""
     favour = 0
     joy = 0
     trust = 0
@@ -44,6 +44,12 @@ class _Rec:
     guilt = 0
     shame = 0
     envy = 0
+
+
+class _WarmRec(_Rec):
+    """只两个维度非 0：注入面板只该列这两个。"""
+    joy = 52
+    trust = 30
 
 
 class TestBuildInjectionPrompt(unittest.TestCase):
@@ -102,14 +108,18 @@ class TestBuildInjectionPrompt(unittest.TestCase):
         self.assertIn("不得输出 thinking", static)
 
     def test_effective_favour_and_emotion_attribute_form(self):
-        """守注入数值与属性协议：<好感度> 必须是衰减后的 effective_favour
-        （record.favour=0 却显示 80），<情感> 用属性形式——写错不报错，
-        模型只会照着错的数值/形状表演。"""
-        out = self.build(_Rec(), "友好", (61, 100), 80)
+        """守注入数值与面板协议：<好感度> 必须是衰减后的 effective_favour
+        （record.favour=0 却显示 80）；<情感> 只列非 0 维——把 0 值全列回去等于递给
+        模型「可以谈这 12 个词」的素材，漏列有值的维度又会让它演错情绪，两边都不报错。"""
+        out = self.build(_WarmRec(), "友好", (61, 100), 80)
         self.assertIn("<好感度>80</好感度>", out)
-        self.assertIn("<情感 ", out)
-        self.assertIn('喜悦="', out)
-        self.assertIn('嫉妒="', out)
+        self.assertIn('喜悦="52"', out)
+        self.assertIn('信任="30"', out)
+        self.assertNotIn("恐惧=", out)
+
+        # 全 0 记录：整段 <情感> 省略，不留空的属性列表（带空格才区分得开外层 <情感好感>）
+        blank = self.build(_Rec(), "友好", (61, 100), 80)
+        self.assertNotIn("<情感 ", blank)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
