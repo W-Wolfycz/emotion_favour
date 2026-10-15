@@ -2357,7 +2357,7 @@ class EmotionFavourPlugin(Star):
         persona_id = await self._get_persona_id(event)
         yield event.plain_result(
             f"🚨 极度危险：即将清空人格「{persona_id}」下【所有】印象数据！\n"
-            "请在 30 秒内准确回复「Accpet.」以继续，回复其他内容取消。"
+            "请在 30 秒内准确回复「Accept.」以继续，回复其他内容取消。"
         )
 
         @session_waiter(timeout=30, record_history_chains=False)
@@ -2365,7 +2365,7 @@ class EmotionFavourPlugin(Star):
             msg = (evt.message_str or "").strip()
             if not msg:
                 return
-            if msg == "Accpet.":
+            if msg == "Accept.":
                 try:
                     count, backup_file = await self.clear_persona_with_backup(persona_id)
                     if count:
