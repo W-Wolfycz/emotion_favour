@@ -6,8 +6,47 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from astrbot.core.message.components import At
+from astrbot.core.message.components import At, Reply
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
+
+
+def collect_mention_targets(
+    event: AstrMessageEvent,
+    *,
+    exclude_ids=(),
+    limit: int = 3,
+) -> list[tuple[str, str]]:
+    """从消息链里取出「本轮被提到的其他人」：(user_id, 昵称)。
+
+    只看两类确定信号：@（At 组件，aiocqhttp 适配器已经把群名片/昵称填进 name）与
+    引用回复（Reply 组件自带 sender_id / sender_nickname）。这两类不需要额外接口调用。
+    文本里裸写的名字需要群成员列表反查，由调用方按开关另行补充。
+    """
+    try:
+        chain = event.get_messages() or []
+    except Exception:
+        return []
+    excluded = {str(value) for value in exclude_ids if str(value)}
+    found: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for comp in chain:
+        kind = type(comp).__name__
+        if kind == "At":
+            user_id = str(getattr(comp, "qq", "") or "").strip()
+            display = str(getattr(comp, "name", "") or "").strip()
+        elif kind == "Reply":
+            user_id = str(getattr(comp, "sender_id", "") or "").strip()
+            display = str(getattr(comp, "sender_nickname", "") or "").strip()
+        else:
+            continue
+        # "all" 是 @全体成员（AtAll），"0" 是部分实现的兜底写法：都不是具体的人
+        if not user_id or user_id in ("all", "0") or user_id in excluded or user_id in seen:
+            continue
+        seen.add(user_id)
+        found.append((user_id, display or user_id))
+        if len(found) >= max(1, limit):
+            break
+    return found
 
 
 def get_target_uid(event: AstrMessageEvent, text_arg: str) -> str | None:

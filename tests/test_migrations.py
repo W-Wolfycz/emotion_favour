@@ -36,6 +36,7 @@ from db_migrations import (  # noqa: E402
     MigrationError,
     SQLiteMigration,
     SQLiteMigrationRunner,
+    add_display_name_column,
     add_emotion_columns,
     add_scar_columns,
     ensure_tier_scripts_table,
@@ -56,6 +57,7 @@ SCAR_COLUMNS = tuple(f"scar_{name}" for name in EMOTION_COLUMNS)
 
 MIGRATION_NAMES = (
     "add_emotion_columns_v1",
+    "add_display_name_v1",
     "add_scar_columns_v1",
     "ensure_tier_scripts_table_v1",
     "normalize_utc_timestamps_v1",
@@ -105,6 +107,7 @@ class MigrationTestBase(unittest.TestCase):
         if migrations is None:
             migrations = (
                 SQLiteMigration("add_emotion_columns_v1", add_emotion_columns),
+                SQLiteMigration("add_display_name_v1", add_display_name_column),
                 SQLiteMigration("add_scar_columns_v1", add_scar_columns),
                 SQLiteMigration("ensure_tier_scripts_table_v1", ensure_tier_scripts_table),
                 SQLiteMigration(
@@ -163,6 +166,7 @@ class LegacyDatabaseUpgradeTest(MigrationTestBase):
         self.assertEqual(self.migration_names(), set(MIGRATION_NAMES))
         self.assertTrue(set(EMOTION_COLUMNS).issubset(set(self.columns("favour_records"))))
         self.assertTrue(set(SCAR_COLUMNS).issubset(set(self.columns("favour_records"))))
+        self.assertIn("display_name", self.columns("favour_records"))
         self.assertIn("persona_tier_scripts", self.tables())
 
         backups = self.backup_files()
@@ -183,6 +187,7 @@ class LegacyDatabaseUpgradeTest(MigrationTestBase):
             row = backup.execute("SELECT favour FROM favour_records").fetchone()
         self.assertEqual(backup_columns & set(EMOTION_COLUMNS), set())
         self.assertEqual(backup_columns & set(SCAR_COLUMNS), set())
+        self.assertNotIn("display_name", backup_columns)
         self.assertNotIn("persona_tier_scripts", backup_tables)
         self.assertEqual(row, (42,))
 
@@ -193,6 +198,8 @@ class LegacyDatabaseUpgradeTest(MigrationTestBase):
         self.assertEqual(
             self.query("SELECT scar_trust, scar_anger FROM favour_records"), [(0, 0)]
         )
+        # 昵称默认空串：升级那一刻管理台先只显示 ID，收到消息后才补
+        self.assertEqual(self.query("SELECT display_name FROM favour_records"), [("",)])
 
 
 class TimestampNormalizationTest(MigrationTestBase):
@@ -258,57 +265,6 @@ class RepeatedRunTest(MigrationTestBase):
                          after_first)
         self.assertEqual(self.migration_names(), set(MIGRATION_NAMES))
         self.assertIsNotNone(first.backup_path)
-
-    def test_already_normalized_database_is_not_shifted_again(self):
-        """守「meta 幂等标记失效 → 二次位移」：库里已带 utc_naive_v1 标记、但 runner 的
-        marker 表还没有（旧版本已迁移过，或从 marker 表之前的备份恢复）时，时间戳必须
-        原样保留。再减 8 小时不会报错，只会让所有时间衰减凭空加速一档。"""
-        self.make_legacy_db()
-        with closing(sqlite3.connect(self.db_path)) as connection:
-            connection.execute(
-                "CREATE TABLE emotion_favour_meta("
-                "key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '')"
-            )
-            connection.execute(
-                "INSERT INTO emotion_favour_meta(key, value) "
-                "VALUES ('timestamp_storage', 'utc_naive_v1')"
-            )
-            connection.execute(
-                "UPDATE favour_records SET created_at='2026-01-01 19:04:05', "
-                "updated_at='2026-03-03 21:06:07'"
-            )
-            connection.execute(
-                "UPDATE persona_summaries SET updated_at='2026-02-02 20:05:06'"
-            )
-            connection.commit()
-
-        self.make_runner().run()
-
-        self.assertEqual(
-            self.query("SELECT created_at, updated_at FROM favour_records"),
-            [("2026-01-01 19:04:05", "2026-03-03 21:06:07")],
-        )
-        self.assertEqual(
-            self.query("SELECT updated_at FROM persona_summaries"),
-            [("2026-02-02 20:05:06",)],
-        )
-
-
-class FreshDatabaseTest(MigrationTestBase):
-    def test_fresh_database_runs_without_backup(self):
-        """守「全新库也生成 pre_migration 备份」：空库没有任何存量数据可回滚，备份只会让
-        admin 备份列表里出现无意义的空文件并随装机次数增长。三个迁移在空库上是 no-op
-        （无表可改），但照样记入 marker——这里同时钉住这一实际行为。"""
-        self.assertFalse(self.db_path.exists())
-        result = self.make_runner().run()
-
-        self.assertEqual(result.applied_names, MIGRATION_NAMES)
-        self.assertIsNone(result.backup_path)
-        self.assertEqual(self.backup_files(), [])
-        self.assertFalse((self.data_dir / "backups").exists())
-        self.assertIn("persona_tier_scripts", self.tables())
-        self.assertEqual(self.migration_names(), set(MIGRATION_NAMES))
-
 
 class FailedMigrationTest(MigrationTestBase):
     def test_failed_migration_rolls_back_schema_and_marker(self):

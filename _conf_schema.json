@@ -139,6 +139,47 @@
       }
     }
   },
+  "mention_config": {
+    "description": "被提及者的关系注入",
+    "type": "object",
+    "hint": "把 Bot 与「有印象记录的人」的好感关系注入本轮上下文，让角色对第三方的态度与既有关系一致（跟 A 很熟、跟 B 只是陌生人时不再演串）。",
+    "items": {
+      "mention_favour_enabled": {
+        "description": "注入他人关系",
+        "type": "bool",
+        "default": true,
+        "hint": "总开关。关闭后完全不注入他人关系，也不做任何提到谁的解析。"
+      },
+      "mention_scope": {
+        "description": "注入范围",
+        "type": "string",
+        "default": "all",
+        "options": [
+          "all",
+          "group",
+          "mention"
+        ],
+        "labels": [
+          "全部（本人生格下有记录的所有人）",
+          "本群（当前群里有记录的人）",
+          "仅被提到的（@、引用，可选昵称匹配）"
+        ],
+        "hint": "全部 = 把该人格下有记录、且已补到昵称的人一次性给模型，最稳、不依赖「这句话里有没有提到谁」；代价是每条消息固定多几十行（20 人约 500 字符）。本群 = 只注入当前群成员中有记录的人，人数随群规模变化。仅被提到的 = 只解析 @、引用（和可选的昵称匹配）。"
+      },
+      "mention_favour_max": {
+        "description": "单轮最多注入几人",
+        "type": "int",
+        "default": 20,
+        "hint": "全部/本群模式下是总行数上限（按好感从高到低取），仅被提到模式下是解析上限。人数越多越吃 token：20 人约 500 字符，50 人约 1.4k。"
+      },
+      "mention_name_match": {
+        "description": "按昵称文本匹配群成员",
+        "type": "bool",
+        "default": false,
+        "hint": "只在「仅被提到的」模式下生效：@ 与引用之外，还会在消息文本里找群成员昵称（取群名片与昵称，名字至少 2 个字、长名优先），需要拉取群成员列表、按 10 分钟缓存。全部/本群模式不需要它。"
+      }
+    }
+  },
   "settlement_config": {
     "description": "结算与衰减",
     "type": "object",

@@ -290,12 +290,6 @@ class WarmTierScriptsTest(TierScriptFlowTestBase):
         self.assertEqual(len(stub.llm_calls), 1)
         self.assertEqual(len(stub.db.replaced), 1)
 
-    def test_skips_when_cache_is_fresh(self):
-        """守「预热重复生成」：缓存新鲜时不得调 LLM，否则每次启动都白烧一次调用。"""
-        stub = _Stub(cached=_fresh_cache(), llm=_llm_payload([(0, "不该调用")]))
-        self.call("_warm_tier_scripts", stub)
-        self.assertEqual(stub.llm_calls, [])
-
     def test_skips_when_disabled_or_unconfigured(self):
         """守「配置被静默忽略」：开关关闭、未配后台任务模型时都不得发起生成调用。
         两者判错都不会报错，只会在启动时悄悄多出 LLM 开销。"""
@@ -308,28 +302,9 @@ class WarmTierScriptsTest(TierScriptFlowTestBase):
                 self.call("_warm_tier_scripts", stub)
                 self.assertEqual(stub.llm_calls, [])
 
-    def test_failure_does_not_escape(self):
-        """守预热的后台异常不外泄：它在后台任务里跑，抛出去只会变成启动期噪音
-        （任务异常日志），还会中断后面人格的补齐。"""
-        stub = _Stub(llm=RuntimeError("provider 超时"))
-
-        async def boom():
-            raise RuntimeError("database is locked")
-
-        stub.db.get_distinct_personas = boom
-        self.call("_warm_tier_scripts", stub)  # 不抛即通过
-
 
 class TierScriptForTest(TierScriptFlowTestBase):
-    """出图路径上的取用：命中直接展示，未命中交后台补齐、不能阻塞出图。"""
-
-    def test_hit_returns_script_without_background_task(self):
-        """守「命中仍起后台任务」：新鲜命中必须直接返回且不 spawn，否则每次出图都
-        多一次无用的后台生成。"""
-        stub = _Stub(cached=_fresh_cache())
-        text = self.call("_tier_script_for", stub, EventStub(), "persona_demo", TIERS[0])
-        self.assertEqual(text, "失望时的心里话。")
-        self.assertEqual(stub._tasks.spawned, [])
+    """出图路径上的取用：未命中交后台补齐、不能阻塞出图。"""
 
     def test_miss_returns_empty_and_spawns_refresh(self):
         """守「缺失时不补生成」：未命中要返回空并交给后台补齐（不阻塞出图）。

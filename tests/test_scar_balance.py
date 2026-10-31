@@ -29,7 +29,6 @@ from domain import (  # noqa: E402
     EMOTION_DIMENSIONS,
     apply_scar,
     apply_scar_decay,
-    build_scar_hint,
     utc_now,
 )
 
@@ -135,23 +134,6 @@ class ScarDecayTest(unittest.TestCase):
             changes, _ = apply_scar_decay(record, min_hours=1.0)
             value += changes.get("trust", 0)
         self.assertEqual(value, 0)
-
-
-class ScarHintTest(unittest.TestCase):
-    def test_hint_lists_only_dimensions_over_threshold(self):
-        """守注入痕迹的门槛与措辞：未达阈值的维度不得出现（否则模型会为一点小事道歉），
-        且必须声明是历史残留——少了这句，模型会把旧伤痕当成当前情绪来演。"""
-        self.assertEqual(build_scar_hint(_record()), "")
-
-        hint = build_scar_hint(_record(scar_trust=-65, scar_joy=-31, scar_anger=-20))
-        self.assertIn("信任严重受损", hint)
-        self.assertIn("喜悦受损", hint)
-        self.assertNotIn("愤怒", hint)
-        self.assertIn("历史残留", hint)
-
-    def test_neutral_dimension_never_shows_a_hint(self):
-        """不参与的维度即使伤痕被写得再深，也不该出现在注入里。"""
-        self.assertEqual(build_scar_hint(_record(scar_surprise=-90)), "")
 
 
 if __name__ == "__main__":

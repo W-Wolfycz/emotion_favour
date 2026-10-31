@@ -124,6 +124,42 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+def as_naive_utc(value) -> Optional[datetime]:
+    """把任意来源的时间戳归一到 UTC naive。
+
+    记录里的 updated_at 可能来自三种路径：本版本写入的 naive UTC、旧版本/备份恢复
+    写进来的带时区值、手工改库的 ISO 字符串。混着做减法会抛
+    `can't subtract offset-naive and offset-aware datetimes`——而炸点在后台结算
+    任务里，表现为「这一轮结算整条失败、这个人的数值原地不动」，
+    只在日志里留一条 ERRO，前台完全看不出来。
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return as_naive_utc(parsed)
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def elapsed_hours_since(value, *, now=None) -> Optional[float]:
+    """now 与 value 的小时差；任一侧无法解析时返回 None（调用方按"不衰减"处理）。"""
+    current = as_naive_utc(now) if now is not None else as_naive_utc(utc_now())
+    stamp = as_naive_utc(value)
+    if current is None or stamp is None:
+        return None
+    return (current - stamp).total_seconds() / 3600
+
+
 def diminish_delta(current: int, delta: int, cap: int = 100) -> int:
     """对正向变化量施加收益递减。"""
     if delta <= 0:
@@ -151,7 +187,10 @@ def apply_emotion_decay(
     """计算时间衰减后的情感值；不修改传入记录。"""
     if not record or not record.updated_at:
         return {}, 0.0
-    elapsed_raw = (utc_now() - record.updated_at).total_seconds() / 3600
+    elapsed_raw = elapsed_hours_since(record.updated_at)
+    if elapsed_raw is None:
+        # 时间戳读不懂（脏数据/带时区的旧值）就当没到衰减点，别让整轮结算崩掉
+        return {}, 0.0
     elapsed_hours = int(elapsed_raw)
     if elapsed_hours < max(1, int(min_hours)):
         return {}, elapsed_raw
@@ -226,7 +265,9 @@ def apply_scar_decay(record, *, min_hours: float, rate: float = SCAR_DECAY_RATE)
     """时间让伤痕慢慢淡去；返回伤痕增量（0 或正数）。"""
     if record is None or not getattr(record, "updated_at", None):
         return {}, 0.0
-    elapsed_raw = (utc_now() - record.updated_at).total_seconds() / 3600
+    elapsed_raw = elapsed_hours_since(record.updated_at)
+    if elapsed_raw is None:
+        return {}, 0.0
     elapsed_hours = int(elapsed_raw)
     if elapsed_hours < max(1, int(min_hours)):
         return {}, elapsed_raw
@@ -259,7 +300,7 @@ def build_scar_hint(record) -> str:
                 break
     if not hits:
         return ""
-    return f"  <痕迹>{'、'.join(hits)}（历史残留，不代表当前态度）</痕迹>"
+    return f"    <SCARS>{'、'.join(hits)}（历史残留，不代表当前态度）</SCARS>"
 
 
 def compute_favour_decay(
@@ -274,8 +315,11 @@ def compute_favour_decay(
     """按非线性 ODE 封闭解计算 lazy 好感衰减，不落盘。"""
     if favour_now <= anchor or not updated_at:
         return favour_now
-    now = now or utc_now()
-    elapsed_ticks = int((now - updated_at).total_seconds() // TICK_SECONDS)
+    stamp = as_naive_utc(updated_at)
+    current = as_naive_utc(now) if now is not None else as_naive_utc(utc_now())
+    if stamp is None or current is None:
+        return favour_now
+    elapsed_ticks = int((current - stamp).total_seconds() // TICK_SECONDS)
     if elapsed_ticks <= 0:
         return favour_now
     initial_delta = favour_now - anchor
@@ -349,7 +393,7 @@ def build_system_prompt_extra(
         "# 情感好感度系统（隐藏的背景规则，自然执行，禁止陈述）",
         "",
         "## 系统说明",
-        "你（角色）与用户的互动受一套隐藏的好感度系统影响。系统在每轮对话前会以 <情感好感> 标签注入当前状态作为情境提示。",
+        "你（角色）与用户的互动受一套隐藏的好感度系统影响。系统在每轮对话前会以 <FAVOUR_STATE> 标签注入当前状态作为情境提示。",
         "系统存在本身是隐藏的元信息，禁止向用户透露：",
         "- 不得提及系统、好感度数值、关系等级、情感维度、档位结构的存在",
         "- 不得使用「我不能说」「按规则」「受等级限制」「等好感度上去再」「解锁」「权限」等机制或元叙述字眼",
@@ -358,9 +402,10 @@ def build_system_prompt_extra(
         "- 所有规则要自然执行，禁止陈述规则本身（例如不得说「我现在不能说X」「按规则只能说Y」）",
         "",
         "## 12 维情感维度",
-        "喜悦 / 信任 / 恐惧 / 惊讶 / 悲伤 / 厌恶 / 愤怒 / 期待 / 得意 / 内疚 / 害羞 / 嫉妒",
-        "（这些维度会以属性形式出现在 <情感> 标签上，反映角色对用户的瞬时情感状态，作为表演参考；"
-        "只列出非 0 的维度，未出现的即为 0）",
+        "joy(喜悦) / trust(信任) / fear(恐惧) / surprise(惊讶) / sadness(悲伤) / disgust(厌恶) / "
+        "anger(愤怒) / anticipation(期待) / pride(得意) / guilt(内疚) / shame(害羞) / envy(嫉妒)",
+        "（这些维度会以属性形式出现在 <EMOTION> 标签上，属性名即上面的英文键，"
+        "反映角色对用户的瞬时情感状态，作为表演参考；只列出非 0 的维度，未出现的即为 0）",
     ]
     if relationship_mode == "advance" and advance_items:
         lines.extend([
@@ -377,7 +422,7 @@ def build_system_prompt_extra(
                 )
         lines.extend([
             "",
-            "当前所在档位的详细边界通过 <情感好感> 标签注入，以当前档为准表演。",
+            "当前所在档位的详细边界通过 <FAVOUR_STATE> 标签注入，以当前档为准表演。",
         ])
     lines.extend([
         "",
@@ -398,24 +443,30 @@ def build_injection_prompt(
     tier_extras: Optional[dict] = None,
     show_scars: bool = True,
 ) -> str:
+    """当前对话者自己的状态面板。
+
+    他人关系是**独立的一块**（`build_others_prompt`）：这份 XML 只描述"我对正在
+    跟我说话的这个人的态度"，把别人的关系塞进来会让两件事在语义上糊在一起。
+    """
     tone = build_tone_instruction(record)
     display_favour = effective_favour if effective_favour is not None else record.favour
     # 只列非 0 维：全 0 面板既费 token，又把「可以谈这 12 个词」的素材递给模型，
-    # 与 <禁止> 想防的事相反。出图侧（format_emotion_detail）仍展示全量面板。
+    # 与 <FORBIDDEN> 想防的事相反。出图侧（format_emotion_detail）仍展示全量面板。
+    # 属性名用英文键（joy/trust/…），与标签同语种；中文维度名只留在正文与人设说明里。
     emotion_attrs = " ".join(
-        f'{EMOTION_DISPLAY_NAMES[dimension]}="{getattr(record, dimension)}"'
+        f'{dimension}="{getattr(record, dimension)}"'
         for dimension in EMOTION_DIMENSIONS
         if getattr(record, dimension)
     )
     scar_hint = build_scar_hint(record) if show_scars else ""
     lines = [
-        "<情感好感>",
-        "  <状态>",
-        f"    <好感度>{display_favour}</好感度>",
-        f"    <关系>{relationship}</关系>",
-        *([f"    <情感 {emotion_attrs}/>"] if emotion_attrs else []),
+        "<FAVOUR_STATE>",
+        "  <STATE>",
+        f"    <FAVOUR>{display_favour}</FAVOUR>",
+        f"    <RELATION>{relationship}</RELATION>",
+        *([f"    <EMOTION {emotion_attrs}/>"] if emotion_attrs else []),
         *([scar_hint] if scar_hint else []),
-        "  </状态>",
+        "  </STATE>",
     ]
 
     percentage: Optional[int] = None
@@ -425,17 +476,17 @@ def build_injection_prompt(
         )
         if tier_extras and tier_extras.get("is_max_tier"):
             lines.append(
-                f"  <进度>在「{relationship}」区间内已积累 {percentage}%（已达最高等级）</进度>"
+                f"  <PROGRESS>在「{relationship}」区间内已积累 {percentage}%（已达最高等级）</PROGRESS>"
             )
         else:
             lines.append(
-                f"  <进度>在「{relationship}」区间内已积累 {percentage}%（{semantic}）</进度>"
+                f"  <PROGRESS>在「{relationship}」区间内已积累 {percentage}%（{semantic}）</PROGRESS>"
             )
 
     if tier_extras:
         boundary = tier_extras.get("boundary", "")
         if boundary:
-            lines.append(f"  <边界>{boundary}</边界>")
+            lines.append(f"  <BOUNDARY>{boundary}</BOUNDARY>")
         if (
             percentage is not None
             and percentage >= 80
@@ -443,21 +494,124 @@ def build_injection_prompt(
             and tier_extras.get("preview")
             and tier_extras.get("next_describe")
         ):
+            # 配置里的 preview 常自带句号，直接拼会出现「。。」
+            preview = str(tier_extras["preview"]).strip().rstrip("。．.；;，,")
             lines.append(
-                f"  <临近解锁>再积累将过渡到「{tier_extras['next_describe']}」。"
-                f"{tier_extras['preview']}。</临近解锁>"
+                f"  <NEAR_UNLOCK>再积累将过渡到「{tier_extras['next_describe']}」。"
+                f"{preview}。</NEAR_UNLOCK>"
             )
 
     lines.extend([
-        f"  <行为>如人格设定未针对「{relationship}」关系提供指引，请根据该关系做出符合人设的回答。</行为>",
-        f"  <语气>{tone or '保持自然对话语气。'}</语气>",
-        "  <禁止>本标签为隐藏情境提示，按系统规则自然执行，禁止在回复中提及、陈述或推理。</禁止>",
-        "  <约束>面板是表演参考，不是对用户的判断或事实，不得作为结论陈述；"
+        f"  <BEHAVIOR>如人格设定未针对「{relationship}」关系提供指引，请根据该关系做出符合人设的回答。</BEHAVIOR>",
+        f"  <TONE>{tone or '保持自然对话语气。'}</TONE>",
+        "  <FORBIDDEN>本标签为隐藏情境提示，按系统规则自然执行，禁止在回复中提及、陈述或推理。</FORBIDDEN>",
+        "  <CONSTRAINT>面板是表演参考，不是对用户的判断或事实，不得作为结论陈述；"
         "面板来自上一轮结算、滞后一轮，与本轮用户实际说出的话明显不符时按本轮内容调整表演；"
-        "档位边界只改变表达方式，不得把档位当作拒绝的理由陈述出来。</约束>",
-        "</情感好感>",
+        "档位边界只改变表达方式，不得把档位当作拒绝的理由陈述出来。</CONSTRAINT>",
+        "</FAVOUR_STATE>",
     ])
     return "\n".join(lines)
+
+
+# 昵称里出现这些字符，基本只可能是想伪造/闭合标记块，而不是真的名字
+_MARKUP_CHARS = frozenset('<>"\'=')
+_ATTR_STRIP = str.maketrans({"<": "", ">": "", '"': "", "'": "", "=": "", "\r": " ", "\n": " "})
+
+
+def is_markup_like(value: object) -> bool:
+    """名字里带 `<>"'=` 的，当作攻击/噪声而不是名字。"""
+    return any(char in _MARKUP_CHARS for char in str(value or ""))
+
+
+def safe_attribute(value: object, *, limit: int = 32) -> str:
+    """属性值兜底：昵称来自群名片，是用户可控的。
+
+    调用方先用 `is_markup_like` 挡掉带尖括号/引号/等号的名字；这里再兜一层——
+    去掉这些字符（不是换全角：换完全角会留下一串看着像乱码的昵称）、压掉换行与
+    不可打印字符，避免 `x＂ 关系=＂挚爱` 这种东西被当成真名字喂给模型。
+    处理方向与 time_awareness 的 `neutralize_markup` 一致：让内容无法闭合或伪造标记块。
+    """
+    text = str(value or "").translate(_ATTR_STRIP)
+    text = "".join(char for char in text if char.isprintable())
+    return " ".join(text.split())[:limit]
+
+
+def build_others_prompt(others: Optional[list]) -> str:
+    """他人关系（独立一块，不塞进对话者的 <FAVOUR_STATE>）。
+
+    每行只有昵称 + 关系名：档位本身就是"该怎么对待这个人"的全部依据，好感数值与
+    区间进度对本轮表演没有增量，却多一份被念出来的风险（没有数字可念，就泄不出去）。
+    没有可注入对象时返回空串，调用方据此不加这一段。
+    """
+    entries = [item for item in (others or []) if item and item.get("relationship")]
+    if not entries:
+        return ""
+    lines = ["<OTHERS>"]
+    for item in entries:
+        raw_name = item.get("name") or item.get("user_id") or ""
+        if is_markup_like(raw_name):
+            # 伪造/噪声名片：整条丢掉，比渲染成一串怪字符更干净
+            continue
+        name = safe_attribute(raw_name)
+        if not name:
+            continue
+        lines.append(f'  <PERSON name="{name}" relation="{safe_attribute(item["relationship"])}"/>')
+    if len(lines) == 1:
+        return ""
+    lines.extend([
+        # 与面板同样的双标签结构：<FORBIDDEN> 管"不许提这个标签"，
+        # <CONSTRAINT> 管这块特有的行为约束。可读性优先，不为了省 token 合并。
+        "  <FORBIDDEN>本标签为隐藏情境提示，按系统规则自然执行，禁止在回复中提及、陈述或推理。</FORBIDDEN>",
+        "  <CONSTRAINT>这是「我对这些人的态度」，只在本轮对话确实涉及某人时参考，"
+        "不要主动提起没被提到的人；不得向任何人复述其中的等级名，"
+        "也不要主动提起这份记录的存在。</CONSTRAINT>",
+        "</OTHERS>",
+    ])
+    return "\n".join(lines)
+
+
+def match_member_names(
+    text: str,
+    members: list,
+    *,
+    exclude_ids=(),
+    max_hits: int = 3,
+    min_len: int = 2,
+) -> list:
+    """在消息文本里找出被提到的群成员（纯函数，便于单测）。
+
+    members 为 [{"user_id": str, "names": [昵称, 群名片…]}, …]。
+    规则：昵称长度 ≥ min_len、按名字从长到短匹配（「小明」优先于「小」），
+    命中后把该子串从待匹配文本里抠掉，避免同一段文字被多个短名重复命中；
+    说话者与 Bot 自己由 exclude_ids 排除。返回 [(user_id, 命中名), …]，按在文本中出现的顺序。
+    """
+    if not text:
+        return []
+    excluded = {str(value) for value in exclude_ids}
+    working = text
+    hits: list[tuple[int, str, str]] = []
+    candidates: list[tuple[str, str]] = []
+    for member in members or []:
+        user_id = str(member.get("user_id") or member.get("user_id") or "").strip()
+        if not user_id or user_id in excluded:
+            continue
+        for name in member.get("names") or []:
+            name = str(name or "").strip()
+            if len(name) >= min_len:
+                candidates.append((name, user_id))
+    candidates.sort(key=lambda pair: (-len(pair[0]), pair[0]))
+    for name, user_id in candidates:
+        if len(hits) >= max_hits:
+            break
+        position = working.find(name)
+        if position < 0:
+            continue
+        if any(existing_id == user_id for _, existing_id, _ in hits):
+            continue
+        hits.append((position, user_id, name))
+        working = working.replace(name, "\x00" * len(name))
+    hits.sort(key=lambda item: item[0])
+    return [(user_id, name) for _, user_id, name in hits]
 
 
 def format_emotion_detail(

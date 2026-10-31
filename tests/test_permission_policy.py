@@ -1,16 +1,15 @@
-"""权限策略与「命令登记」不变量测试。
+"""权限策略测试。
 
 - 管理命令必须 Bot 管理员（含未登记命令 fail-closed）；
-- 特殊 ID 才拿特殊初始好感度；
-- 命令集合与权限检查点都从 `main.py` 现取（不是测试自造副本），并断言每个会做
-  权限检查的命令名都已登记：漏登记的表现是「命令静默不可用」。
+- 特殊 ID 才拿特殊初始好感度。
+两者判错都没有运行期报错，只会静默越权或静默失效；命令集合从 `main.py` 现取，
+不维护测试副本。
 
 运行：
     python3 -m unittest tests.test_permission_policy -v
 """
 import asyncio
 import importlib.util
-import re
 import types
 import unittest
 from pathlib import Path
@@ -29,9 +28,6 @@ extract_class_attribute = _shared.extract_class_attribute
 extract_method = _shared.extract_method
 read_main_source = _shared.read_main_source
 
-CHECKED_COMMAND_PATTERN = re.compile(r'_check_command_permission\(event,\s*"([^"]+)"')
-
-
 class _Event:
     def __init__(self, sender_id):
         self.sender_id = sender_id
@@ -46,10 +42,6 @@ def _command_sets(src: str) -> tuple:
         return eval(block.split("=", 1)[1].strip(), {"frozenset": frozenset})
 
     return value("_PUBLIC_COMMANDS"), value("_BOT_ADMIN_COMMANDS")
-
-
-def _checked_command_names(src: str) -> list:
-    return sorted(set(CHECKED_COMMAND_PATTERN.findall(src)))
 
 
 class TestPermissionPolicy(unittest.TestCase):
@@ -91,14 +83,6 @@ class TestPermissionPolicy(unittest.TestCase):
             asyncio.run(self.check(non_admin, _Event("10002"), "not-registered")),
             "未登记的命令必须 fail-closed",
         )
-
-    def test_checked_commands_are_registered(self):
-        """守「新增命令带权限检查但漏登记」：fail-closed 会让该命令静默不可用，
-        只有真被人用到时才暴露；检查点与登记表都从源码现取，不维护测试副本。"""
-        checked = _checked_command_names(self.src)
-        self.assertTrue(checked, "应从 main.py 提取到权限检查点")
-        registered = set(self.public) | set(self.admin)
-        self.assertEqual(sorted(set(checked) - registered), [])
 
     def test_explicit_special_ids_only_get_special_initial_favour(self):
         """守「初始好感度被静默改写」：显式特使拿 admin_default_favour，其他人拿

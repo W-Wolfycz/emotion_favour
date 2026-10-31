@@ -2,6 +2,7 @@
 import os
 import re
 import json
+import time
 import shutil
 import asyncio
 import traceback
@@ -46,12 +47,14 @@ from .domain import (
     build_injection_prompt,
     build_interaction_section,
     build_list_html,
+    build_others_prompt,
     build_report_html,
     build_system_prompt_extra,
     build_tier_script_prompt,
     compute_tier_progress,
     format_emotion_detail,
     get_dominant_emotions,
+    match_member_names,
     parse_tier_script_response,
     tier_scripts_fresh,
     diminish_delta,
@@ -64,6 +67,7 @@ from .domain import (
 )
 from .utils import (
     cleanup_old_files,
+    collect_mention_targets,
     placeholder_for_message,
     strip_reply_markers,
     get_target_uid,
@@ -129,6 +133,8 @@ class EmotionFavourPlugin(Star):
         self._blocked_records: set[tuple[str, str, str]] = set()
         # 结算健康度计数（内存态、按 persona；纯诊断，重启清零）
         self._settlement_stats: dict[str, dict] = {}
+        # 群成员昵称缓存：{group_id: (抓取时间, [{"user_id", "names"}])}，只服务"文本里提到某人"
+        self._member_cache: dict[str, tuple[float, list[dict]]] = {}
         self._browser_lock = asyncio.Lock()
 
         # Playwright T2I
@@ -669,11 +675,14 @@ class EmotionFavourPlugin(Star):
     async def _get_persona_id(self, event: AstrMessageEvent) -> str:
         """获取当前 LLM 请求实际生效的 persona_id。
 
-        与 chat_memory 同源：通过 persona_manager.resolve_selected_persona 按
-        session 规则 > conversation.persona_id > config 默认 优先级解析，
+        与 chat_memory 同源：交给 `persona_manager.resolve_selected_persona` 按
+        session 强制 > conversation.persona_id > 该 UMO 命中 conf 的 agent_runner 人格
+        解析（`runner_type` 分支、`[%None]` 显式无人格等细节都封在核心实现里），
         保证 favour 记录的 persona 与 LLM 实际使用的 persona 一致。
-        旧实现只取 config 的 default_personality，会忽略 /persona 切换与
-        conversation 级 persona，导致切人格后 favour 数据错位。
+
+        不要再用「读 provider_settings 里的默认人格」那套：`default_personality`
+        在 4.29 的用户配置里已不存在，读它只会拿到空值并让 /persona 切换失效。
+        `provider_settings` 形参在核心侧已废弃（函数体不读），这里也就不再传。
         """
         try:
             umo = event.unified_msg_origin
@@ -687,12 +696,10 @@ class EmotionFavourPlugin(Star):
             except Exception:
                 pass
 
-            cfg = self.context.get_config(umo=umo).get("provider_settings", {})
             resolved, _, _, _ = await self.persona_mgr.resolve_selected_persona(
                 umo=umo,
                 conversation_persona_id=conv_persona_id,
                 platform_name=event.get_platform_name(),
-                provider_settings=cfg,
             )
             if resolved and resolved != "[%None]":
                 return resolved
@@ -964,6 +971,9 @@ class EmotionFavourPlugin(Star):
     # 结算健康度最多跟踪多少个人格（纯诊断，超出不再记新人格）
     _SETTLEMENT_STATS_MAX_PERSONAS = 200
 
+    # 群成员昵称缓存存活秒数（只服务"文本里提到某人"，避免每条消息都拉成员列表）
+    _MEMBER_CACHE_TTL = 600.0
+
     _CDN_TO_FILE = {
         "https://cdn.jsdelivr.net/npm/marked/marked.min.js": "marked.min.js",
         "https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js": "highlight.min.js",
@@ -1139,9 +1149,11 @@ class EmotionFavourPlugin(Star):
 
     # ================= Hook: 注入 =================
 
+    # 新旧标签都要能洗：升级前注入到历史里的中文块仍在上下文里，不认就会越堆越多
     _CTX_CLEAN_PATTERN = re.compile(
         r"(?:```(?:xml|text)?\s*)?<(?:thought|thinking)>[\s\S]*?</(?:thought|thinking)>(?:\s*```)?"
-        r"|<情感好感[^>]*>[\s\S]*?</情感好感>",
+        r"|<(?:情感好感|FAVOUR_STATE)[^>]*>[\s\S]*?</(?:情感好感|FAVOUR_STATE)>"
+        r"|<(?:他人关系|OTHERS)[^>]*>[\s\S]*?</(?:他人关系|OTHERS)>",
         re.IGNORECASE | re.MULTILINE,
     )
 
@@ -1182,13 +1194,235 @@ class EmotionFavourPlugin(Star):
                 cleaned.append(ctx)
         return cleaned
 
+    async def _sync_display_name(
+        self, event: AstrMessageEvent, persona_id: str, user_id: str, record
+    ) -> None:
+        """把发送者的群昵称补进记录（管理台展示/搜索用）。
+
+        只在名字变化时写一次：`set_display_name` 不刷 updated_at，所以不影响衰减；
+        写失败只记 DEBUG，绝不因为"昵称没存上"影响本轮注入。
+        """
+        name = str(event.get_sender_name() or "").strip()[:64]
+        if not name or name == str(getattr(record, "display_name", "") or ""):
+            return
+        try:
+            if await self.db.set_display_name(persona_id, user_id, name):
+                setattr(record, "display_name", name)
+        except Exception as exc:
+            logger.debug(f"{self._tag(event)} 同步昵称失败: {type(exc).__name__}")
+
+    async def _lookup_platform_nickname(self, user_id: str) -> str:
+        """从平台接口取昵称（管理台"补全昵称"用），失败返回空串。"""
+        try:
+            insts = self.context.platform_manager.get_insts()
+        except Exception:
+            return ""
+        for inst in insts or []:
+            meta_fn = getattr(inst, "meta", None)
+            bot = getattr(inst, "bot", None)
+            if bot is None or not callable(meta_fn):
+                continue
+            try:
+                if meta_fn().name != "aiocqhttp":
+                    continue
+                info = await bot.call_action(
+                    action="get_stranger_info", user_id=int(user_id)
+                )
+            except Exception:
+                continue
+            name = str((info or {}).get("nickname") or "").strip()
+            if name:
+                return name[:64]
+        return ""
+
+    async def refresh_display_names(self, persona_id: str, *, limit: int = 50) -> dict:
+        """给缺昵称的记录补名（管理台按钮触发，每次最多 limit 条）。"""
+        records = await self.db.list_records_missing_display_name(
+            persona_id, limit=limit
+        )
+        updated = 0
+        for record in records:
+            name = await self._lookup_platform_nickname(record.user_id)
+            if not name:
+                continue
+            if await self.db.set_display_name(persona_id, record.user_id, name):
+                updated += 1
+        return {"scanned": len(records), "updated": updated}
+
+    async def _group_member_names(self, event: AstrMessageEvent, group_id: str) -> list[dict]:
+        """取群成员「id + 可用称呼」，带 TTL 缓存。
+
+        只在开启「文本昵称匹配」时才调用：一次 get_group_member_list 在大群里是
+        不小的一次性开销，缓存住避免每条消息都拉。
+        """
+        now = time.monotonic()
+        cached = self._member_cache.get(group_id)
+        if cached and now - cached[0] < self._MEMBER_CACHE_TTL:
+            return cached[1]
+        members: list[dict] = []
+        try:
+            raw = await event.bot.call_action(
+                action="get_group_member_list", group_id=int(group_id)
+            )
+        except Exception as exc:
+            logger.debug(f"{self._tag(event)} 拉取群成员失败: {type(exc).__name__}")
+            raw = None
+        for item in raw or []:
+            if not isinstance(item, dict):
+                continue
+            user_id = str(item.get("user_id") or "").strip()
+            if not user_id:
+                continue
+            names = [
+                str(item.get(key) or "").strip()
+                for key in ("card", "nickname")
+            ]
+            members.append({"user_id": user_id, "names": [n for n in names if n]})
+        self._member_cache[group_id] = (now, members)
+        return members
+
+    async def _collect_mention_targets(
+        self, event: AstrMessageEvent, speaker_id: str
+    ) -> list[tuple[str, str]]:
+        """本轮被提到的其他人（不含说话者与 Bot 自己）。
+
+        @ 与引用回复是确定性信号；文本里裸写的昵称需要开关（mention_name_match）+
+        群成员列表才能反查，默认关闭。
+        """
+        limit = max(1, int(self.mention_favour_max))
+        exclude = {str(speaker_id), str(event.get_self_id())}
+        targets = collect_mention_targets(event, exclude_ids=exclude, limit=limit)
+        if not self.mention_name_match or len(targets) >= limit:
+            return targets
+        group_id = str(event.get_group_id() or "")
+        text = (getattr(event, "message_str", "") or "").strip()
+        if not group_id or not text:
+            return targets
+        members = await self._group_member_names(event, group_id)
+        exclude |= {user_id for user_id, _name in targets}
+        for user_id, name in match_member_names(
+            text, members, exclude_ids=exclude, max_hits=limit - len(targets)
+        ):
+            targets.append((user_id, name))
+        return targets
+
+    def _make_other_entry(self, user_id: str, name: str, favour: int) -> dict:
+        """他人条目只带昵称与关系名：档位决定"该怎么对待这个人"，好感数值/进度
+        对本轮表演没有增量，徒增被念出来的风险。"""
+        return {
+            "name": name,
+            "user_id": user_id,
+            "relationship": self._get_relationship(favour, user_id),
+        }
+
+    async def _entries_for_mentions(
+        self, event: AstrMessageEvent, persona_id: str, speaker_id: str, cap: int
+    ) -> list[dict]:
+        """只注入本轮 @/引用（及可选昵称匹配）提到的人。"""
+        entries: list[dict] = []
+        for user_id, name in await self._collect_mention_targets(event, speaker_id):
+            if len(entries) >= cap:
+                break
+            record = await self.db.get_favour(persona_id, user_id)
+            if record is None:
+                # 没聊过就没有关系可言：不注入，避免暗示"我认识他"
+                continue
+            entries.append(self._make_other_entry(user_id, name, self._decay_favour_value(record)))
+        return entries
+
+    async def _entries_for_group(
+        self, event: AstrMessageEvent, persona_id: str, speaker_id: str, cap: int
+    ) -> list[dict]:
+        """注入当前群里有记录的人（按好感从高到低取前 cap 个）。
+
+        只取群成员 ∩ 有记录，私聊直接返回空：私聊里"本群"没有意义。
+        """
+        group_id = str(event.get_group_id() or "")
+        if not group_id:
+            return []
+        members = await self._group_member_names(event, group_id)
+        names = {}
+        for member in members:
+            user_id = member.get("user_id")
+            if user_id and member.get("names"):
+                names[user_id] = member["names"][0]
+        if not names:
+            return []
+        exclude = {str(speaker_id), str(event.get_self_id())}
+        records = await self.db.get_favours_by_user_ids(persona_id, names.keys())
+        records.sort(key=lambda record: record.favour, reverse=True)
+        entries: list[dict] = []
+        for record in records:
+            if len(entries) >= cap:
+                break
+            if record.user_id in exclude:
+                continue
+            name = names.get(record.user_id) or str(record.display_name or "").strip()
+            if not name:
+                continue
+            entries.append(
+                self._make_other_entry(record.user_id, name, self._decay_favour_value(record))
+            )
+        return entries
+
+    async def _entries_for_all(self, persona_id: str, speaker_id: str, cap: int) -> list[dict]:
+        """注入该人格下有记录、且已补到昵称的人（好感从高到低取前 cap 个）。
+
+        两个"别占名额"的细节：没有昵称的记录在 SQL 层就被排掉（`昵称="20002"`
+        对模型毫无意义，还会诱导它念 QQ 号）；说话者自己多取一条再剔除，否则
+        自己会白占一个位置。
+        """
+        speaker = str(speaker_id)
+        records = await self.db.list_records(
+            persona_id,
+            limit=min(200, cap + 1),
+            sort_by="favour",
+            sort_order="desc",
+            named_only=True,
+        )
+        entries: list[dict] = []
+        for record in records:
+            if len(entries) >= cap:
+                break
+            if str(record.user_id) == speaker:
+                continue
+            name = str(record.display_name or "").strip()
+            if not name:
+                continue
+            entries.append(
+                self._make_other_entry(record.user_id, name, self._decay_favour_value(record))
+            )
+        return entries
+
+    async def _build_others_entries(
+        self, event: AstrMessageEvent, persona_id: str, speaker_id: str
+    ) -> list[dict]:
+        """按配置的注入范围，把"其他人"转成注入条目。失败一律返回空列表。"""
+        cap = max(1, int(self.mention_favour_max))
+        try:
+            scope = self.mention_scope
+            if scope == "group":
+                entries = await self._entries_for_group(event, persona_id, speaker_id, cap)
+            elif scope == "mention":
+                entries = await self._entries_for_mentions(event, persona_id, speaker_id, cap)
+            else:
+                entries = await self._entries_for_all(persona_id, speaker_id, cap)
+        except Exception as exc:
+            logger.debug(f"{self._tag(event)} 构建他人条目失败: {type(exc).__name__}")
+            return []
+        if entries:
+            logger.debug(
+                f"{self._tag(event)} 注入他人关系({self.mention_scope}): {len(entries)} 条"
+            )
+        return entries
+
     @filter.on_llm_request()
     async def inject_favour_prompt(self, event: AstrMessageEvent, req: ProviderRequest):
         """LLM请求前注入好感度面板与情感状态，并清洗历史上下文中的旧注入标记"""
         if not self.is_ready():
             return
 
-        # 1. 清洗历史上下文：移除旧的 <情感好感> 注入和 <thought> 块
+        # 1. 清洗历史上下文：移除旧的 <FAVOUR_STATE> 注入和 <thought> 块
         if hasattr(req, "contexts") and isinstance(req.contexts, list):
             req.contexts = self._clean_history_contexts(
                 req.contexts, self._CTX_CLEAN_PATTERN
@@ -1207,6 +1441,7 @@ class EmotionFavourPlugin(Star):
                         f"{self._tag(event)} 好感度衰减生效: user={user_id} "
                         f"{record.favour}->{current_favour}"
                     )
+                await self._sync_display_name(event, persona_id, user_id, record)
             else:
                 current_favour = await self._get_initial_favour(event)
                 record = FavourRecord(persona_id=persona_id, user_id=user_id, favour=current_favour)
@@ -1228,6 +1463,10 @@ class EmotionFavourPlugin(Star):
                 append_system_prompt_once(req, sys_extra, SYSTEM_PROMPT_MARKER)
 
             # User append 通道：当前档位的动态状态（好感度数值、12 维情感、当前 boundary、进度）
+            others = (
+                await self._build_others_entries(event, persona_id, user_id)
+                if self.mention_favour_enabled else []
+            )
             prompt_final = build_injection_prompt(
                 record,
                 relationship,
@@ -1236,6 +1475,10 @@ class EmotionFavourPlugin(Star):
                 tier_extras=tier_extras,
                 show_scars=self.scar_enabled,
             )
+            # 他人关系单独一块：不属于"对当前对话者的态度"，拼在面板后面而不是里面
+            others_prompt = build_others_prompt(others)
+            if others_prompt:
+                prompt_final = f"{prompt_final}\n{others_prompt}"
 
             inject_runtime_prompt(req, prompt_final, TextPart)
             logger.debug(f"{self._tag(event)} 注入的印象上下文:\n{prompt_final}")
@@ -1621,7 +1864,8 @@ class EmotionFavourPlugin(Star):
                             favour=transient_favour,
                         ):
                             return
-                        logger.info(
+                        # 每轮都可能走到这里，只是刷新衰减基线、没有行为变化：DEBUG 就够
+                        logger.debug(
                             f"{tag} 印象结算无变化，刷新衰减基线 user={user_id} "
                             f"{record.favour}->{transient_favour}"
                         )
@@ -2414,7 +2658,7 @@ class EmotionFavourPlugin(Star):
                 "",
                 "- `/emotion query <@用户或ID>`　查看指定用户",
                 "- `/emotion list [页码]`　排行榜（每页 8 人）",
-                "- `/emotion set <@用户或ID> <好感度>`　设置好感值",
+                "- `/emotion set <@用户或ID> <FAVOUR>`　设置好感值",
                 "- `/emotion mood <@用户或ID> [维度] <数值>`　修改情感",
                 "- `/emotion clear <@用户或ID>`　清空指定用户",
                 "- `/emotion clear-all`　清空当前人格",

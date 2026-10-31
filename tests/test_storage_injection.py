@@ -1,8 +1,8 @@
 """domain.build_injection_prompt / build_system_prompt_extra 注入内容的静默失效点。
 
 注入文本只进模型上下文，出错不抛异常、界面也不显示，只能靠断言盯住三类：
-进度门（≥80% 才预告解锁）、满级不再给解锁预告、有效好感度与 <情感> 面板口径
-（只列非 0 维）以及 `<禁止>` 的禁令分层（thinking 禁令若退回动态标签就是真实泄漏）。
+进度门（≥80% 才预告解锁）、满级不再给解锁预告、有效好感度与 <EMOTION> 面板口径
+（只列非 0 维）以及 `<FORBIDDEN>` 的禁令分层（thinking 禁令若退回动态标签就是真实泄漏）。
 
 运行：
     python3 -m unittest tests.test_storage_injection -v
@@ -70,13 +70,13 @@ class TestBuildInjectionPrompt(unittest.TestCase):
             boundary="允许：牵手", preview="可流露深度亲密", next_describe="挚爱",
         )
         high = self.build(_Rec(), "喜欢", (61, 100), 95, tier_extras=extras)
-        self.assertIn("<临近解锁>", high)
+        self.assertIn("<NEAR_UNLOCK>", high)
         self.assertIn("过渡到「挚爱」", high)
         self.assertIn("可流露深度亲密", high)
 
         # 同一构造下进度不足则必须沉默
         low = self.build(_Rec(), "喜欢", (61, 100), 70, tier_extras=extras)
-        self.assertNotIn("<临近解锁>", low)
+        self.assertNotIn("<NEAR_UNLOCK>", low)
 
     def test_max_tier_marks_progress_and_blocks_preview(self):
         """守满级口径：is_max_tier=True 时进度行标「已达最高等级」且不再预告解锁。
@@ -89,13 +89,13 @@ class TestBuildInjectionPrompt(unittest.TestCase):
                 is_max_tier=True),
         )
         self.assertIn("已达最高等级", out)
-        self.assertNotIn("<临近解锁>", out)
+        self.assertNotIn("<NEAR_UNLOCK>", out)
 
     def test_dynamic_ban_pointer_vs_static_full_bans(self):
         """守禁令分层：动态标签只留就近指针，完整机制禁令（含 thinking 禁令）归静态
         SystemPrompt。静态禁令被复制回动态标签不会报错，只会让模型更容易说出机制。"""
         out = self.build(_Rec(), "友好", (61, 100), 80)
-        self.assertIn("<禁止>", out)
+        self.assertIn("<FORBIDDEN>", out)
         self.assertIn("隐藏情境提示", out)
         # 负向断言用禁令里真会出现的词：静态禁令若被复制回动态标签，这里会失败
         self.assertNotIn("解锁", out)
@@ -108,18 +108,19 @@ class TestBuildInjectionPrompt(unittest.TestCase):
         self.assertIn("不得输出 thinking", static)
 
     def test_effective_favour_and_emotion_attribute_form(self):
-        """守注入数值与面板协议：<好感度> 必须是衰减后的 effective_favour
-        （record.favour=0 却显示 80）；<情感> 只列非 0 维——把 0 值全列回去等于递给
+        """守注入数值与面板协议：<FAVOUR> 必须是衰减后的 effective_favour
+        （record.favour=0 却显示 80）；<EMOTION> 只列非 0 维——把 0 值全列回去等于递给
         模型「可以谈这 12 个词」的素材，漏列有值的维度又会让它演错情绪，两边都不报错。"""
         out = self.build(_WarmRec(), "友好", (61, 100), 80)
-        self.assertIn("<好感度>80</好感度>", out)
-        self.assertIn('喜悦="52"', out)
-        self.assertIn('信任="30"', out)
-        self.assertNotIn("恐惧=", out)
+        self.assertIn("<FAVOUR>80</FAVOUR>", out)
+        self.assertIn('joy="52"', out)
+        self.assertIn('trust="30"', out)
+        self.assertNotIn("fear=", out)
 
-        # 全 0 记录：整段 <情感> 省略，不留空的属性列表（带空格才区分得开外层 <情感好感>）
+        # 全 0 记录：整段 <EMOTION> 省略，不留空的属性列表（带空格才区分得开外层 <FAVOUR_STATE>）
         blank = self.build(_Rec(), "友好", (61, 100), 80)
-        self.assertNotIn("<情感 ", blank)
+        self.assertNotIn("<EMOTION ", blank)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

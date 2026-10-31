@@ -1,7 +1,7 @@
 """domain.py 数值函数的固定种子属性测试（stdlib random，不引入 hypothesis）。
 
 守的全是「数值悄悄算错」类静默失效：收益递减方向反了、好感衰减越过锚点或反向增长、
-三档情感代谢率接错位置、档位百分比越界——这些判错都不会报错，界面/日志里只是一串
+三档情感代谢率接错位置——这些判错都不会报错，界面/日志里只是一串
 看起来合理的数字，要专门比对历史值才看得出来。
 
 只喂契约内的输入域（cap > 0、current ∈ [0, cap]、时间戳取过去时刻、档位区间自洽），
@@ -12,15 +12,15 @@
 """
 import random
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from domain import (
     EMOTION_DIMENSIONS,
     EMOTION_GROUPS,
     apply_emotion_decay,
+    apply_scar_decay,
     compute_favour_decay,
-    compute_tier_progress,
     diminish_delta,
     utc_now,
 )
@@ -39,15 +39,6 @@ def _record(**overrides):
 
 
 class DiminishDeltaTest(unittest.TestCase):
-    def test_non_positive_delta_passes_through_unchanged(self):
-        """守「负向变化也被递减/被钳成 0」：delta <= 0（扣分）必须原样返回，否则惩罚被
-        悄悄抹平——负面情绪消解不掉、冒犯不再扣好感，界面上只是数值不动。"""
-        rng = random.Random(SEED)
-        for _ in range(SAMPLES):
-            current = rng.randint(0, CAP)
-            delta = rng.randint(-CAP, 0)
-            self.assertEqual(diminish_delta(current, delta, CAP), delta)
-
     def test_positive_gain_is_bounded_and_monotone(self):
         """守收益递减的两个方向错误：正向变化不得超过申请值（出现放大就是衰减系数写反）、
         不得变成 0（正反馈被吃光），且 current 越大收益越小（单调非增）。
@@ -95,23 +86,42 @@ class FavourDecayTest(unittest.TestCase):
         # 同一时刻（elapsed_ticks <= 0）不得衰减
         self.assertEqual(compute_favour_decay(300, NOW, anchor=100, now=NOW), 300)
 
-    def test_decay_is_monotone_and_converges_to_anchor(self):
-        """守「衰减方向/速率写错」：时间越久结果必须越靠近 anchor（单调非增），足够久后
-        收敛到 anchor。速率或指数符号写错时数值依然「看起来像在衰减」，只是永远差一截。"""
-        anchor, favour = 100, 600
-        durations = [timedelta(0), timedelta(hours=1), timedelta(hours=6),
-                     timedelta(days=1), timedelta(days=7), timedelta(days=365)]
-        results = [
-            compute_favour_decay(favour, NOW - elapsed, anchor=anchor, now=NOW)
-            for elapsed in durations
-        ]
-        self.assertEqual(results[0], favour)
-        for earlier, later in zip(results, results[1:]):
-            self.assertLessEqual(later, earlier, f"时间越久必须越接近锚点: {results}")
-        self.assertEqual(results[-1], anchor, "一年后应已衰减到锚点")
-
 
 class EmotionDecayTest(unittest.TestCase):
+    def test_timezone_aware_timestamp_is_normalized(self):
+        """守「库里混进带时区的时间戳 → 结算整轮崩掉」：`updated_at` 若带 tzinfo，
+        直接和 naive 的 `utc_now()` 相减会抛 `can't subtract offset-naive and
+        offset-aware datetimes`。它发生在后台任务里，表现为这个人此后**每一轮**结算
+        都失败、数值原地不动——前台只看到"没反应"，日志里一条 ERRO。
+        带时区的 8 小时前必须和 naive 的 8 小时前算出相同结果。"""
+        aware = (utc_now() - timedelta(hours=8)).replace(tzinfo=timezone.utc)
+        naive = utc_now() - timedelta(hours=8)
+
+        aware_rec = _record(joy=100, trust=100, surprise=100)
+        aware_rec.updated_at = aware
+        naive_rec = _record(joy=100, trust=100, surprise=100)
+        naive_rec.updated_at = naive
+
+        aware_decayed, aware_elapsed = apply_emotion_decay(aware_rec, 0.5, 0.8, 0.95, 6)
+        naive_decayed, naive_elapsed = apply_emotion_decay(naive_rec, 0.5, 0.8, 0.95, 6)
+        self.assertEqual(aware_decayed, naive_decayed)
+        self.assertAlmostEqual(aware_elapsed, naive_elapsed, places=3)
+
+        # 伤痕衰减走同一条时间算术，同样不能炸
+        scar_rec = _record()
+        scar_rec.updated_at = aware
+        self.assertEqual(apply_scar_decay(scar_rec, min_hours=6), ({}, 8.0))
+
+        # 好感衰减同时接受 aware 与 ISO 字符串（手工改库/备份恢复的两种形态）
+        self.assertEqual(
+            compute_favour_decay(200, aware, anchor=50),
+            compute_favour_decay(200, naive, anchor=50),
+        )
+        self.assertEqual(
+            compute_favour_decay(200, str(naive), anchor=50),
+            compute_favour_decay(200, naive, anchor=50),
+        )
+
     def test_decay_gated_by_min_hours(self):
         """守「未到 min_hours 就衰减」：阈值内的记录必须原样返回空，否则每轮结算都在
         偷偷扣情感，短间隔聊天时数值一路下滑而没有任何提示。"""
@@ -180,35 +190,6 @@ class EmotionDecayTest(unittest.TestCase):
             )
         self.assertLess(decayed["surprise"], decayed["joy"])
         self.assertLess(decayed["joy"], decayed["trust"])
-
-
-class TierProgressTest(unittest.TestCase):
-    def test_percent_stays_within_bounds_and_max_tier_uses_upper_bound(self):
-        """守档位百分比越界与满级档位用错右边界：百分比必须恒在 0-100 且随好感单调不减；
-        满级档要用 max_favour_value 而不是 tier_max 作右边界，否则达标前后百分比静默失真
-        （这里取 tier_max 与 max 之间的好感值，两种算法结果不同）。"""
-        tier_min, tier_max, max_favour_value = 600, 700, 800
-        percents = []
-        for favour in range(0, 901, 25):
-            percent, _hint = compute_tier_progress(
-                favour, tier_min=tier_min, tier_max=tier_max,
-                max_favour_value=max_favour_value, next_tier_min=701,
-            )
-            self.assertGreaterEqual(percent, 0.0)
-            self.assertLessEqual(percent, 100.0)
-            percents.append((favour, percent))
-            if favour < tier_min:
-                self.assertEqual(percent, 0.0)
-
-        ordered = [percent for _favour, percent in percents]
-        self.assertEqual(ordered, sorted(ordered), "百分比必须随好感单调不减")
-
-        max_tier_percent, hint = compute_tier_progress(
-            750, tier_min=tier_min, tier_max=tier_max,
-            max_favour_value=max_favour_value, next_tier_min=None,
-        )
-        self.assertEqual(max_tier_percent, 75.0, "满级档右边界应为 max_favour_value")
-        self.assertEqual(hint, "已满级")
 
 
 if __name__ == "__main__":

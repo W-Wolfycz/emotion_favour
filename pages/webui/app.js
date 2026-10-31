@@ -95,6 +95,8 @@ const api = {
     apiGet('injection-preview', { persona_id, user_id }),
   getHealth: () => apiGet('health'),
   saveRecord: (payload) => apiPost('records/save', payload),
+  refreshNames: (persona_id, limit = 50) =>
+    apiPost('records/refresh-names', { persona_id, limit }),
   getBackups: (persona_id) => apiGet('backups', { persona_id }),
   createBackup: (persona_id) => apiPost('backups/create', { persona_id }),
   restoreBackup: (persona_id, filename) =>
@@ -575,7 +577,7 @@ function renderRecords() {
     if (state.userIdSearch) {
       empty.innerHTML = `
         <div class="empty-icon">🔎</div>
-        <div>没有匹配“${escapeHtml(state.userIdSearch)}”的用户 ID</div>
+        <div>没有匹配“${escapeHtml(state.userIdSearch)}”的用户或昵称</div>
       `;
       return;
     }
@@ -614,10 +616,18 @@ function buildCard(record) {
   el.className = 'record-card';
   el.dataset.userId = record.user_id;
 
+  const displayName = (record.display_name || '').trim();
+  // 有昵称时：昵称主显、ID 退成副信息；没昵称时保持原样（老记录在下条消息前可能为空）
+  const nameHtml = displayName
+    ? `<span class="user-name" title="${escapeHtml(displayName)}">${escapeHtml(displayName)}</span>`
+    : '';
+  const idClass = displayName ? 'user-id muted' : 'user-id';
+
   const row = document.createElement('div');
   row.className = 'card-row';
   row.innerHTML = `
-    <span class="user-id">${escapeHtml(record.user_id)}</span>
+    ${nameHtml}
+    <span class="${idClass}" title="user_id">${escapeHtml(record.user_id)}</span>
     ${record.is_special_override ? '<span class="admin-tag">特殊关系</span>' : ''}
     <span class="favour-wrap">
       <span class="favour-display" title="当前实际生效值">${record.favour}</span>
@@ -818,6 +828,12 @@ function openEditDialog(userId) {
   favourInput.max = favourMax;
 
   document.getElementById('edit-user-id').textContent = record.user_id;
+  const editName = document.getElementById('edit-user-name');
+  if (editName) {
+    const displayName = (record.display_name || '').trim();
+    editName.textContent = displayName;
+    editName.hidden = !displayName;
+  }
   document.getElementById('edit-admin-tag').hidden = !record.is_special_override;
   document.getElementById('edit-updated-at').textContent = '最后更新：' + formatDate(record.updated_at);
   favourInput.value = record.favour;
@@ -1276,6 +1292,34 @@ function setupEventListeners() {
     document.getElementById('clear-search').hidden = true;
     await loadRecords();
   });
+
+  // 补全昵称：老记录（含导入的备份）没有昵称，一次性从平台接口补一批
+  const refreshNamesBtn = document.getElementById('refresh-names');
+  if (refreshNamesBtn) {
+    refreshNamesBtn.addEventListener('click', async () => {
+      if (!state.currentPersona) return;
+      refreshNamesBtn.disabled = true;
+      try {
+        const resp = await api.refreshNames(state.currentPersona, 50);
+        if (!resp.success) {
+          showToast(resp.error || '补全昵称失败', 'error');
+          return;
+        }
+        if (resp.updated > 0) {
+          showToast(`已补全 ${resp.updated}/${resp.scanned} 个昵称，可再点一次继续`, 'success');
+        } else if (resp.scanned > 0) {
+          showToast(`本批 ${resp.scanned} 条都没取到昵称（平台未连接或接口不支持）`, 'error');
+        } else {
+          showToast('所有记录都有昵称了', 'info');
+        }
+        await loadRecords();
+      } catch (e) {
+        showToast('补全昵称失败', 'error');
+      } finally {
+        refreshNamesBtn.disabled = false;
+      }
+    });
+  }
 
   // 刷新
   document.getElementById('refresh-btn').addEventListener('click', async () => {

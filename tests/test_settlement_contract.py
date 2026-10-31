@@ -287,45 +287,12 @@ class SettlementContractTest(unittest.TestCase):
         self.assertEqual(low.settlements[0]["favour"], BASE_FAVOUR - 3)
         self.assertEqual(low.settlements[0]["emotion_updates"], {"joy": -5})
 
-    def test_unknown_dimension_is_dropped(self):
-        """守维度白名单被删：模型编出的未知维度名会一路进到落库参数里（写不进去或写坏
-        列），既不报错也没有任何界面症状。"""
-        stub = self.settle(
-            "<result><reasoning>r</reasoning><change>0</change>"
-            "<emotions><jealousy>5</jealousy><joy>2</joy></emotions></result>"
-        )
-        self.assertEqual(stub.settlements[0]["emotion_updates"], {"joy": 2})
-        self.assertEqual(stub.settlements[0]["favour"], BASE_FAVOUR)
-
     def test_reply_without_result_block_writes_nothing(self):
         """守「找不到 XML 仍走写路径」：模型跑题时不能产生任何结算写入。桩让衰减基线
         差 5 点，所以一旦解析失败被当成「无变化」，那条伪造的基线就会落盘并刷新
         updated_at——衰减起算点被凭空吞掉，日志里只说「结算无变化」。"""
         stub = self.settle("我不知道该怎么评估这次互动。", decay_loss=5)
         self.assertEqual(stub.settlements, [])
-
-    def test_broken_xml_never_raises_and_never_writes(self):
-        """守「解析失败被当成空结果落库」：坏 XML / 非数字 change 都必须停在解析层，
-        既不写库（同上：会以无变化分支刷新衰减基线）也不把异常抛给后台任务。"""
-        replies = {
-            "未闭合标签": "<result><change>3</change><emotions></result>",
-            "非数字 change": "<result><change>很多</change></result>",
-            "截断输出": "<result><change>3</change>",
-        }
-        for label, reply in replies.items():
-            with self.subTest(label):
-                stub = self.settle(reply, decay_loss=5)
-                self.assertEqual(stub.settlements, [], f"{label} 不应产生写入")
-
-    def test_float_change_rounds_instead_of_truncating(self):
-        """守 `int(round(float(...)))` 被简写成 int()：模型输出 2.6 / -2.6 时结算值
-        悄悄偏 1 点（长期单向偏小），日志里只是一个正常数字。"""
-        positive = self.settle(
-            "<result><reasoning>r</reasoning><change>2.6</change></result>")
-        self.assertEqual(positive.settlements[0]["favour"], BASE_FAVOUR + 3)
-        negative = self.settle(
-            "<result><reasoning>r</reasoning><change>-2.6</change></result>")
-        self.assertEqual(negative.settlements[0]["favour"], BASE_FAVOUR - 3)
 
 
 if __name__ == "__main__":

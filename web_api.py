@@ -30,6 +30,7 @@ from .domain import (
     EMOTION_DISPLAY_NAMES,
     EMOTION_GROUPS,
     build_injection_prompt,
+    build_others_prompt,
     scar_field,
     utc_now,
 )
@@ -102,6 +103,8 @@ def _record_to_dict(
     return {
         "persona_id": persona_id or record.persona_id,
         "user_id": record.user_id,
+        # 群昵称：随消息自动补写；老记录在首次收到该用户消息前为空
+        "display_name": str(getattr(record, "display_name", "") or ""),
         "favour": decayed,
         "stored_favour": record.favour,
         "relationship": plugin._get_relationship(decayed, record.user_id),
@@ -453,6 +456,25 @@ def register_web_apis(context, plugin) -> None:
 
     # ==================== 注册 ====================
 
+    async def refresh_display_names():
+        """给缺昵称的记录补名（管理台"补全昵称"按钮；每次最多 50 条）。"""
+        try:
+            unavailable = _not_ready()
+            if unavailable:
+                return unavailable
+            data = await request.get_json() or {}
+            persona_id, err = _persona_id_from(data.get("persona_id"))
+            if err:
+                return err
+            try:
+                limit = max(1, min(100, int(data.get("limit", 50))))
+            except (TypeError, ValueError):
+                limit = 50
+            result = await plugin.refresh_display_names(persona_id, limit=limit)
+            return _ok(**result)
+        except Exception as e:
+            return _internal_error(e)
+
     async def get_injection_preview():
         """预览某用户当前会收到的那段注入提示词（只读，供调试 Prompt/档位用）。"""
         not_ready = _not_ready()
@@ -476,6 +498,15 @@ def register_web_apis(context, plugin) -> None:
                 record, relationship, favour_range, favour,
                 tier_extras=tier_extras, show_scars=plugin.scar_enabled,
             )
+            # 预览要跟实况一致：全量范围下把他人关系那一块也拼上
+            if getattr(plugin, "mention_favour_enabled", False) and (
+                getattr(plugin, "mention_scope", "") == "all"
+            ):
+                cap = max(1, int(getattr(plugin, "mention_favour_max", 20)))
+                entries = await plugin._entries_for_all(persona_id, user_id, cap)
+                others_prompt = build_others_prompt(entries)
+                if others_prompt:
+                    text = f"{text}\n{others_prompt}"
         except Exception as e:
             return _internal_error(e)
         return _ok(text=text, relationship=relationship, favour=favour)
@@ -490,40 +521,30 @@ def register_web_apis(context, plugin) -> None:
         except Exception as e:
             return _internal_error(e)
 
-    context.register_web_api(
-        f"/{PLUGIN_NAME}/about", get_about, ["GET"], "获取插件版本信息"
+    endpoints = (
+        (f"/{PLUGIN_NAME}/about", get_about, ["GET"], "获取插件版本信息"),
+        (
+            f"/{PLUGIN_NAME}/injection-preview", get_injection_preview, ["GET"],
+            "预览当前会注入给主模型的情感提示词",
+        ),
+        (
+            f"/{PLUGIN_NAME}/health", get_settlement_health, ["GET"],
+            "获取各人格的后台结算健康度计数",
+        ),
+        (f"/{PLUGIN_NAME}/personas", get_personas, ["GET"], "获取所有 persona_id 列表"),
+        (f"/{PLUGIN_NAME}/records", get_records, ["GET"], "分页获取指定 persona 的用户记录"),
+        (f"/{PLUGIN_NAME}/relationship", get_relationship, ["GET"], "实时计算好感度对应的关系名"),
+        (f"/{PLUGIN_NAME}/records/save", save_record, ["POST"], "保存单行用户记录变更"),
+        (
+            f"/{PLUGIN_NAME}/records/refresh-names", refresh_display_names, ["POST"],
+            "批量补全记录的群昵称",
+        ),
+        (f"/{PLUGIN_NAME}/backups", get_backups, ["GET"], "获取当前人格数据备份"),
+        (f"/{PLUGIN_NAME}/backups/create", create_backup, ["POST"], "创建当前人格数据备份"),
+        (f"/{PLUGIN_NAME}/backups/restore", restore_backup, ["POST"], "恢复当前人格数据备份"),
+        (f"/{PLUGIN_NAME}/backups/delete", delete_backup, ["POST"], "删除当前人格数据备份"),
     )
-    context.register_web_api(
-        f"/{PLUGIN_NAME}/injection-preview", get_injection_preview, ["GET"],
-        "预览当前会注入给主模型的情感提示词",
-    )
-    context.register_web_api(
-        f"/{PLUGIN_NAME}/health", get_settlement_health, ["GET"],
-        "获取各人格的后台结算健康度计数",
-    )
-    context.register_web_api(
-        f"/{PLUGIN_NAME}/personas", get_personas, ["GET"], "获取所有 persona_id 列表"
-    )
-    context.register_web_api(
-        f"/{PLUGIN_NAME}/records", get_records, ["GET"], "分页获取指定 persona 的用户记录"
-    )
-    context.register_web_api(
-        f"/{PLUGIN_NAME}/relationship", get_relationship, ["GET"], "实时计算好感度对应的关系名"
-    )
-    context.register_web_api(
-        f"/{PLUGIN_NAME}/records/save", save_record, ["POST"], "保存单行用户记录变更"
-    )
-    context.register_web_api(
-        f"/{PLUGIN_NAME}/backups", get_backups, ["GET"], "获取当前人格数据备份"
-    )
-    context.register_web_api(
-        f"/{PLUGIN_NAME}/backups/create", create_backup, ["POST"], "创建当前人格数据备份"
-    )
-    context.register_web_api(
-        f"/{PLUGIN_NAME}/backups/restore", restore_backup, ["POST"], "恢复当前人格数据备份"
-    )
-    context.register_web_api(
-        f"/{PLUGIN_NAME}/backups/delete", delete_backup, ["POST"], "删除当前人格数据备份"
-    )
+    for route, handler, methods, description in endpoints:
+        context.register_web_api(route, handler, methods, description)
 
-    logger.info(f"[{PLUGIN_NAME}] ✅ Web API 已注册（共 11 个端点）")
+    logger.info(f"[{PLUGIN_NAME}] ✅ Web API 已注册（共 {len(endpoints)} 个端点）")

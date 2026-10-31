@@ -1,6 +1,6 @@
 # emotion_favour 代码逻辑测试
 
-当前源码版本：3.5.0。当前规模：Python 66 项 + Node 3 项。
+当前源码版本：3.6.2。当前规模：Python 70 项 + Node 1 项。
 
 ## 定位与边界
 
@@ -56,28 +56,24 @@ print('ast.parse OK')
 | 文件 | 验证内容 | 隔离方式 |
 |------|----------|----------|
 | `_shared.py` | 共享测试基础设施：源码方法提取、事件/任务/锁桩 | 由各测试文件 importlib 按路径加载，自身无用例 |
-| `test_ctx_clean.py` | 历史清洗保留 tool 配对（孤儿 function_call_output 的 400 事故回归） | 从 `main.py` 提取静态方法 |
+| `test_ctx_clean.py` | 历史清洗的标签契约与 tool 配对保留（孤儿 function_call_output 的 400 事故回归） | 从 `main.py` 提取静态方法 |
 | `test_emotion_html.py` | 出图 HTML 的用户文本转义（注入面） | 直接导入 `domain.py` |
-| `test_storage_injection.py` | 注入内容的静默失效点：进度门、满级不留预告、有效好感度与禁令分层 | 直接导入 `domain.py` |
-| `test_tier_extras.py` | 关系档位与特殊用户覆盖的边界 | 从 `main.py` 提取目标方法 |
+| `test_mention_context.py` | @/引用解析、昵称长名优先、名片伪造标记块的注入边界 | 从 `utils.py` / `domain.py` 取函数 |
+| `test_tier_extras.py` | 特殊用户覆盖的安全边界（三条件齐备、空 ID 不放行） | 从 `main.py` 提取目标方法 |
 | `test_tier_script.py` | 档位描述解析（含档位键归一化）与缓存新鲜度 | 直接导入 `domain.py` |
-| `test_tier_script_flow.py` | 档位描述编排的回归点：force 失败、部分解析、空指纹、缓存命中、预热 | 从 `main.py` 提取目标方法 |
-| `test_query_impl.py` | 档位描述只在自己查询时出现 + 满级/非满级进度口径 | 从 `main.py` 提取命令方法 |
-| `test_list_command.py` | 排行榜昵称模式的取数分支 | 从 `main.py` 提取命令方法 |
-| `test_help_menu.py` | 帮助菜单权限分支（非管理员看不到管理命令） | 从 `main.py` 提取命令方法 |
+| `test_tier_script_flow.py` | 档位描述编排的回归点：force 失败如实返回、部分解析、空指纹、缓存命中、预热、并发双检锁 | 从 `main.py` 提取目标方法 |
 | `test_runtime.py` | 锁串行/回收、人格清空与单条删除的 epoch 屏障 | 真实 asyncio，不 mock |
 | `test_permission_policy.py` | 管理命令权限、未登记命令 fail-closed、特殊 ID 初始值 | 源码逻辑测试 |
 | `test_playwright_support.py` | Chromium 缺失识别的协议字符串 | 纯函数，不下载浏览器 |
 | `test_prompt_injection.py` | 注入幂等与动态状态走临时通道 | 轻量假请求对象 |
-| `test_admin_backup_logic.py` | 编辑变更检测（无变化不备份、有变化必须备份） | 直接导入 `domain.py` |
-| `test_config.py` | 重试次数钳制、备份保留期、档位重叠校验 | 直接导入 `config.py` |
+| `test_config.py` | 备份保留期不被钳制、配置分组迁移（搬值/删旧键/缺默认值不删）、启动不重复写盘 | 直接导入 `config.py` + 提取 `_migrate_config_if_needed` |
 | `test_utils.py` | 过期文件清理的后缀/年龄过滤 | 从 `utils.py` 提取顶层函数 |
 | `test_render_custom_t2i.py` | 出图模板的正文注入顺序/转义与临时 HTML 清理 | 假 page/browser，不启动 Playwright |
-| `test_migrations.py` | 迁移 runner 的升级、时间戳 UTC 化、幂等、备份时机、失败回滚 | 真 `db_migrations.py` + stdlib sqlite，tempfile 造存量库 |
-| `test_settlement_contract.py` | 结算 prompt 示例与解析器的标签契约、clamp、维度白名单、坏输出不写库 | 从 `main.py` 提取 `_calculate_favour_bg` + 桩 self |
-| `test_numeric_invariants.py` | 收益递减、好感衰减、情感代谢、档位百分比的数值不变量 | 直接导入 `domain.py`，固定种子 stdlib random |
-| `test_message_placeholder.py` | 非文本消息的占位映射（空 message_str 会让整轮结算静默跳过） | 从 `utils.py` 提取顶层函数 |
-| `test_persona_logic.js` | 初始人格回退、搜索过滤、键盘导航 | Node 内置测试运行器 |
+| `test_migrations.py` | 迁移 runner 的升级、时间戳 UTC 化、幂等、失败回滚 | 真 `db_migrations.py` + stdlib sqlite，tempfile 造存量库 |
+| `test_settlement_contract.py` | 结算 prompt 示例与解析器的标签契约、clamp、伤痕接线、坏输出不写库 | 从 `main.py` 提取 `_calculate_favour_bg` + 桩 self |
+| `test_numeric_invariants.py` | 收益递减、好感衰减、情感代谢的数值不变量 | 直接导入 `domain.py`，固定种子 stdlib random |
+| `test_scar_balance.py` | 伤痕极性/单调性/k 语义/无历史恒等/低位残留归零 | 直接导入 `domain.py` |
+| `test_persona_logic.js` | 初始人格回退 | Node 内置测试运行器 |
 
 ## 部署端验收
 

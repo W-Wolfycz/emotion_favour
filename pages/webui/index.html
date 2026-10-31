@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>emotion_favour · 印象管理台</title>
-  <link rel="stylesheet" href="style.css?v=3.6.1">
+  <link rel="stylesheet" href="style.css?v=3.6.2">
   <script>
     // 防止浅色主题闪烁（FOUC）：AstrBot 主 webui 注入 localStorage 主题
     (function () {
@@ -80,9 +80,11 @@
       </div>
 
       <div class="records-toolbar">
-        <label for="user-search">用户 ID</label>
-        <input id="user-search" type="search" placeholder="搜索全部记录" autocomplete="off">
+        <label for="user-search">昵称 / 用户 ID</label>
+        <input id="user-search" type="search" placeholder="搜索昵称或 ID" autocomplete="off">
         <button class="btn btn-secondary btn-sm" id="clear-search" type="button" hidden>清除</button>
+        <button class="btn btn-secondary btn-sm" id="refresh-names" type="button"
+                title="给缺昵称的老记录从平台接口补一批（每次 50 条，可重复点）">补全昵称</button>
       </div>
 
       <div id="records-list" class="records-list">
@@ -123,6 +125,7 @@
   <dialog id="edit-dialog" class="dialog">
     <div class="dialog-header">
       <div class="dialog-title">
+        <span class="user-name" id="edit-user-name" hidden></span>
         <span class="user-id" id="edit-user-id">—</span>
         <span class="admin-tag" id="edit-admin-tag" hidden>特殊关系</span>
       </div>
@@ -240,7 +243,7 @@
     </div>
   </dialog>
 
-  <script src="persona_logic.js?v=3.6.1"></script>
-  <script src="app.js?v=3.6.1"></script>
+  <script src="persona_logic.js?v=3.6.2"></script>
+  <script src="app.js?v=3.6.2"></script>
 </body>
 </html>

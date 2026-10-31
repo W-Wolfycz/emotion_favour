@@ -32,6 +32,19 @@ def _clamp(value, low, high):
     return max(low, min(high, value))
 
 
+MENTION_SCOPES = ("all", "group", "mention")
+
+
+def _mention_scope(value: Any, warnings: list) -> str:
+    """注入范围：只接受 all / group / mention，写错就落回 all 并留一条告警。"""
+    scope = str(value or "").strip().lower()
+    if scope in MENTION_SCOPES:
+        return scope
+    if scope:
+        warnings.append(f"mention_scope 取值 {scope!r} 无效，已按 all 处理")
+    return "all"
+
+
 def _group(config: Mapping[str, Any], name: str) -> Mapping[str, Any]:
     """取一个 object 分组；缺失或类型不对时当空组处理。"""
     value = config.get(name, {}) or {}
@@ -50,6 +63,11 @@ class PluginSettings:
     relationship_mode: str
     relationship_simple_list: list[str]
     relationship_advance_raw: Any
+
+    mention_favour_enabled: bool
+    mention_scope: str
+    mention_favour_max: int
+    mention_name_match: bool
 
     admin_default_favour: int
     admin_default_relationship: str
@@ -124,9 +142,10 @@ class PluginSettings:
         decay = settlement  # v3.6.0 起衰减并入 settlement_config（结算与衰减）
         access = _group(config, "access_config")
         runtime = _group(config, "runtime_config")
+        mention = _group(config, "mention_config")
         legacy = _group(config, "advanced_config")
         for name in ("advanced_config", "settlement_config",
-                     "access_config", "runtime_config"):
+                     "access_config", "runtime_config", "mention_config"):
             if name in config and not isinstance(config[name], Mapping):
                 warnings.append(f"{name} 不是对象，已忽略")
 
@@ -196,6 +215,14 @@ class PluginSettings:
             favour_change_max=favour_max,
             emotion_change_min=emotion_min,
             emotion_change_max=emotion_max,
+            mention_favour_enabled=moved_bool(mention, "mention_favour_enabled", True),
+            mention_scope=_mention_scope(
+                moved(mention, "mention_scope", "all"), warnings
+            ),
+            mention_favour_max=_clamp(
+                _as_int(moved(mention, "mention_favour_max", 20), 20), 1, 50,
+            ),
+            mention_name_match=moved_bool(mention, "mention_name_match", False),
             history_rounds=_clamp(_as_int(moved(runtime, "history_rounds", 0), 0), 0, 10),
             use_chat_memory=moved_bool(runtime, "use_chat_memory", False),
             emotion_decay_enabled=moved_bool(decay, "emotion_decay_enabled", True),

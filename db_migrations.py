@@ -216,8 +216,14 @@ FAVOUR_COLUMNS = (
     "id", "persona_id", "user_id", "favour", "created_at", "updated_at",
     "joy", "trust", "fear", "surprise", "sadness", "disgust", "anger",
     "anticipation", "pride", "guilt", "shame", "envy",
+    # v3.7.0：群昵称/昵称，仅用于管理台展示与搜索，不参与任何结算
+    "display_name",
 )
-EMOTION_COLUMNS = FAVOUR_COLUMNS[6:]
+# 显式列表，不再用 FAVOUR_COLUMNS 切片推——加新列时切片会悄悄带进陌生列
+EMOTION_COLUMNS = (
+    "joy", "trust", "fear", "surprise", "sadness", "disgust",
+    "anger", "anticipation", "pride", "guilt", "shame", "envy",
+)
 # 伤痕列（0 = 无历史，负 = 有伤），列名与 domain.scar_field 保持一致
 SCAR_COLUMNS = tuple(f"scar_{name}" for name in EMOTION_COLUMNS)
 FAVOUR_COLUMNS = FAVOUR_COLUMNS + SCAR_COLUMNS
@@ -286,6 +292,17 @@ def add_scar_columns(connection: sqlite3.Connection) -> None:
     for name in SCAR_COLUMNS:
         if name not in existing:
             connection.execute(f'ALTER TABLE favour_records ADD COLUMN "{name}" INTEGER DEFAULT 0')
+
+
+def add_display_name_column(connection: sqlite3.Connection) -> None:
+    """昵称列：默认空串，存量库升级后管理台先只显示 ID，收到消息时自动补上。"""
+    if not table_exists(connection, "favour_records"):
+        return
+    existing = set(column_names(connection, "favour_records"))
+    if "display_name" not in existing:
+        connection.execute(
+            'ALTER TABLE favour_records ADD COLUMN "display_name" TEXT DEFAULT \'\''
+        )
 
 
 def normalize_utc_timestamps(

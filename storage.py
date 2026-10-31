@@ -10,8 +10,9 @@ from typing import List, Optional, Tuple
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from aiofiles import open as aio_open
+from pydantic import NaiveDatetime
 from sqlmodel import SQLModel, Field, select, delete
-from sqlalchemy import UniqueConstraint, event, func, text, update
+from sqlalchemy import UniqueConstraint, event, func, or_, text, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
@@ -42,6 +43,7 @@ from .db_migrations import (
     SQLiteMigration,
     SQLiteMigrationRunner,
     TIER_SCRIPT_DDL,
+    add_display_name_column,
     add_emotion_columns,
     add_scar_columns,
     ensure_tier_scripts_table,
@@ -114,9 +116,14 @@ class FavourRecord(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     persona_id: str = Field(default="", index=True)
     user_id: str = Field(index=True)
+    # 群昵称/昵称：只用于管理台展示与搜索，不参与结算，也不刷新 updated_at
+    display_name: str = Field(default="")
     favour: int = Field(default=0)
-    created_at: datetime = Field(default_factory=utc_now)
-    updated_at: datetime = Field(default_factory=utc_now)
+    # 时间列必须显式声明成 naive：SQLModel 0.0.48（AstrBot 4.29.3 自带）把裸 datetime
+    # 映射成 UTCDateTime——写入要求带时区、读出自动加 UTC 时区，与本插件"全库统一
+    # 存 naive UTC"的约定冲突（写入直接抛 ValueError，读出的 aware 值再参与减法又会炸）。
+    created_at: NaiveDatetime = Field(default_factory=utc_now)
+    updated_at: NaiveDatetime = Field(default_factory=utc_now)
 
     # 12 维情感 (0-100)
     joy: int = Field(default=0)
@@ -154,7 +161,7 @@ class PersonaSummaryRecord(SQLModel, table=True):
     persona_id: str = Field(default="", unique=True, index=True)
     summary: str = Field(default="")
     persona_hash: str = Field(default="")
-    updated_at: datetime = Field(default_factory=utc_now)
+    updated_at: NaiveDatetime = Field(default_factory=utc_now)
 
 
 class PersonaTierScriptRecord(SQLModel, table=True):
@@ -175,7 +182,7 @@ class PersonaTierScriptRecord(SQLModel, table=True):
     tier_label: str = Field(default="")
     script: str = Field(default="")
     persona_hash: str = Field(default="")
-    updated_at: datetime = Field(default_factory=utc_now)
+    updated_at: NaiveDatetime = Field(default_factory=utc_now)
 
 
 class FavourDBManager:
@@ -226,6 +233,7 @@ class FavourDBManager:
             self.data_dir / "backups",
             (
                 SQLiteMigration("add_emotion_columns_v1", add_emotion_columns),
+                SQLiteMigration("add_display_name_v1", add_display_name_column),
                 SQLiteMigration("add_scar_columns_v1", add_scar_columns),
                 SQLiteMigration("ensure_tier_scripts_table_v1", ensure_tier_scripts_table),
                 SQLiteMigration(
@@ -260,30 +268,9 @@ class FavourDBManager:
                     table_exists = result.fetchone() is not None
 
                     if not table_exists:
-                        # 全新安装：用 CREATE TABLE IF NOT EXISTS，避免索引冲突
-                        await conn.execute(text("""
-                            CREATE TABLE IF NOT EXISTS favour_records (
-                                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                                persona_id TEXT NOT NULL DEFAULT '',
-                                user_id TEXT NOT NULL,
-                                favour INTEGER NOT NULL DEFAULT 0,
-                                created_at DATETIME,
-                                updated_at DATETIME,
-                                joy INTEGER NOT NULL DEFAULT 0,
-                                trust INTEGER NOT NULL DEFAULT 0,
-                                fear INTEGER NOT NULL DEFAULT 0,
-                                surprise INTEGER NOT NULL DEFAULT 0,
-                                sadness INTEGER NOT NULL DEFAULT 0,
-                                disgust INTEGER NOT NULL DEFAULT 0,
-                                anger INTEGER NOT NULL DEFAULT 0,
-                                anticipation INTEGER NOT NULL DEFAULT 0,
-                                pride INTEGER NOT NULL DEFAULT 0,
-                                guilt INTEGER NOT NULL DEFAULT 0,
-                                shame INTEGER NOT NULL DEFAULT 0,
-                                envy INTEGER NOT NULL DEFAULT 0,
-                                CONSTRAINT uq_persona_user UNIQUE (persona_id, user_id)
-                            )
-                        """))
+                        # 全新安装：直接用 ORM 定义建表，不再手写 DDL——手写版在
+                        # v3.6.0 加伤痕列时漏改，新装库会在下面校验时直接失败。
+                        await conn.run_sync(SQLModel.metadata.create_all)
                         # 索引用 IF NOT EXISTS，热重载也不会冲突
                         await conn.execute(text(
                             "CREATE INDEX IF NOT EXISTS ix_favour_records_persona_id ON favour_records (persona_id)"
@@ -335,8 +322,15 @@ class FavourDBManager:
         self._initialized = False
 
     def to_local_datetime(self, value: Optional[datetime]) -> Optional[datetime]:
+        """UTC 时间转本地 naive；带时区的值先按它自己的偏移归一到 UTC。
+
+        直接 `replace(tzinfo=utc)` 只对 naive UTC 成立：库里若混进带 +08:00 的值，
+        那样做会把它当成 UTC 再转一次，显示时间整整偏 8 小时。
+        """
         if value is None:
             return None
+        if value.tzinfo is not None:
+            value = value.astimezone(timezone.utc).replace(tzinfo=None)
         return (
             value.replace(tzinfo=timezone.utc)
             .astimezone(self.local_tz)
@@ -684,6 +678,10 @@ class FavourDBManager:
                     row[dim] = max(0, min(100, int(item.get(dim, 0))))
                 except (TypeError, ValueError) as exc:
                     raise ValueError(f"备份中存在无效情感维度: {dim}") from exc
+            # 老备份没有这个键：只有备份里确实带昵称时才覆盖，避免把现有昵称清空
+            display_name = str(item.get("display_name", "") or "").strip()
+            if display_name:
+                row["display_name"] = display_name[:64]
             clean_rows.append(row)
 
         async with self.async_session() as session:
@@ -832,6 +830,34 @@ class FavourDBManager:
             logger.error(f"更新数据库失败: {str(e)}")
             return False
 
+    async def set_display_name(
+        self, persona_id: str, user_id: str, display_name: str
+    ) -> bool:
+        """只更新昵称列：绝不动 updated_at（那会重置衰减基线）。"""
+        await self.init_db()
+        if not _is_valid_userid(user_id):
+            return False
+        name = str(display_name or "").strip()[:64]
+        if not name:
+            return False
+        try:
+            async with self.async_session() as session:
+                stmt = (
+                    update(FavourRecord)
+                    .where(
+                        FavourRecord.persona_id == persona_id,
+                        FavourRecord.user_id == user_id,
+                    )
+                    .values(display_name=name)
+                )
+                result = await session.execute(stmt)
+                await session.commit()
+                return bool(result.rowcount)
+        except Exception as e:
+            # 昵称是用户提供的文本，异常串里可能带参数，只记类型
+            logger.error(f"更新昵称失败: {type(e).__name__}")
+            return False
+
     async def set_record_fields(
         self,
         persona_id: str,
@@ -960,12 +986,20 @@ class FavourDBManager:
             result = await session.execute(stmt)
             return list(result.scalars().all())
 
+    @staticmethod
+    def _search_condition(query: str):
+        """管理台搜索：ID 与昵称都能命中（昵称是后补的，老记录可能为空）。"""
+        return or_(
+            FavourRecord.user_id.contains(query),
+            FavourRecord.display_name.contains(query),
+        )
+
     async def count_records(self, persona_id: str, *, user_id_search: str = "") -> int:
         await self.init_db()
         async with self.async_session() as session:
             conditions = [FavourRecord.persona_id == persona_id]
             if user_id_search:
-                conditions.append(FavourRecord.user_id.contains(user_id_search))
+                conditions.append(self._search_condition(user_id_search))
             stmt = select(func.count(FavourRecord.id)).where(*conditions)
             result = await session.execute(stmt)
             return int(result.scalar_one() or 0)
@@ -980,9 +1014,46 @@ class FavourDBManager:
         await self.init_db()
         conditions = [FavourRecord.persona_id == persona_id]
         if user_id_search:
-            conditions.append(FavourRecord.user_id.contains(user_id_search))
+            conditions.append(self._search_condition(user_id_search))
         async with self.async_session() as session:
             stmt = select(FavourRecord).where(*conditions).order_by(FavourRecord.id.asc())
+            result = await session.execute(stmt)
+            return list(result.scalars().all())
+
+    async def get_favours_by_user_ids(
+        self, persona_id: str, user_ids, *, chunk: int = 400
+    ) -> List[FavourRecord]:
+        """按 user_id 集合取记录（本群范围注入用）；分块避免撞 SQLite 变量数上限。"""
+        await self.init_db()
+        ids = [uid for uid in dict.fromkeys(str(u) for u in (user_ids or [])) if uid]
+        if not ids:
+            return []
+        records: List[FavourRecord] = []
+        async with self.async_session() as session:
+            for start in range(0, len(ids), chunk):
+                stmt = select(FavourRecord).where(
+                    FavourRecord.persona_id == persona_id,
+                    FavourRecord.user_id.in_(ids[start:start + chunk]),
+                )
+                result = await session.execute(stmt)
+                records.extend(result.scalars().all())
+        return records
+
+    async def list_records_missing_display_name(
+        self, persona_id: str, *, limit: int = 50
+    ) -> List[FavourRecord]:
+        """还没补上昵称的记录（管理台"补全昵称"按钮用）。"""
+        await self.init_db()
+        async with self.async_session() as session:
+            stmt = (
+                select(FavourRecord)
+                .where(
+                    FavourRecord.persona_id == persona_id,
+                    or_(FavourRecord.display_name.is_(None), FavourRecord.display_name == ""),
+                )
+                .order_by(FavourRecord.id.asc())
+                .limit(max(1, min(200, int(limit))))
+            )
             result = await session.execute(stmt)
             return list(result.scalars().all())
 
@@ -995,8 +1066,13 @@ class FavourDBManager:
         sort_by: str = "favour",
         sort_order: str = "desc",
         user_id_search: str = "",
+        named_only: bool = False,
     ) -> List[FavourRecord]:
-        """数据库侧分页；favour 排序基于存储值，展示时仍计算 transient 衰减值。"""
+        """数据库侧分页；favour 排序基于存储值，展示时仍计算 transient 衰减值。
+
+        named_only：只取已补到昵称的记录（全量注入他人关系时用）。必须在 SQL 层
+        过滤——先截断再丢没名字的，会让没昵称的高好感记录白占名额。
+        """
         await self.init_db()
         columns = {
             "user_id": FavourRecord.user_id,
@@ -1009,7 +1085,10 @@ class FavourDBManager:
         async with self.async_session() as session:
             conditions = [FavourRecord.persona_id == persona_id]
             if user_id_search:
-                conditions.append(FavourRecord.user_id.contains(user_id_search))
+                conditions.append(self._search_condition(user_id_search))
+            if named_only:
+                conditions.append(FavourRecord.display_name.isnot(None))
+                conditions.append(FavourRecord.display_name != "")
             stmt = (
                 select(FavourRecord)
                 .where(*conditions)
@@ -1150,7 +1229,8 @@ class FavourDBManager:
                 await session.commit()
                 return True
         except Exception as e:
-            logger.error(f"保存人设摘要失败: {e}")
+            # 写的是人设摘要正文：SQLAlchemy 异常串会带 [parameters: …]，只记类型
+            logger.error(f"保存人设摘要失败: {type(e).__name__}")
             return False
 
     async def delete_persona_summary(self, persona_id: str) -> bool:

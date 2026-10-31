@@ -31,5 +31,6 @@ class TestRecordFieldsChanged(unittest.TestCase):
         self.assertTrue(record_fields_changed(record, favour=21))
         self.assertTrue(record_fields_changed(record, emotions_absolute={"joy": 31}))
 
+
 if __name__ == "__main__":
     unittest.main()

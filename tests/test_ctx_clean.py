@@ -36,6 +36,20 @@ def _load():
 
 _clean_history_contexts, _CTX_CLEAN_PATTERN = _load()
 
+def test_legacy_chinese_blocks_are_still_stripped():
+    """守升级路径：3.6.2 之前注入的是中文标签（<情感好感> / <他人关系>），
+    升级后这些块仍躺在历史上下文里。清洗正则只认新标签的话，它们会一直堆到
+    上下文上限——不报错、只是每轮都白白多带几百字。"""
+    legacy = (
+        "<情感好感>\n  <状态>\n    <好感度>120</好感度>\n"
+        "    <关系>友好</关系>\n  </状态>\n</情感好感>\n"
+        "<他人关系>\n  <对象 昵称=\"小蓝\" 关系=\"喜欢\"/>\n</他人关系>"
+    )
+    contexts = [{"role": "user", "content": f"你好\n\n{legacy}"}]
+    cleaned = _clean_history_contexts(contexts, _CTX_CLEAN_PATTERN)
+    assert cleaned[0]["content"] == "你好"
+
+
 TOOL_CALL_ID = "call_00_l7pEfPNSfm8E3OJOrfsw0372"
 
 
@@ -58,18 +72,6 @@ def _tool_msg(content, call_id=TOOL_CALL_ID):
 
 
 class TestCleanHistoryContexts(unittest.TestCase):
-    def test_keeps_tool_message_even_if_cleaned_empty(self):
-        """400 事故回归：旧注入面板整段落在 role=tool 消息里，清洗后正文为空。
-        若按「空内容即丢弃」处理，配对丢失 → 上游把孤儿 function_call_output 拒掉。"""
-        contexts = [
-            _assistant_toolcall("发起技能调用"),
-            _tool_msg("<情感好感>旧面板</情感好感>"),
-        ]
-        cleaned = _clean_history_contexts(contexts, _CTX_CLEAN_PATTERN)
-        self.assertEqual(len(cleaned), 2)
-        self.assertEqual(cleaned[1]["role"], "tool")
-        self.assertEqual(cleaned[1]["content"], "")
-
     def test_full_skill_roundtrip_keeps_pairing(self):
         """同一回归的完整形态：assistant 正文只剩 thought 块（清洗后为空）但带
         tool_calls，必须与后面的 tool 输出一起保留，call_id 不能断。"""
@@ -88,6 +90,18 @@ class TestCleanHistoryContexts(unittest.TestCase):
         self.assertEqual(cleaned[3]["role"], "tool")
         self.assertEqual(cleaned[3]["tool_call_id"], TOOL_CALL_ID)
         self.assertEqual(cleaned[4]["content"], "查到了，结果是……")
+
+    def test_keeps_tool_message_even_if_cleaned_empty(self):
+        """400 事故回归：旧注入面板整段落在 role=tool 消息里，清洗后正文为空。
+        若按「空内容即丢弃」处理，配对丢失 → 上游把孤儿 function_call_output 拒掉。"""
+        contexts = [
+            _assistant_toolcall("发起技能调用"),
+            _tool_msg("<情感好感>旧面板</情感好感>"),
+        ]
+        cleaned = _clean_history_contexts(contexts, _CTX_CLEAN_PATTERN)
+        self.assertEqual(len(cleaned), 2)
+        self.assertEqual(cleaned[1]["role"], "tool")
+        self.assertEqual(cleaned[1]["content"], "")
 
 if __name__ == "__main__":
     unittest.main()
